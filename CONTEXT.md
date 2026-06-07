@@ -163,3 +163,7 @@ _Avoid_: sandbox, permissions, environment
 **Model Provider**:
 An external service or local system that supplies model inference within an agent runtime.
 _Avoid_: LLM provider, model API, runtime
+
+**Adapter Preflight**:
+A runtime adapter check that verifies a capability artifact can be discovered by an agent runtime before execution evaluation begins.
+_Avoid_: smoke test, execution evaluation, skill-use check

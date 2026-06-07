@@ -8,3 +8,8 @@
 .pytest_cache/
 __pycache__/
 *.py[cod]
+
+# Claude local working artifacts.
+.claude/plans/
+.claude/agent-memory/
+.claude/worktrees/

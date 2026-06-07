@@ -1,5 +1,26 @@
 # MetaCrucible
 
+## Commands
+
+- Setup tools/env: `mise install`
+- Install package + dev deps: `mise run install`
+- Run tests: `mise run test`
+- Build wheel dry-run: `uv build --wheel`
+
+## Toolchain
+
+`mise.toml` is the source of truth for tool versions and tasks. It provisions Python 3.14 and `.venv`; do not add another root environment manager without rationale.
+
+## Project shape
+
+- Python package: `src/metacrucible/`
+- CLI entry: `metacrucible = "metacrucible.__main__:main"`
+- Tests: `tests/`
+- Domain glossary: `CONTEXT.md`
+- Decisions: `docs/adr/`
+
+Before domain/design work, read `CONTEXT.md` and relevant ADRs. Surface ADR conflicts instead of silently overriding.
+
 ## Agent skills
 
 ### Issue tracker

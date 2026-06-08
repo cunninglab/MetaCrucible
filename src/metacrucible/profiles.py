@@ -92,12 +92,14 @@ __all__ = [
     "ROUTING_SURFACE_SAFETY_VERSION",
     "RUNTIME_NEUTRALITY_ID",
     "RUNTIME_NEUTRALITY_VERSION",
+    "RUNTIME_PORTABILITY_TARGETS",
     "SECRET_PRIVACY_RISK_ID",
     "SECRET_PRIVACY_RISK_VERSION",
     "ProfileResult",
     "ProfileSpec",
     "compute_evaluation_harness_sha",
     "evaluate_acceptance",
+    "evaluate_runtime_neutrality",
     "select_supplemental",
     "select_triggers",
     "weakest_darwin_dimensions",
@@ -684,3 +686,159 @@ def weakest_darwin_dimensions(
     if n == 0:
         return ()
     return tuple(sorted_scores[:n])
+
+
+# --------------------------------------------------------------------------- #
+# Runtime-neutrality portability trigger (Issue #23)                          #
+# --------------------------------------------------------------------------- #
+#
+# Pins the contract from ADR 0033 (``portability.target is a
+# portability claim that controls runtime-neutrality checks [...]
+# claude_code, oh_my_pi, shared_claude_layout, and runtime_neutral
+# claims use progressively different language checks'') and the
+# acceptance criteria from issue #23:
+#
+#   1. **Trigger based on portability.target**. The runtime-neutrality
+#      profile is a supplemental review layer whose trigger is the
+#      artifact input's ``portability.target`` field. Exactly four
+#      values are accepted; any other value (typo, drift, unknown
+#      runtime) is treated as a missing/bad trigger rather than a
+#      silent pass.
+#
+#   2. **Invalid or missing portability.target is BLOCKED**. A
+#      missing ``portability`` block, a missing ``target`` field,
+#      or a ``target`` outside the four-value set returns a real
+#      ``ProfileResult`` with ``status='BLOCKED'`` and at least one
+#      blocker. The BLOCKED result is the framework's evidence
+#      convention for an unresolved rule (ADR 0033: ``unresolved
+#      required ambiguity blocks''), so a buggy artifact cannot
+#      silently bypass the trigger and the failure flows into the
+#      evidence verdict.
+#
+#   3. **Findings enter evidence via the existing profile evidence
+#      conventions**. The runtime-neutrality result is a real
+#      ``ProfileResult``; it slots into ``evaluate_acceptance`` and
+#      the per-target finding surfaces on the verdict's
+#      ``supplemental_findings`` list (the framework's evidence
+#      convention), not via an ad hoc return channel.
+#
+# The four pinned target values are also the contract for
+# :data:`RUNTIME_PORTABILITY_TARGETS`. Renaming or removing a value
+# is a breaking change for any artifact that names the target
+# (e.g. in a Skill routing surface); new values are an ADR-level
+# contract change that must add a new target without dropping
+# the existing four.
+
+#: Pinned tuple of runtime-portability targets (Issue #23, ADR 0033).
+#: Iteration order is the canonical order; the four values are
+#: the trigger set for :func:`evaluate_runtime_neutrality` and
+#: participate in stable evidence reports.
+RUNTIME_PORTABILITY_TARGETS: tuple[str, ...] = (
+    "claude_code",
+    "oh_my_pi",
+    "shared_claude_layout",
+    "runtime_neutral",
+)
+
+
+def evaluate_runtime_neutrality(
+    artifact: Mapping[str, Any],
+) -> ProfileResult:
+    """Evaluate the runtime-neutrality profile for ``artifact``.
+
+    The trigger is ``artifact["portability"]["target"]``. The
+    function reads the target and returns a real
+    :class:`ProfileResult` so the result plugs into
+    :func:`evaluate_acceptance` and the findings/blockers flow
+    into the evidence verdict.
+
+    Parameters
+    ----------
+    artifact:
+        The artifact-shaped input mapping. The function looks up
+        ``artifact["portability"]["target"]`` (the contract field
+        per ADR 0033). Non-mapping inputs raise :class:`ValueError`
+        so a programmer error cannot silently pass review.
+
+    Returns
+    -------
+    ProfileResult
+        A real :class:`ProfileResult` for the
+        ``runtime-neutrality`` profile.
+
+        * If ``portability.target`` is one of
+          :data:`RUNTIME_PORTABILITY_TARGETS`, returns
+          ``status='PASS'`` with a per-target finding that
+          records the observed target so evidence and reports
+          round-trip the claim.
+        * Otherwise (missing ``portability`` block, missing
+          ``target`` field, or an unknown target value),
+          returns ``status='BLOCKED'`` with a blocker whose id
+          is rooted at ``runtime-neutrality.target`` so the
+          missing/bad trigger shows up on the verdict's
+          ``blockers`` list.
+
+    Raises
+    ------
+    ValueError
+        If ``artifact`` is not a mapping. A missing trigger
+        field is a BLOCKED result, not a programming error;
+        a non-mapping ``artifact`` argument is a programming
+        error.
+    """
+    if not isinstance(artifact, Mapping):
+        raise ValueError(
+            f"evaluate_runtime_neutrality requires a mapping input; "
+            f"got {type(artifact).__name__}"
+        )
+
+    portability = artifact.get("portability")
+    target: Any = None
+    if isinstance(portability, Mapping):
+        target = portability.get("target")
+
+    if target not in RUNTIME_PORTABILITY_TARGETS:
+        # Missing or invalid trigger. Surface as a BLOCKED result
+        # with a blocker; the blocker is the evidence the
+        # framework reports when the trigger could not be
+        # resolved. The blocker id is stable so downstream
+        # automation (judges, optimizers, reports) can group on
+        # it.
+        return ProfileResult(
+            profile_id=RUNTIME_NEUTRALITY_ID,
+            version=RUNTIME_NEUTRALITY_VERSION,
+            status="BLOCKED",
+            blockers=(
+                {
+                    "id": "runtime-neutrality.target",
+                    "message": (
+                        "portability.target must be one of "
+                        f"{list(RUNTIME_PORTABILITY_TARGETS)!r}; "
+                        f"got {target!r}"
+                    ),
+                    "target": target,
+                },
+            ),
+        )
+
+    # Valid trigger: emit a per-target finding that records the
+    # observed target. The finding flows through
+    # ``evaluate_acceptance`` as a supplemental finding so
+    # downstream tools can report which portability claim the
+    # profile observed. PASS status with a non-empty finding
+    # tuple is the supplemental-review convention (ADR 0033).
+    return ProfileResult(
+        profile_id=RUNTIME_NEUTRALITY_ID,
+        version=RUNTIME_NEUTRALITY_VERSION,
+        status="PASS",
+        findings=(
+            {
+                "id": f"runtime-neutrality.target.{target}",
+                "message": (
+                    f"portability.target={target!r} is in the "
+                    f"runtime-neutrality allowed set"
+                ),
+                "target": target,
+            },
+        ),
+    )

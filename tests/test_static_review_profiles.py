@@ -1148,3 +1148,305 @@ def test_darwin_default_content_hash_is_in_harness_identity(
         f"harness sha must be a 64-char hex digest; "
         f"got {len(decoded['harness_sha'])} chars"
     )
+
+
+
+# --------------------------------------------------------------------------- #
+# Issue #23 - runtime-neutrality portability target trigger                   #
+# --------------------------------------------------------------------------- #
+#
+# Pins the contract from ADR 0033 (static review profile contract,
+# consequence: "portability.target is a portability claim that controls
+# runtime-neutrality checks, not the runtime adapter selector;
+# claude_code, oh_my_pi, shared_claude_layout, and runtime_neutral
+# claims use progressively different language checks.") and the three
+# acceptance criteria from issue #23:
+#
+#   1. **Trigger based on portability.target**. The runtime-neutrality
+#      profile runs when artifact input carries a portability target
+#      in {claude_code, oh_my_pi, shared_claude_layout, runtime_neutral};
+#      the four target values are the trigger set and the result is a
+#      machine-readable ProfileResult that the rest of the framework
+#      can consume.
+#
+#   2. **Invalid or missing portability.target is BLOCKED**. A buggy
+#      artifact cannot silently bypass the trigger; a missing or
+#      unknown portability target must surface a blocker (and a
+#      BLOCKED status) so downstream evidence can report it.
+#
+#   3. **Findings enter evidence via the existing profile evidence
+#      conventions**. The runtime-neutrality result is a real
+#      ProfileResult; its findings surface through
+#      evaluate_acceptance as supplemental_findings (the
+#      framework's evidence convention), not via an ad hoc return
+#      channel.
+
+
+def test_runtime_neutrality_module_exposes_issue23_surface(
+    profiles: Any,
+) -> None:
+    """Issue #23 surface: the new symbols must exist on the module.
+
+    The runtime-neutrality trigger is exposed as a public
+    function (``evaluate_runtime_neutrality``) and a public
+    constant (``RUNTIME_PORTABILITY_TARGETS``) so callers can
+    branch on the allowed target set without duplicating it.
+    """
+    for name in (
+        "RUNTIME_PORTABILITY_TARGETS",
+        "evaluate_runtime_neutrality",
+    ):
+        assert hasattr(profiles, name), (
+            f"{PROFILES_MODULE!r} must expose {name!r} (Issue #23); "
+            f"got attributes "
+            f"{sorted(a for a in dir(profiles) if not a.startswith('_'))!r}"
+        )
+
+
+def test_runtime_portability_targets_constant_pins_exactly_four_values(
+    profiles: Any,
+) -> None:
+    """Issue #23 AC1: the trigger set is exactly the four ADR-pinned targets.
+
+    ADR 0033: ``claude_code, oh_my_pi, shared_claude_layout, and
+    runtime_neutral claims use progressively different language
+    checks.'' The set is the machine contract; an extra or missing
+    value silently shifts what the profile accepts. Order is pinned
+    too because the constant participates in evidence and stable
+    reports depend on stable iteration order.
+    """
+    targets = profiles.RUNTIME_PORTABILITY_TARGETS
+    assert isinstance(targets, (tuple, list, frozenset)), (
+        f"RUNTIME_PORTABILITY_TARGETS must be a tuple/list/frozenset; "
+        f"got {type(targets).__name__}"
+    )
+    assert tuple(targets) == (
+        "claude_code",
+        "oh_my_pi",
+        "shared_claude_layout",
+        "runtime_neutral",
+    ), (
+        f"RUNTIME_PORTABILITY_TARGETS must equal the ADR 0033 set "
+        f"(claude_code, oh_my_pi, shared_claude_layout, runtime_neutral); "
+        f"got {tuple(targets)!r}"
+    )
+
+
+def test_evaluate_runtime_neutrality_returns_profile_result_for_each_target(
+    profiles: Any,
+) -> None:
+    """Issue #23 AC1: every ADR-pinned target triggers a real ProfileResult.
+
+    The four portability targets are the trigger set. For each
+    one the function must return a real :class:`ProfileResult`
+    with ``profile_id='runtime-neutrality'``, ``status='PASS'``,
+    and a non-empty ``findings`` tuple that records the
+    observed target.
+    """
+    for target in profiles.RUNTIME_PORTABILITY_TARGETS:
+        artifact = {"portability": {"target": target}}
+        result = profiles.evaluate_runtime_neutrality(artifact)
+        assert isinstance(result, profiles.ProfileResult), (
+            f"evaluate_runtime_neutrality must return a ProfileResult for "
+            f"target={target!r}; got {type(result).__name__}"
+        )
+        assert result.profile_id == "runtime-neutrality", (
+            f"runtime-neutrality result must carry profile_id="
+            f"'runtime-neutrality' (target={target!r}); "
+            f"got {result.profile_id!r}"
+        )
+        assert result.version == "v1", (
+            f"runtime-neutrality result version must be 'v1' "
+            f"(target={target!r}); got {result.version!r}"
+        )
+        assert result.status == "PASS", (
+            f"valid portability.target={target!r} must yield PASS; "
+            f"got {result.status!r}"
+        )
+        assert len(result.findings) >= 1, (
+            f"valid portability.target={target!r} must emit at least "
+            f"one finding (Issue #23 AC3: findings enter evidence); "
+            f"got {result.findings!r}"
+        )
+        # Blockers list is empty on PASS: a passing trigger must
+        # not poison acceptance.
+        assert result.blockers == (), (
+            f"valid portability.target={target!r} must not emit "
+            f"blockers; got {result.blockers!r}"
+        )
+
+
+def test_evaluate_runtime_neutrality_finding_records_observed_target(
+    profiles: Any,
+) -> None:
+    """Issue #23 AC3: the per-target finding records the observed target.
+
+    Downstream evidence (judges, optimizers, reports) needs to
+    know *which* portability target the trigger observed. The
+    finding must carry the target value in a machine-readable
+    field so receipts and JSON dumps round-trip the claim.
+    """
+    for target in profiles.RUNTIME_PORTABILITY_TARGETS:
+        artifact = {"portability": {"target": target}}
+        result = profiles.evaluate_runtime_neutrality(artifact)
+        observed = [
+            f.get("target") for f in result.findings if isinstance(f, Mapping)
+        ]
+        assert target in observed, (
+            f"runtime-neutrality finding must record the observed "
+            f"target={target!r}; got observed={observed!r} "
+            f"findings={result.findings!r}"
+        )
+
+
+def test_evaluate_runtime_neutrality_blocks_on_invalid_target(
+    profiles: Any,
+) -> None:
+    """Issue #23 AC2: an unknown portability.target must surface as BLOCKED.
+
+    The trigger is the four ADR-pinned values. Any other string
+    (typo, drift, made-up value) must produce a BLOCKED result
+    with at least one blocker so the buggy artifact cannot
+    silently pass review.
+    """
+    for bad in ("Claude_code", "claude-code", "shared_claude", "omp", ""):
+        artifact = {"portability": {"target": bad}}
+        result = profiles.evaluate_runtime_neutrality(artifact)
+        assert result.status == "BLOCKED", (
+            f"invalid portability.target={bad!r} must BLOCK; "
+            f"got status={result.status!r}"
+        )
+        assert len(result.blockers) >= 1, (
+            f"invalid portability.target={bad!r} must emit at least "
+            f"one blocker (Issue #23 AC2); got blockers={result.blockers!r}"
+        )
+
+
+def test_evaluate_runtime_neutrality_blocks_on_missing_portability(
+    profiles: Any,
+) -> None:
+    """Issue #23 AC2: an artifact without ``portability`` must surface BLOCKED.
+
+    The framework cannot infer portability from thin air. A
+    missing ``portability`` block must produce a BLOCKED result
+    with a blocker (and empty findings) so evidence shows the
+    missing-trigger condition rather than silently passing.
+    """
+    result = profiles.evaluate_runtime_neutrality({})
+    assert result.status == "BLOCKED", (
+        f"missing portability block must BLOCK; "
+        f"got status={result.status!r}"
+    )
+    assert len(result.blockers) >= 1, (
+        f"missing portability block must emit a blocker; "
+        f"got blockers={result.blockers!r}"
+    )
+
+
+def test_evaluate_runtime_neutrality_blocks_on_missing_target(
+    profiles: Any,
+) -> None:
+    """Issue #23 AC2: ``portability`` without ``target`` must surface BLOCKED.
+
+    The trigger key is ``portability.target``; an artifact that
+    carries an empty portability block cannot trigger the
+    profile. The result must be BLOCKED with a blocker (and no
+    findings) so a half-declared claim does not silently pass.
+    """
+    result = profiles.evaluate_runtime_neutrality({"portability": {}})
+    assert result.status == "BLOCKED", (
+        f"missing portability.target must BLOCK; "
+        f"got status={result.status!r}"
+    )
+    assert len(result.blockers) >= 1, (
+        f"missing portability.target must emit a blocker; "
+        f"got blockers={result.blockers!r}"
+    )
+
+
+def test_evaluate_runtime_neutrality_findings_enter_evidence_verdict(
+    profiles: Any,
+) -> None:
+    """Issue #23 AC3: findings must flow through the existing evidence path.
+
+    The contract says "findings enter evidence using existing
+    static review profile evidence conventions." The framework's
+    evidence convention is :func:`evaluate_acceptance`; the
+    runtime-neutrality result must plug into it and surface its
+    findings on the verdict's ``supplemental_findings`` list so
+    downstream tools (judges, optimizers, reports) can consume
+    them through the same channel as every other profile.
+    """
+    secret_spec = _make_profile_spec(
+        profiles, "secret-privacy-risk", blocking=True
+    )
+    runtime_spec = _make_profile_spec(
+        profiles, "runtime-neutrality", blocking=False, content_hash="f" * 64
+    )
+    artifact = {"portability": {"target": "claude_code"}}
+    runtime_result = profiles.evaluate_runtime_neutrality(artifact)
+    secret_result = _make_profile_result(
+        profiles, "secret-privacy-risk", status="PASS"
+    )
+    verdict = profiles.evaluate_acceptance(
+        [secret_result, runtime_result],
+        profile_specs={
+            _spec_id(secret_spec): secret_spec,
+            _spec_id(runtime_spec): runtime_spec,
+        },
+    )
+    assert verdict["accepted"] is True, (
+        f"runtime-neutrality is supplemental; its findings must NOT "
+        f"block acceptance; got verdict={verdict!r}"
+    )
+    finding_ids = _finding_ids(verdict)
+    runtime_finding_ids = [
+        fid for fid in finding_ids if fid.startswith("runtime-neutrality")
+    ]
+    assert runtime_finding_ids, (
+        f"runtime-neutrality findings must surface on the evidence "
+        f"verdict (Issue #23 AC3); got finding_ids={finding_ids!r}"
+    )
+
+
+def test_evaluate_runtime_neutrality_blocker_appears_on_evidence_verdict(
+    profiles: Any,
+) -> None:
+    """Issue #23 AC2: a BLOCKED runtime-neutrality must block acceptance.
+
+    Even though the built-in runtime-neutrality is supplemental
+    by default, a BLOCKED result must still surface on the
+    verdict's ``blockers`` list so the missing/invalid trigger
+    condition is part of evidence. A project policy that promotes
+    runtime-neutrality to blocking must then see ``accepted=False``
+    on the verdict; the per-profile result, not the spec, is
+    the source of truth for the BLOCKED status.
+    """
+    runtime_spec = _make_profile_spec(
+        profiles, "runtime-neutrality", blocking=True, content_hash="9" * 64
+    )
+    secret_spec = _make_profile_spec(
+        profiles, "secret-privacy-risk", blocking=True
+    )
+    runtime_result = profiles.evaluate_runtime_neutrality(
+        {"portability": {"target": "omp"}}
+    )
+    secret_result = _make_profile_result(
+        profiles, "secret-privacy-risk", status="PASS"
+    )
+    verdict = profiles.evaluate_acceptance(
+        [secret_result, runtime_result],
+        profile_specs={
+            _spec_id(runtime_spec): runtime_spec,
+            _spec_id(secret_spec): secret_spec,
+        },
+    )
+    assert verdict["accepted"] is False, (
+        f"promoted-to-blocking runtime-neutrality BLOCKED must set "
+        f"accepted=False; got verdict={verdict!r}"
+    )
+    blocker_ids = _blocker_ids(verdict)
+    assert any(bid.startswith("runtime-neutrality") for bid in blocker_ids), (
+        f"runtime-neutrality BLOCKED must surface a blocker on the "
+        f"verdict (Issue #23 AC2); got blocker_ids={blocker_ids!r}"
+    )

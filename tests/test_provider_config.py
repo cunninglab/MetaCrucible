@@ -596,3 +596,237 @@ def test_cli_overrides_win_over_project_user_and_defaults(
     assert result.get("ok") is True
     assert result["config"]["control_plane"]["judge"]["model"] == "CLI"
     assert result["config"]["control_plane"]["optimizer"]["model"] == "CLI"
+
+
+# --------------------------------------------------------------------------- #
+# Issue #16: structured-output capability probe                              #
+# --------------------------------------------------------------------------- #
+# Issue #16 + ADR 0034 require that judge and optimizer structured-output use
+# is gated on a successful capability probe. The probe function is supplied
+# per-provider via a public callback (``probe_fn``) so production code can use
+# a real LLM round-trip and tests can drive success and failure paths with a
+# deterministic local function (no mocks).
+
+# Stable blocker id emitted by ``run_structured_output_probe`` on a failed
+# probe. The id is part of the machine contract; renaming is a breaking
+# change.
+EXPECTED_STRUCTURED_OUTPUT_PROBE_BLOCKER: str = (
+    "provider-config-structured-output-probe-failed"
+)
+
+# Deterministic local probe callbacks used by the tests. They are
+# plain functions defined in this test module; the production code
+# receives them as ``probe_fn`` arguments and never reaches for any
+# monkeypatch or mock library.
+
+
+def _fake_probe_pass(
+    provider_name: str,
+    provider_spec: Mapping[str, Any],
+    model: str,
+) -> dict[str, Any]:
+    """A fake probe that always succeeds and records what it saw."""
+    return {
+        "ok": True,
+        "reason": None,
+        "latency_ms": 1,
+        "probe_kind": "fake-pass",
+        "raw": {
+            "provider_name": provider_name,
+            "model": model,
+            "type": provider_spec.get("type")
+            if isinstance(provider_spec, Mapping)
+            else None,
+        },
+    }
+
+
+def _fake_probe_fail_judge(
+    provider_name: str,
+    provider_spec: Mapping[str, Any],
+    model: str,
+) -> dict[str, Any]:
+    """A fake probe that always fails; the caller observes ok=False."""
+    return {
+        "ok": False,
+        "reason": "synthetic refusal: model does not support tools",
+        "latency_ms": 2,
+        "probe_kind": "fake-fail",
+        "raw": {
+            "provider_name": provider_name,
+            "model": model,
+        },
+    }
+
+
+def test_provider_config_module_exposes_probe_surface(
+    provider_config: Any,
+) -> None:
+    """Issue #16: module must expose the capability-probe entry point and blocker id."""
+    for name in (
+        "STRUCTURED_OUTPUT_PROBE_BLOCKER",
+        "run_structured_output_probe",
+    ):
+        assert hasattr(provider_config, name), (
+            f"{PROVIDER_CONFIG_MODULE!r} must expose {name!r} (Issue #16); "
+            f"got attributes "
+            f"{sorted(a for a in dir(provider_config) if not a.startswith('_'))!r}"
+        )
+
+
+def test_provider_config_module_exposes_probe_blocker_id(
+    provider_config: Any,
+) -> None:
+    """The probe blocker id is part of the machine contract; it must be stable."""
+    assert (
+        provider_config.STRUCTURED_OUTPUT_PROBE_BLOCKER
+        == EXPECTED_STRUCTURED_OUTPUT_PROBE_BLOCKER
+    ), (
+        f"STRUCTURED_OUTPUT_PROBE_BLOCKER must be exactly "
+        f"{EXPECTED_STRUCTURED_OUTPUT_PROBE_BLOCKER!r}; got "
+        f"{provider_config.STRUCTURED_OUTPUT_PROBE_BLOCKER!r}"
+    )
+    assert isinstance(provider_config.EXPECTED_BLOCKERS, dict)
+    assert (
+        provider_config.EXPECTED_BLOCKERS.get("structured_output_probe")
+        == EXPECTED_STRUCTURED_OUTPUT_PROBE_BLOCKER
+    ), (
+        f"EXPECTED_BLOCKERS must include the structured_output_probe entry; "
+        f"got {provider_config.EXPECTED_BLOCKERS!r}"
+    )
+
+
+def test_run_structured_output_probe_passes_with_passing_probe_fn(
+    provider_config: Any,
+) -> None:
+    """A passing probe means judge/optimizer structured-output use is unblocked."""
+    resolved = provider_config.resolve_provider_config()
+    assert resolved.get("ok") is True, (
+        f"baseline resolve must succeed; got {resolved!r}"
+    )
+    result = provider_config.run_structured_output_probe(
+        resolved["config"], probe_fn=_fake_probe_pass
+    )
+    assert isinstance(result, dict)
+    assert result.get("ok") is True, (
+        f"passing probe must yield ok=True; got result={result!r}"
+    )
+    assert result.get("blockers") == [], (
+        f"passing probe must emit no blockers; got {result['blockers']!r}"
+    )
+
+
+def test_run_structured_output_probe_blocks_with_stable_blocker(
+    provider_config: Any,
+) -> None:
+    """A failing probe must block structured-output use with the stable blocker id."""
+    resolved = provider_config.resolve_provider_config()
+    result = provider_config.run_structured_output_probe(
+        resolved["config"], probe_fn=_fake_probe_fail_judge
+    )
+    assert result.get("ok") is False, (
+        f"failing probe must yield ok=False; got result={result!r}"
+    )
+    assert EXPECTED_STRUCTURED_OUTPUT_PROBE_BLOCKER in _blocker_ids(result), (
+        f"failed probe must emit blocker id "
+        f"{EXPECTED_STRUCTURED_OUTPUT_PROBE_BLOCKER!r}; got "
+        f"blocker_ids={_blocker_ids(result)!r}"
+    )
+
+
+def test_run_structured_output_probe_records_evidence_per_role(
+    provider_config: Any,
+) -> None:
+    """Probe evidence must be present in a deterministic place per role."""
+    resolved = provider_config.resolve_provider_config()
+    result = provider_config.run_structured_output_probe(
+        resolved["config"], probe_fn=_fake_probe_pass
+    )
+    evidence = result.get("probe_evidence")
+    assert isinstance(evidence, dict), (
+        f"probe_evidence must be a dict at a deterministic place; got "
+        f"{evidence!r}"
+    )
+    for role in ("judge", "optimizer"):
+        assert role in evidence, (
+            f"probe_evidence must include {role!r}; got "
+            f"keys={sorted(evidence.keys())!r}"
+        )
+        entry = evidence[role]
+        assert isinstance(entry, dict)
+        assert entry.get("role") == role
+        assert entry.get("provider") == "anthropic", (
+            f"default config selects anthropic for {role!r}; got "
+            f"{entry.get('provider')!r}"
+        )
+        assert entry.get("model") == "claude-sonnet-4-5"
+        assert entry.get("ok") is True
+        assert entry.get("probe_kind") == "fake-pass"
+
+
+def test_run_structured_output_probe_does_not_echo_credential_in_blocker(
+    provider_config: Any,
+) -> None:
+    """The blocker message must not leak the env var name as a credential echo."""
+    user = {
+        "providers": {
+            "anthropic": {
+                "type": "anthropic",
+                "api_key_env": "MY_SUPER_SECRET_KEY_NAME",
+            }
+        }
+    }
+    resolved = provider_config.resolve_provider_config(user=user)
+    result = provider_config.run_structured_output_probe(
+        resolved["config"], probe_fn=_fake_probe_fail_judge
+    )
+    blob = str(result)
+    assert "MY_SUPER_SECRET_KEY_NAME" not in blob, (
+        f"provider credential env-var name must not appear in probe result; "
+        f"leaked in {blob!r}"
+    )
+
+
+def test_run_structured_output_probe_uses_default_probe_for_known_types(
+    provider_config: Any,
+) -> None:
+    """The default probe must recognize the built-in provider types and pass."""
+    resolved = provider_config.resolve_provider_config()
+    result = provider_config.run_structured_output_probe(resolved["config"])
+    assert result.get("ok") is True, (
+        f"default probe on default config must succeed; got result={result!r}"
+    )
+    assert result.get("blockers") == []
+
+
+def test_run_structured_output_probe_default_blocks_unknown_provider_type(
+    provider_config: Any,
+) -> None:
+    """The default probe must reject an unrecognized provider type."""
+    user = {
+        "providers": {
+            "weird_unknown_provider": {
+                "type": "made_up_type",
+                "api_key_env": "WEIRD_PROVIDER_KEY",
+            }
+        },
+        "control_plane": {
+            "judge": {
+                "provider": "weird_unknown_provider",
+                "model": "weird-1",
+            },
+            "optimizer": {
+                "provider": "weird_unknown_provider",
+                "model": "weird-1",
+            },
+        },
+    }
+    resolved = provider_config.resolve_provider_config(user=user)
+    assert resolved.get("ok") is True, (
+        f"resolver must accept a well-formed unknown type; got {resolved!r}"
+    )
+    result = provider_config.run_structured_output_probe(resolved["config"])
+    assert result.get("ok") is False, (
+        f"default probe must reject unknown provider type; got result={result!r}"
+    )
+    assert EXPECTED_STRUCTURED_OUTPUT_PROBE_BLOCKER in _blocker_ids(result)

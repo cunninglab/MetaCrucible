@@ -37,14 +37,16 @@ References
 from __future__ import annotations
 
 import copy
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 __all__ = [
     "EXPECTED_BLOCKERS",
     "SECRET_FIELD_BLOCKER",
     "RUNTIME_ADAPTER_LEAK_BLOCKER",
+    "STRUCTURED_OUTPUT_PROBE_BLOCKER",
     "DEFAULT_PROVIDER_CONFIG",
     "resolve_provider_config",
+    "run_structured_output_probe",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -90,10 +92,17 @@ SECRET_FIELD_BLOCKER: str = "provider-config-secret-field-rejected"
 RUNTIME_ADAPTER_LEAK_BLOCKER: str = (
     "provider-config-runtime-adapter-control-plane-leak"
 )
+# Stable blocker id emitted by :func:`run_structured_output_probe` when any
+# role's structured-output capability probe fails (Issue #16, ADR 0034).
+# The id is part of the machine contract: callers branch on it verbatim.
+STRUCTURED_OUTPUT_PROBE_BLOCKER: str = (
+    "provider-config-structured-output-probe-failed"
+)
 
 EXPECTED_BLOCKERS: dict[str, str] = {
     "secret_field": SECRET_FIELD_BLOCKER,
     "runtime_leak": RUNTIME_ADAPTER_LEAK_BLOCKER,
+    "structured_output_probe": STRUCTURED_OUTPUT_PROBE_BLOCKER,
 }
 
 # Built-in defaults for the resolver. The defaults are the
@@ -326,3 +335,255 @@ def resolve_provider_config(
     if blockers:
         return {"ok": False, "config": {}, "blockers": blockers}
     return {"ok": True, "config": merged, "blockers": []}
+
+
+
+# --------------------------------------------------------------------------- #
+# Public: structured-output capability probe (Issue #16, ADR 0034)            #
+# --------------------------------------------------------------------------- #
+
+# Provider types the default local probe recognizes. ADR 0034 pins
+# Anthropic and OpenAI-compatible providers; anything else falls through
+# to a probe-time failure unless the caller supplies a probe_fn that
+# says otherwise.
+_RECOGNIZED_PROVIDER_TYPES: frozenset[str] = frozenset(
+    {"anthropic", "openai_compatible"}
+)
+
+
+def _default_structured_output_probe(
+    provider_name: str,
+    provider_spec: Mapping[str, Any],
+    model: str,
+) -> dict[str, Any]:
+    """Default local probe: succeed iff ``provider_spec['type']`` is recognized.
+
+    The default probe is deterministic and offline: it inspects the
+    provider spec the resolver produced and returns success for the
+    built-in shapes (``anthropic`` / ``openai_compatible``) and a
+    well-formed failure for anything else. The real LLM round-trip
+    lives in the caller-supplied ``probe_fn`` for production use;
+    tests inject a deterministic local callback to drive both the
+    success and the failure paths.
+    """
+    ptype: Any = None
+    if isinstance(provider_spec, Mapping):
+        ptype = provider_spec.get("type")
+    raw: dict[str, Any] = {
+        "provider_name": provider_name,
+        "model": model,
+        "type": ptype,
+    }
+    if ptype in _RECOGNIZED_PROVIDER_TYPES:
+        return {
+            "ok": True,
+            "reason": None,
+            "latency_ms": 0,
+            "probe_kind": "local-static-ok",
+            "raw": raw,
+        }
+    return {
+        "ok": False,
+        "reason": (
+            f"provider type {ptype!r} is not in the recognized set "
+            f"{sorted(_RECOGNIZED_PROVIDER_TYPES)!r}"
+        ),
+        "latency_ms": 0,
+        "probe_kind": "local-static-fail",
+        "raw": raw,
+    }
+
+
+def run_structured_output_probe(
+    config: Mapping[str, Any],
+    *,
+    probe_fn: Callable[[str, Mapping[str, Any], str], Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Run the structured-output capability probe for ``judge`` and ``optimizer``.
+
+    Issue #16 + ADR 0034: judge and optimizer structured-output use
+    must require a successful capability probe first. The probe is
+    supplied per-provider via the public ``probe_fn`` callback. The
+    default probe is the deterministic local probe
+    (:func:`_default_structured_output_probe`) that recognizes the
+    built-in provider types and rejects unknown ones, with no
+    network I/O and no mocks.
+
+    Returns a result dict::
+
+        {
+            "ok": bool,
+            "probe_evidence": {
+                "judge": {
+                    "role": "judge",
+                    "provider": str | None,
+                    "model": str | None,
+                    "ok": bool,
+                    "probe_kind": str,
+                    "latency_ms": int | None,
+                    "reason": str | None,
+                    "raw": Any | None,
+                },
+                "optimizer": {...},
+            },
+            "blockers": [{"id": str, "message": str}],
+        }
+
+    On a blocked probe ``ok`` is ``False`` and ``blockers`` lists every
+    role that failed (selector missing, unknown provider catalog entry,
+    or probe_fn reported ``ok=False``). Error messages do not include
+    ``api_key_env`` or any other credential reference (ADR 0034).
+    Probe evidence lives at ``probe_evidence`` for every run regardless
+    of success so a downstream receipt/evidence recorder has a stable
+    place to find it.
+    """
+    if probe_fn is None:
+        probe_fn = _default_structured_output_probe
+
+    if not isinstance(config, Mapping):
+        return {
+            "ok": False,
+            "probe_evidence": {
+                "judge": _probe_evidence_entry(
+                    "judge", None, None, False, "config-missing", None,
+                    "config is not a mapping", None,
+                ),
+                "optimizer": _probe_evidence_entry(
+                    "optimizer", None, None, False, "config-missing", None,
+                    "config is not a mapping", None,
+                ),
+            },
+            "blockers": [_blocker(
+                STRUCTURED_OUTPUT_PROBE_BLOCKER,
+                "structured-output probe input must be a mapping; got "
+                f"{type(config).__name__} (Issue #16, ADR 0034)",
+            )],
+        }
+
+    control_plane = config.get("control_plane", {})
+    providers_catalog = config.get("providers", {})
+
+    probe_evidence: dict[str, dict[str, Any]] = {}
+    blockers: list[dict[str, str]] = []
+
+    for role in ("judge", "optimizer"):
+        selection: Any = (
+            control_plane.get(role)
+            if isinstance(control_plane, Mapping)
+            else None
+        )
+        if not isinstance(selection, Mapping):
+            blockers.append(_blocker(
+                STRUCTURED_OUTPUT_PROBE_BLOCKER,
+                f"control_plane.{role} selection is missing or invalid; "
+                "structured-output probe cannot run (Issue #16, ADR 0034)",
+            ))
+            probe_evidence[role] = _probe_evidence_entry(
+                role, None, None, False, "selection-missing", None,
+                "control_plane selection missing or invalid", None,
+            )
+            continue
+
+        provider_name: Any = selection.get("provider")
+        model: Any = selection.get("model")
+        if not isinstance(provider_name, str) or not isinstance(model, str):
+            blockers.append(_blocker(
+                STRUCTURED_OUTPUT_PROBE_BLOCKER,
+                f"control_plane.{role} must carry 'provider' and 'model' "
+                "strings; structured-output probe cannot run "
+                "(Issue #16, ADR 0034)",
+            ))
+            probe_evidence[role] = _probe_evidence_entry(
+                role, provider_name, model, False, "selection-malformed",
+                None, "control_plane selection missing provider or model",
+                None,
+            )
+            continue
+
+        provider_spec: Any = (
+            providers_catalog.get(provider_name)
+            if isinstance(providers_catalog, Mapping)
+            else None
+        )
+        if not isinstance(provider_spec, Mapping):
+            blockers.append(_blocker(
+                STRUCTURED_OUTPUT_PROBE_BLOCKER,
+                f"provider {provider_name!r} is not present in the providers "
+                f"catalog; structured-output probe cannot run for {role} "
+                "(Issue #16, ADR 0034)",
+            ))
+            probe_evidence[role] = _probe_evidence_entry(
+                role, provider_name, model, False, "provider-unknown", None,
+                f"provider {provider_name!r} is not in the providers catalog",
+                None,
+            )
+            continue
+
+        probe_result: Any = probe_fn(provider_name, provider_spec, model)
+        ok = bool(probe_result.get("ok")) if isinstance(probe_result, Mapping) else False
+        reason_raw: Any = (
+            probe_result.get("reason") if isinstance(probe_result, Mapping) else None
+        )
+        reason: str | None = reason_raw if isinstance(reason_raw, str) else None
+        latency_raw: Any = (
+            probe_result.get("latency_ms") if isinstance(probe_result, Mapping) else None
+        )
+        latency_ms: int | None = latency_raw if isinstance(latency_raw, int) else None
+        kind_raw: Any = (
+            probe_result.get("probe_kind") if isinstance(probe_result, Mapping) else None
+        )
+        probe_kind: str = (
+            kind_raw if isinstance(kind_raw, str) and kind_raw else "probe-return-malformed"
+        )
+        raw: Any = (
+            probe_result.get("raw") if isinstance(probe_result, Mapping) else None
+        )
+
+        probe_evidence[role] = _probe_evidence_entry(
+            role, provider_name, model, ok, probe_kind, latency_ms,
+            reason if not ok else None, raw,
+        )
+
+        if not ok:
+            blockers.append(_blocker(
+                STRUCTURED_OUTPUT_PROBE_BLOCKER,
+                (
+                    f"structured-output capability probe failed for {role} role "
+                    f"(provider={provider_name!r}, model={model!r}): "
+                    f"{reason!r}; judge/optimizer structured-output use is "
+                    "blocked until the probe passes (Issue #16, ADR 0034)"
+                ),
+            ))
+
+    return {
+        "ok": not blockers,
+        "probe_evidence": probe_evidence,
+        "blockers": blockers,
+    }
+
+
+def _probe_evidence_entry(
+    role: str,
+    provider: Any,
+    model: Any,
+    ok: bool,
+    probe_kind: str,
+    latency_ms: int | None,
+    reason: str | None,
+    raw: Any,
+) -> dict[str, Any]:
+    """Return a normalized ``probe_evidence`` entry for a single role.
+
+    Centralizing the entry shape keeps ``probe_evidence`` a stable
+    contract for downstream receipt/evidence recording.
+    """
+    return {
+        "role": role,
+        "provider": provider,
+        "model": model,
+        "ok": ok,
+        "probe_kind": probe_kind,
+        "latency_ms": latency_ms,
+        "reason": reason,
+        "raw": raw,
+    }

@@ -52,6 +52,21 @@ References
 ----------
 - ADR 0033 (static review profile contract).
 - Issue #21 acceptance criteria.
+
+Issue #22 (Darwin 9-dimension rubric profile) adds a new section
+at the bottom of this file. The contract for that issue lives in
+ADR 0033 (``darwin-skill-quality.v1`` is a 9-dimension
+SkillLens-derived supplemental review layer) and the four
+acceptance criteria from issue #22:
+
+  1. The Darwin profile has exactly 9 dimensions.
+  2. Per-dimension scores are emitted in the machine-readable
+     result so receipts can carry the breakdown.
+  3. Weakest dimensions are reported deterministically
+     (ascending score, ties broken by ascending id).
+  4. Darwin remains supplemental by default; a project policy can
+     promote it to blocking, in which case a FAIL result blocks
+     acceptance.
 """
 from __future__ import annotations
 
@@ -152,6 +167,7 @@ def _make_profile_result(
     *,
     blockers: Sequence[Mapping[str, str]] = (),
     findings: Sequence[Mapping[str, str]] = (),
+    dimension_scores: Sequence[Mapping[str, Any]] = (),
 ) -> Any:
     """Build a real ``ProfileResult`` instance via the production constructor."""
     return profiles.ProfileResult(
@@ -160,6 +176,7 @@ def _make_profile_result(
         status=status,
         blockers=tuple(blockers),
         findings=tuple(findings),
+        dimension_scores=tuple(dimension_scores),
     )
 
 
@@ -172,6 +189,17 @@ def _spec_id(spec: Any) -> str:
     if isinstance(spec, Mapping):
         return spec["id"]
     return spec.id
+
+
+def _score_ids(scores: Any) -> list[str]:
+    """Return the list of dimension ids in a per-dimension score sequence."""
+    if not isinstance(scores, list):
+        return []
+    out: list[str] = []
+    for entry in scores:
+        if isinstance(entry, Mapping) and isinstance(entry.get("id"), str):
+            out.append(entry["id"])
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -785,4 +813,338 @@ def test_compute_evaluation_harness_sha_profile_order_is_deterministic(
     assert a == b, (
         f"compute_evaluation_harness_sha must be order-independent; "
         f"got a={a!r} b={b!r}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Issue #22 — Darwin 9-dimension rubric profile                                #
+# --------------------------------------------------------------------------- #
+#
+# Pins the four acceptance criteria for issue #22. The Darwin profile
+# is a 9-dimension SkillLens-derived rubric that:
+#
+#   1. exposes exactly 9 stable dimension ids,
+#   2. emits per-dimension scores in the machine-readable result,
+#   3. reports the weakest dimensions in a deterministic order
+#      (ascending score, ties broken by ascending id), and
+#   4. remains supplemental by default but can be promoted to
+#      blocking by project policy (a FAIL under blocking blocks
+#      acceptance).
+
+
+def test_darwin_module_exposes_darwin_dimensions_and_weakest_helper(
+    profiles: Any,
+) -> None:
+    """Issue #22 surface: the module must expose the Darwin rubric helpers.
+
+    The Darwin-specific API is :data:`DARWIN_DIMENSIONS` (the
+    machine-stable 9-dimension id tuple) and
+    :func:`weakest_darwin_dimensions` (the deterministic
+    ranking helper). Both are part of the public surface so
+    downstream tools can rank or render the rubric.
+    """
+    for name in ("DARWIN_DIMENSIONS", "weakest_darwin_dimensions"):
+        assert hasattr(profiles, name), (
+            f"{PROFILES_MODULE!r} must expose {name!r} (Issue #22); "
+            f"got attributes "
+            f"{sorted(a for a in dir(profiles) if not a.startswith('_'))!r}"
+        )
+
+
+def test_darwin_dimensions_constant_has_exactly_nine_dimensions(
+    profiles: Any,
+) -> None:
+    """Issue #22 AC1: the Darwin rubric has exactly 9 dimensions.
+
+    The Darwin rubric is a 9-dimension SkillLens-derived set;
+    a count drift (8 or 10) silently changes the rubric, so the
+    test pins both the count and the order.
+    """
+    dims = profiles.DARWIN_DIMENSIONS
+    assert isinstance(dims, (tuple, list, frozenset)), (
+        f"DARWIN_DIMENSIONS must be a tuple/list/frozenset; "
+        f"got {type(dims).__name__}"
+    )
+    assert len(dims) == 9, (
+        f"DARWIN_DIMENSIONS must have exactly 9 entries "
+        f"(Issue #22 AC1); got {len(dims)}"
+    )
+
+
+def test_darwin_dimension_ids_are_unique_nonempty_strings(
+    profiles: Any,
+) -> None:
+    """Issue #22 AC1: every dimension id is unique and a non-empty str.
+
+    Dimension ids participate in findings/blockers and the
+    deterministic weakness ranking; duplicates or empty ids
+    would corrupt the rubric.
+    """
+    dims = list(profiles.DARWIN_DIMENSIONS)
+    assert len(set(dims)) == len(dims), (
+        f"DARWIN_DIMENSIONS ids must be unique; got {tuple(dims)!r}"
+    )
+    for dim in dims:
+        assert isinstance(dim, str) and dim, (
+            f"each DARWIN_DIMENSIONS id must be a non-empty str; got {dim!r}"
+        )
+
+
+def test_darwin_profile_result_emits_per_dimension_scores(
+    profiles: Any,
+) -> None:
+    """Issue #22 AC2: per-dimension scores are emitted in the result.
+
+    ``ProfileResult`` carries a ``dimension_scores`` field —
+    a sequence of mappings with at least ``id`` (str) and
+    ``score`` (numeric). The field is preserved by
+    :meth:`ProfileResult.as_dict` so receipts and downstream
+    reports can render the breakdown.
+    """
+    dim_scores = tuple(
+        {"id": dim, "score": 0.5 + 0.05 * i}
+        for i, dim in enumerate(profiles.DARWIN_DIMENSIONS)
+    )
+    result = profiles.ProfileResult(
+        profile_id="darwin-skill-quality",
+        version="v1",
+        status="PASS",
+        dimension_scores=dim_scores,
+    )
+    payload = result.as_dict()
+    assert "dimension_scores" in payload, (
+        f"ProfileResult.as_dict() must include 'dimension_scores' "
+        f"(Issue #22 AC2); got keys={list(payload.keys())!r}"
+    )
+    out_scores = payload["dimension_scores"]
+    assert isinstance(out_scores, list), (
+        f"ProfileResult.as_dict()['dimension_scores'] must be a list; "
+        f"got {type(out_scores).__name__}"
+    )
+    assert len(out_scores) == 9, (
+        f"per-dimension scores must carry all 9 Darwin dimensions; "
+        f"got {len(out_scores)}"
+    )
+    for entry in out_scores:
+        assert isinstance(entry, Mapping), (
+            f"each dimension score entry must be a Mapping; got {entry!r}"
+        )
+        assert "id" in entry and "score" in entry, (
+            f"each dimension score entry must carry 'id' and 'score'; "
+            f"got {entry!r}"
+        )
+        assert isinstance(entry["id"], str), (
+            f"dimension score 'id' must be a str; got {type(entry['id']).__name__}"
+        )
+
+
+def test_weakest_darwin_dimensions_reported_deterministically(
+    profiles: Any,
+) -> None:
+    """Issue #22 AC3: weakest dimensions are reported deterministically.
+
+    The ranking is ascending score; ties are broken by ascending
+    dimension id so the report is byte-stable across runs and
+    Python versions. The test builds a hand-crafted score
+    vector that pins both rules.
+    """
+    dims = list(profiles.DARWIN_DIMENSIONS)
+    # dims[0] and dims[1] tie at the lowest score (0.1); the
+    # helper must order them by id ascending.
+    # dims[2] is the unique second-lowest, dims[3] the unique
+    # third-lowest; the rest of the vector is monotone so the
+    # test does not depend on the dimensions' sort order.
+    scores = [
+        {"id": dims[0], "score": 0.1},
+        {"id": dims[1], "score": 0.1},
+        {"id": dims[2], "score": 0.2},
+        {"id": dims[3], "score": 0.3},
+    ] + [
+        {"id": d, "score": 0.5 + 0.01 * i}
+        for i, d in enumerate(dims[4:])
+    ]
+    result = _make_profile_result(
+        profiles,
+        "darwin-skill-quality",
+        status="PASS",
+        dimension_scores=tuple(scores),
+    )
+    weakest = profiles.weakest_darwin_dimensions(result, n=3)
+    assert isinstance(weakest, tuple), (
+        f"weakest_darwin_dimensions must return a tuple; "
+        f"got {type(weakest).__name__}"
+    )
+    assert len(weakest) == 3, (
+        f"weakest_darwin_dimensions(n=3) must return 3 entries; "
+        f"got {len(weakest)}"
+    )
+    # The first two are the tied 0.1 entries, sorted by id ascending.
+    assert weakest[0]["id"] < weakest[1]["id"], (
+        f"tie-break must be by id ascending; got ids="
+        f"{[d['id'] for d in weakest[:2]]!r}"
+    )
+    assert weakest[2]["id"] == dims[2], (
+        f"third weakest must be the unique 0.2 score ({dims[2]!r}); "
+        f"got {weakest[2]['id']!r}"
+    )
+    # Every returned id must come from the input dimension set.
+    assert all(d["id"] in dims for d in weakest), (
+        f"weakest ids must be from DARWIN_DIMENSIONS; got "
+        f"{[d['id'] for d in weakest]!r}"
+    )
+    # Calling twice yields the same order (deterministic).
+    again = profiles.weakest_darwin_dimensions(result, n=3)
+    assert [d["id"] for d in again] == [d["id"] for d in weakest], (
+        f"weakest_darwin_dimensions must be deterministic; "
+        f"got {[d['id'] for d in again]!r} vs {[d['id'] for d in weakest]!r}"
+    )
+
+
+def test_weakest_darwin_dimensions_rejects_non_darwin_result(
+    profiles: Any,
+) -> None:
+    """Issue #22 AC3 (defensive): the helper refuses non-Darwin results.
+
+    A runtime-neutrality or secret-privacy-risk result is not a
+    Darwin result; the helper must raise rather than silently
+    ranking the wrong dimension set.
+    """
+    result = _make_profile_result(profiles, "runtime-neutrality", status="PASS")
+    with pytest.raises(ValueError):
+        profiles.weakest_darwin_dimensions(result)
+
+
+def test_weakest_darwin_dimensions_rejects_negative_n(
+    profiles: Any,
+) -> None:
+    """Issue #22 AC3 (defensive): negative ``n`` is rejected."""
+    result = _make_profile_result(profiles, "darwin-skill-quality", status="PASS")
+    with pytest.raises(ValueError):
+        profiles.weakest_darwin_dimensions(result, n=-1)
+
+
+def test_built_in_darwin_default_profile_is_supplemental(
+    profiles: Any,
+) -> None:
+    """Issue #22 AC4: the built-in Darwin spec is supplemental by default.
+
+    ADR 0033: ``darwin-skill-quality.v1 runs by default for
+    review'' and ``does not become a blocking acceptance gate
+    unless project policy configures a threshold.'' The
+    built-in spec ships with ``blocking=False`` so the default
+    behavior is correct without configuration.
+    """
+    spec_index = {s.id: s for s in profiles.BUILTIN_PROFILES}
+    darwin = spec_index["darwin-skill-quality"]
+    assert darwin.blocking is False, (
+        f"built-in darwin-skill-quality must be supplemental "
+        f"(blocking=False) by default (Issue #22 AC4); "
+        f"got blocking={darwin.blocking!r}"
+    )
+
+
+def test_darwin_policy_can_promote_to_blocking_fails_acceptance(
+    profiles: Any,
+) -> None:
+    """Issue #22 AC5: policy can promote Darwin to blocking; FAIL blocks.
+
+    With a project policy that flips ``blocking=True`` (whose
+    hash is part of the harness identity) and a Darwin
+    ``status=FAIL`` result, the acceptance verdict must flip to
+    ``accepted=False`` so the policy gate actually works.
+    """
+    darwin_spec = _make_profile_spec(
+        profiles, "darwin-skill-quality", blocking=True, content_hash="e" * 64
+    )
+    secret_spec = _make_profile_spec(profiles, "secret-privacy-risk", blocking=True)
+    results = [
+        _make_profile_result(profiles, "secret-privacy-risk", status="PASS"),
+        _make_profile_result(
+            profiles,
+            "darwin-skill-quality",
+            status="FAIL",
+            findings=(
+                {
+                    "id": "darwin-skill-quality.dimension.examples",
+                    "message": "examples are too thin",
+                },
+            ),
+            dimension_scores=tuple(
+                {"id": d, "score": 0.3} for d in profiles.DARWIN_DIMENSIONS
+            ),
+        ),
+    ]
+    verdict = profiles.evaluate_acceptance(
+        results,
+        profile_specs={
+            _spec_id(darwin_spec): darwin_spec,
+            _spec_id(secret_spec): secret_spec,
+        },
+    )
+    assert verdict.get("accepted") is False, (
+        f"Darwin FAIL with blocking=True must set accepted=False "
+        f"(Issue #22 AC5); got verdict={verdict!r}"
+    )
+
+
+def test_darwin_supplemental_failure_does_not_block_with_dimensions(
+    profiles: Any,
+) -> None:
+    """Issue #22 AC4: a default-supplemental Darwin FAIL does not block.
+
+    Even with rich per-dimension scores on the result, the
+    default (``blocking=False``) Darwin profile must not flip
+    acceptance to ``False`` — the scores are advisory, not a
+    hard gate.
+    """
+    darwin_spec = _make_profile_spec(
+        profiles, "darwin-skill-quality", blocking=False, content_hash="d" * 64
+    )
+    secret_spec = _make_profile_spec(profiles, "secret-privacy-risk", blocking=True)
+    results = [
+        _make_profile_result(profiles, "secret-privacy-risk", status="PASS"),
+        _make_profile_result(
+            profiles,
+            "darwin-skill-quality",
+            status="FAIL",
+            dimension_scores=tuple(
+                {"id": d, "score": 0.2} for d in profiles.DARWIN_DIMENSIONS
+            ),
+        ),
+    ]
+    verdict = profiles.evaluate_acceptance(
+        results,
+        profile_specs={
+            _spec_id(darwin_spec): darwin_spec,
+            _spec_id(secret_spec): secret_spec,
+        },
+    )
+    assert verdict.get("accepted") is True, (
+        f"supplemental Darwin FAIL must not block acceptance "
+        f"(Issue #22 AC4); got verdict={verdict!r}"
+    )
+
+
+def test_darwin_default_content_hash_is_in_harness_identity(
+    profiles: Any,
+) -> None:
+    """Issue #22: the 9-dimension rubric shifts the built-in content hash.
+
+    The Darwin rule summary used to compute the built-in
+    content hash must reference the 9-dimension rubric; the
+    harness identity must round-trip through JSON so receipts
+    can carry it. This is the cross-cutting wiring test for
+    AC1+AC2.
+    """
+    specs = [_make_profile_spec(profiles, pid) for pid in BUILTIN_PROFILE_IDS]
+    digest = profiles.compute_evaluation_harness_sha(specs)
+    encoded = json.dumps({"harness_sha": digest, "darwin": profiles.DARWIN_DIMENSIONS})
+    decoded = json.loads(encoded)
+    assert decoded["darwin"] == list(profiles.DARWIN_DIMENSIONS), (
+        f"DARWIN_DIMENSIONS must round-trip through JSON; "
+        f"got {decoded['darwin']!r}"
+    )
+    assert len(decoded["harness_sha"]) == 64, (
+        f"harness sha must be a 64-char hex digest; "
+        f"got {len(decoded['harness_sha'])} chars"
     )

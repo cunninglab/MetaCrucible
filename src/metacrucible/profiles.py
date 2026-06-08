@@ -18,6 +18,15 @@ the three acceptance criteria from issue #21:
      supplemental by default; their findings surface on the
      verdict but do not change ``accepted`` to ``False``.
 
+Issue #22 extends the Darwin profile with a 9-dimension
+SkillLens-derived rubric:
+
+  * :data:`DARWIN_DIMENSIONS` — the pinned 9 dimension ids.
+  * :class:`ProfileResult.dimension_scores` — per-dimension scores
+    carried on the result, machine-readable via ``as_dict()``.
+  * :func:`weakest_darwin_dimensions` — deterministic ranking
+    helper (ascending score, ties broken by ascending id).
+
 Public surface
 --------------
 
@@ -25,22 +34,26 @@ Public surface
 * :data:`ROUTING_SURFACE_SAFETY_ID` / :data:`ROUTING_SURFACE_SAFETY_VERSION`
 * :data:`SECRET_PRIVACY_RISK_ID` / :data:`SECRET_PRIVACY_RISK_VERSION`
 * :data:`DARWIN_SKILL_QUALITY_ID` / :data:`DARWIN_SKILL_QUALITY_VERSION`
+* :data:`DARWIN_DIMENSIONS` — the 9-dimension rubric (Issue #22).
 * :data:`BUILTIN_PROFILE_IDS` — the four pinned built-in profile ids.
 * :data:`BUILTIN_PROFILES` — a tuple of :class:`ProfileSpec` for every
   built-in profile (id, version, blocking, built_in, content_hash).
 * :class:`ProfileSpec` — versioned identity for a profile.
 * :class:`ProfileResult` — top-level ``PASS`` / ``FAIL`` / ``BLOCKED``
-  result plus per-rule blockers and supplemental findings.
+  result plus per-rule blockers, supplemental findings, and
+  per-dimension scores (Issue #22).
 * :func:`select_triggers` — which profiles MUST run for a given
   artifact surface (e.g. ``routing_touched`` flips the routing-safety
   trigger).
 * :func:`select_supplemental` — which profiles run by default as
   supplemental review layers.
 * :func:`compute_evaluation_harness_sha` — produce a hex digest over
-  every profile id, version, content hash, config hash, and the
+  every profile id, version, content hash, config hash, and
   disabled-state of every configurable profile.
 * :func:`evaluate_acceptance` — aggregate per-profile results into a
   blocking verdict and a supplemental-findings list.
+* :func:`weakest_darwin_dimensions` — deterministic ranking of
+  the n lowest-scoring Darwin dimensions (Issue #22).
 
 Harness identity
 ----------------
@@ -72,6 +85,7 @@ from typing import Any, Iterable, Mapping, Sequence
 __all__ = [
     "BUILTIN_PROFILE_IDS",
     "BUILTIN_PROFILES",
+    "DARWIN_DIMENSIONS",
     "DARWIN_SKILL_QUALITY_ID",
     "DARWIN_SKILL_QUALITY_VERSION",
     "ROUTING_SURFACE_SAFETY_ID",
@@ -86,6 +100,7 @@ __all__ = [
     "evaluate_acceptance",
     "select_supplemental",
     "select_triggers",
+    "weakest_darwin_dimensions",
 ]
 
 
@@ -129,6 +144,36 @@ HARDCODED_SAFETY_PROFILE_IDS: frozenset[str] = frozenset(
 
 
 # --------------------------------------------------------------------------- #
+# Darwin 9-dimension rubric (Issue #22)                                        #
+# --------------------------------------------------------------------------- #
+#
+# The Darwin skill-quality profile is a SkillLens-derived 9-dimension
+# rubric. The dimension ids are the machine contract: they show up
+# in ``ProfileResult.dimension_scores`` and in the deterministic
+# ``weakest_darwin_dimensions`` ranking. Adding, removing, or
+# renaming a dimension is a rubric change; a content-hash bump
+# will follow (see :data:`_DARWIN_SKILL_QUALITY_RULES`) and every
+# cached result computed under the old rubric will be invalidated
+# by the harness identity digest.
+#
+# The dimension set is intentionally a ``tuple`` so iteration order
+# is byte-stable and downstream reports can render the breakdown
+# in the canonical order without an extra sort.
+
+DARWIN_DIMENSIONS: tuple[str, ...] = (
+    "trigger_clarity",
+    "input_contract",
+    "output_contract",
+    "invariants",
+    "failure_modes",
+    "examples",
+    "scope_boundaries",
+    "runtime_neutrality",
+    "evaluability",
+)
+
+
+# --------------------------------------------------------------------------- #
 # ProfileSpec — versioned identity for a profile                              #
 # --------------------------------------------------------------------------- #
 
@@ -158,7 +203,11 @@ class ProfileSpec:
         ``True`` for hard-coded safety/evidence profiles whose
         ``FAIL`` / ``BLOCKED`` verdicts can block acceptance.
         ``False`` for supplemental review layers that only report
-        findings.
+        findings. ADR 0033: ``darwin-skill-quality.v1`` is
+        ``blocking=False`` by default; a project policy that
+        promotes it to ``blocking=True`` (hashed into the harness
+        identity via the config hash) turns a Darwin FAIL into an
+        acceptance block.
     built_in:
         ``True`` for profiles shipped with MetaCrucible; ``False``
         for custom user-defined profiles. Built-in safety profiles
@@ -232,8 +281,10 @@ _SECRET_PRIVACY_RISK_RULES: str = (
     "hard-coded; cannot be disabled"
 )
 _DARWIN_SKILL_QUALITY_RULES: str = (
-    "Darwin 9-dimension SkillLens-derived rubric; non-blocking by "
-    "default; supplemental review layer"
+    "Darwin 9-dimension SkillLens-derived rubric "
+    "(trigger_clarity, input_contract, output_contract, invariants, "
+    "failure_modes, examples, scope_boundaries, runtime_neutrality, "
+    "evaluability); non-blocking by default; supplemental review layer"
 )
 
 
@@ -301,7 +352,9 @@ class ProfileResult:
     to ``FAIL``; an unresolved required ambiguity flips it to
     ``BLOCKED``); ``findings`` is the list of supplemental
     findings (advisories, borderline scores, weak-evidence notes)
-    that do not block acceptance by themselves.
+    that do not block acceptance by themselves; ``dimension_scores``
+    is the per-dimension breakdown used by rubric profiles such as
+    ``darwin-skill-quality.v1`` (Issue #22).
 
     Attributes
     ----------
@@ -325,6 +378,13 @@ class ProfileResult:
         with at least ``id`` (str) and ``message`` (str).
         Findings surface on the acceptance verdict regardless of
         status and never block acceptance.
+    dimension_scores:
+        Optional per-dimension score sequence (Issue #22). Each
+        entry is a mapping with at least ``id`` (str) and
+        ``score`` (numeric). Rubric profiles such as Darwin
+        populate this field; non-rubric profiles leave it
+        empty. The field is preserved verbatim by
+        :meth:`as_dict` so receipts can carry the breakdown.
     """
 
     profile_id: str
@@ -332,6 +392,7 @@ class ProfileResult:
     status: str
     blockers: tuple[Mapping[str, str], ...] = ()
     findings: tuple[Mapping[str, str], ...] = ()
+    dimension_scores: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if self.status not in _PROFILE_STATUSES:
@@ -358,6 +419,7 @@ class ProfileResult:
             "status": self.status,
             "blockers": [dict(b) for b in self.blockers],
             "findings": [dict(f) for f in self.findings],
+            "dimension_scores": [dict(s) for s in self.dimension_scores],
         }
 
 
@@ -465,8 +527,8 @@ def compute_evaluation_harness_sha(
     # the contract: a future change to the field set is a contract
     # change because every cached result computed under the old
     # shape would still hit the cache under the new shape, which
-    # is exactly the failure mode the harness identity is meant
-    # to prevent.
+    # is exactly the failure mode the harness identity is meant to
+    # prevent.
     identity: dict[str, Any] = {
         "schema": "metacrucible.evaluation_harness_sha.v1",
         "config_hash": config_hash,
@@ -555,3 +617,70 @@ def evaluate_acceptance(
         "blockers": blockers,
         "supplemental_findings": supplemental_findings,
     }
+
+
+# --------------------------------------------------------------------------- #
+# weakest_darwin_dimensions (Issue #22)                                        #
+# --------------------------------------------------------------------------- #
+
+
+def weakest_darwin_dimensions(
+    result: ProfileResult,
+    *,
+    n: int = 3,
+) -> tuple[Mapping[str, Any], ...]:
+    """Return the ``n`` lowest-scoring Darwin dimensions, deterministically.
+
+    The ranking is **ascending score** (worst first); ties are
+    broken by **ascending dimension id** so the report is
+    byte-stable across processes and Python versions. The
+    default ``n=3`` matches the common "show me the three worst
+    dimensions" report shape; callers can request any non-
+    negative ``n``.
+
+    Parameters
+    ----------
+    result:
+        A :class:`ProfileResult` produced by the Darwin profile.
+        Any other profile id raises :class:`ValueError` so a
+        runtime bug cannot silently rank the wrong dimension
+        set.
+    n:
+        Number of weakest dimensions to return. ``n=0`` returns
+        an empty tuple; negative ``n`` raises :class:`ValueError`.
+
+    Returns
+    -------
+    tuple
+        A tuple of per-dimension score mappings (in the same
+        shape the caller passed in) ordered from weakest to
+        strongest among the returned slice.
+
+    Raises
+    ------
+    ValueError
+        If ``result.profile_id`` is not ``darwin-skill-quality``
+        or if ``n`` is negative.
+    """
+    if result.profile_id != DARWIN_SKILL_QUALITY_ID:
+        raise ValueError(
+            f"weakest_darwin_dimensions requires a darwin-skill-quality "
+            f"result; got profile_id={result.profile_id!r}"
+        )
+    if not isinstance(n, int) or n < 0:
+        raise ValueError(
+            f"weakest_darwin_dimensions: n must be a non-negative int; "
+            f"got n={n!r}"
+        )
+
+    # Sort key is (score, id). ``float(d['score'])`` keeps the
+    # contract permissive — callers may pass int or float scores
+    # — and ``str(d['id'])`` defends against a non-str id
+    # slipping through and breaking the tie-break ordering.
+    sorted_scores = sorted(
+        result.dimension_scores,
+        key=lambda d: (float(d["score"]), str(d["id"])),
+    )
+    if n == 0:
+        return ()
+    return tuple(sorted_scores[:n])

@@ -23,16 +23,22 @@ The module exposes:
   ``control_plane``, ``providers``, and ``runtime_adapters``.
 * :data:`SECRET_FIELD_BLOCKER` /
   :data:`RUNTIME_ADAPTER_LEAK_BLOCKER` /
+  :data:`STRUCTURED_OUTPUT_PROBE_BLOCKER` /
+  :data:`STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER` /
   :data:`EXPECTED_BLOCKERS` — stable blocker ids the resolver
   emits on validation failure (machine contract; do not rename).
 * :func:`resolve_provider_config` — accept layered dict configs
   in precedence (built-in defaults < user < project < CLI) and
   return the resolved config or a list of blockers.
+* :func:`run_structured_output_probe` — run the structured-output
+  capability probe for ``judge`` and ``optimizer`` (Issue #16).
+* :func:`call_structured` — call an LLM and validate its response
+  against a JSON Schema with bounded repair retries (Issue #17).
 
 References
 ----------
 - ADR 0034 (control-plane provider configuration).
-- Issue #15 acceptance criteria.
+- Issue #15, Issue #16, Issue #17 acceptance criteria.
 """
 from __future__ import annotations
 
@@ -44,9 +50,11 @@ __all__ = [
     "SECRET_FIELD_BLOCKER",
     "RUNTIME_ADAPTER_LEAK_BLOCKER",
     "STRUCTURED_OUTPUT_PROBE_BLOCKER",
+    "STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER",
     "DEFAULT_PROVIDER_CONFIG",
     "resolve_provider_config",
     "run_structured_output_probe",
+    "call_structured",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -99,10 +107,19 @@ STRUCTURED_OUTPUT_PROBE_BLOCKER: str = (
     "provider-config-structured-output-probe-failed"
 )
 
+# Stable blocker id emitted by :func:`call_structured` when a structured
+# provider response fails JSON Schema validation after the bounded
+# repair retry budget is exhausted (Issue #17, ADR 0034). The id is
+# part of the machine contract: callers branch on it verbatim.
+STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER: str = (
+    "provider-config-structured-output-schema-validation-failed"
+)
+
 EXPECTED_BLOCKERS: dict[str, str] = {
     "secret_field": SECRET_FIELD_BLOCKER,
     "runtime_leak": RUNTIME_ADAPTER_LEAK_BLOCKER,
     "structured_output_probe": STRUCTURED_OUTPUT_PROBE_BLOCKER,
+    "structured_output_schema": STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER,
 }
 
 # Built-in defaults for the resolver. The defaults are the
@@ -586,4 +603,240 @@ def _probe_evidence_entry(
         "latency_ms": latency_ms,
         "reason": reason,
         "raw": raw,
+    }
+
+
+
+# --------------------------------------------------------------------------- #
+# Public: structured-output JSON Schema validation + bounded repair          #
+#          (Issue #17, ADR 0034)                                              #
+# --------------------------------------------------------------------------- #
+
+# JSON Schema type names we recognize in the structured-output
+# contract. The validator only needs the subset the contract
+# actually exercises (object/array/string/number/integer/boolean/
+# null); unknown types are treated as a no-op pass so future
+# JSON Schema revisions do not break the contract.
+_SCHEMA_TYPE_NAMES: tuple[str, ...] = (
+    "object",
+    "array",
+    "string",
+    "number",
+    "integer",
+    "boolean",
+    "null",
+)
+
+
+def _check_schema_type(value: Any, expected: str) -> bool:
+    """Return True iff ``value`` matches the JSON Schema ``expected`` type.
+
+    The JSON Schema ``integer`` and ``number`` types must reject
+    booleans even though ``bool`` is a subclass of ``int`` in
+    Python, so we explicitly exclude ``bool`` from the numeric
+    checks.
+    """
+    if expected == "object":
+        return isinstance(value, Mapping)
+    if expected == "array":
+        return isinstance(value, list)
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "null":
+        return value is None
+    return True
+
+
+def _validate_against_schema(
+    value: Any,
+    schema: Any,
+    path: str,
+    errors: list[str],
+) -> None:
+    """Recursively validate ``value`` against ``schema``, appending to ``errors``.
+
+    The validator implements a minimal JSON Schema subset that
+    covers the structured-output contract: ``type`` for any node,
+    and ``properties`` / ``required`` / ``additionalProperties`` for
+    object nodes. Anything outside the subset is ignored so the
+    validator stays boring and dependency-free (Issue #17 keeps
+    the implementation stdlib-only; ADR 0034 forbids new
+    dependencies for the MVP).
+    """
+    if not isinstance(schema, Mapping):
+        return
+
+    expected_type_raw: Any = schema.get("type")
+    if isinstance(expected_type_raw, str) and expected_type_raw in _SCHEMA_TYPE_NAMES:
+        if not _check_schema_type(value, expected_type_raw):
+            errors.append(
+                f"{path}: expected type {expected_type_raw!r}, "
+                f"got {type(value).__name__}"
+            )
+            return
+
+    if (
+        isinstance(expected_type_raw, str)
+        and expected_type_raw == "object"
+        and isinstance(value, Mapping)
+    ):
+        properties: Any = schema.get("properties", {})
+        if isinstance(properties, Mapping):
+            for key, child_value in value.items():
+                if key in properties:
+                    _validate_against_schema(
+                        child_value,
+                        properties[key],
+                        f"{path}.{key}",
+                        errors,
+                    )
+
+        required: Any = schema.get("required", [])
+        if isinstance(required, list):
+            for key in required:
+                if key not in value:
+                    errors.append(
+                        f"{path}: missing required property {key!r}"
+                    )
+
+        additional: Any = schema.get("additionalProperties", True)
+        if additional is False and isinstance(properties, Mapping):
+            for key in value:
+                if key not in properties:
+                    errors.append(
+                        f"{path}: property {key!r} is not allowed "
+                        "(additionalProperties=False)"
+                    )
+
+    if (
+        isinstance(expected_type_raw, str)
+        and expected_type_raw == "array"
+        and isinstance(value, list)
+    ):
+        items: Any = schema.get("items")
+        if isinstance(items, Mapping):
+            for index, item in enumerate(value):
+                _validate_against_schema(
+                    item, items, f"{path}[{index}]", errors
+                )
+
+
+def call_structured(
+    provider_name: str,
+    provider_spec: Mapping[str, Any],
+    model: str,
+    schema: Mapping[str, Any],
+    call_fn: Callable[..., Any],
+    *,
+    max_repair_attempts: int = 1,
+) -> dict[str, Any]:
+    """Call ``call_fn`` and validate its response against ``schema``.
+
+    Issue #17 + ADR 0034: every structured provider response must
+    be JSON-Schema-validated before the caller is allowed to act
+    on it. When a response fails validation the same ``call_fn``
+    is re-invoked with a ``repair_context`` mapping exposing
+    ``schema`` and ``validation_errors`` so the LLM (or any
+    caller-side repair logic) can self-correct. Repairs are
+    bounded by ``max_repair_attempts``; once that budget is
+    exhausted the function returns the stable
+    :data:`STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER` and does
+    not raise (Issue #17: schema validation failure is a
+    result-level outcome, not an exception).
+
+    The first call to ``call_fn`` is always issued with
+    ``repair_context=None``. Every retry passes a mapping whose
+    keys include at least ``schema`` and ``validation_errors``
+    (extra keys are allowed but never required). ``call_fn`` is
+    invoked as ``call_fn(repair_context=<mapping or None>)``.
+
+    Parameters
+    ----------
+    provider_name:
+        Logical provider name (e.g. ``"anthropic"``). Used only
+        for blocker messages; never echoed as a credential
+        reference (ADR 0034).
+    provider_spec:
+        Resolved provider spec from the providers catalog. Passed
+        through unchanged on every call; not interpreted here.
+    model:
+        Model name passed through unchanged on every call.
+    schema:
+        JSON Schema dict the response must satisfy. Owned by the
+        caller; we never mutate it.
+    call_fn:
+        Callable invoked as ``call_fn(repair_context=...)``. May
+        be a thin wrapper around the provider SDK or any local
+        test double.
+    max_repair_attempts:
+        Maximum number of repair retries after the initial call.
+        ``0`` means "one call only" (no retries); ``1`` (the
+        default) means "one initial call plus one retry". The
+        total number of invocations is therefore
+        ``1 + max_repair_attempts``.
+
+    Returns
+    -------
+    dict
+        ``{"ok": True, "value": <response>, "attempts": int,
+        "validation_errors": [], "blockers": []}`` on success;
+        ``{"ok": False, "value": None, "attempts": int,
+        "validation_errors": <non-empty list>,
+        "blockers": [{"id": stable, "message": non-empty str}]}``
+        on final failure.
+    """
+    if max_repair_attempts < 0:
+        max_repair_attempts = 0
+
+    attempts = 0
+    repair_context: Any = None
+    last_errors: list[str] = []
+
+    while True:
+        attempts += 1
+        response: Any = call_fn(repair_context=repair_context)
+        errors: list[str] = []
+        _validate_against_schema(response, schema, path="$", errors=errors)
+        if not errors:
+            return {
+                "ok": True,
+                "value": response,
+                "attempts": attempts,
+                "validation_errors": [],
+                "blockers": [],
+            }
+        last_errors = errors
+        if attempts > max_repair_attempts:
+            break
+        repair_context = {
+            "schema": schema,
+            "validation_errors": errors,
+            "provider_name": provider_name,
+            "provider_spec": provider_spec,
+            "model": model,
+        }
+
+    return {
+        "ok": False,
+        "value": None,
+        "attempts": attempts,
+        "validation_errors": last_errors,
+        "blockers": [
+            _blocker(
+                STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER,
+                (
+                    f"structured-output response from provider "
+                    f"{provider_name!r} model {model!r} failed JSON Schema "
+                    f"validation after {attempts} attempt(s); see "
+                    f"validation_errors for details "
+                    f"(Issue #17, ADR 0034)"
+                ),
+            ),
+        ],
     }

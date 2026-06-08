@@ -830,3 +830,315 @@ def test_run_structured_output_probe_default_blocks_unknown_provider_type(
         f"default probe must reject unknown provider type; got result={result!r}"
     )
     assert EXPECTED_STRUCTURED_OUTPUT_PROBE_BLOCKER in _blocker_ids(result)
+
+
+# --------------------------------------------------------------------------- #
+# Issue #17: JSON Schema validation + bounded repair retry                    #
+# --------------------------------------------------------------------------- #
+# Issue #17 + ADR 0034 require that every structured call's response is
+# validated against a JSON Schema, and that a failing response is repaired
+# via a bounded number of retry calls to the same ``call_fn``. Contract:
+#
+#   * ``call_structured(provider_name, provider_spec, model, schema, call_fn,
+#       *, max_repair_attempts=1)`` is the public entry point.
+#   * The first call to ``call_fn`` receives ``repair_context=None``; on
+#     every retry the call_fn receives a mapping carrying
+#     ``validation_errors`` and ``schema`` so the LLM/caller can self-correct.
+#   * Retries stop after ``max_repair_attempts``; final failure returns the
+#     stable STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER.
+#   * On success: ``{"ok": True, "value": <validated>, "attempts": int,
+#     "validation_errors": [], "blockers": []}``.
+#   * On final failure: ``{"ok": False, "value": None, "attempts": int,
+#     "validation_errors": non-empty list,
+#     "blockers": [{"id": stable, "message": non-empty str}]}``.
+
+# Stable blocker id emitted by ``call_structured`` on a final validation
+# failure. The id is part of the machine contract; renaming is a breaking
+# change.
+EXPECTED_STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER: str = (
+    "provider-config-structured-output-schema-validation-failed"
+)
+
+# A minimal JSON Schema for the call_structured fixtures. The schema is
+# intentionally simple so any reasonable JSON Schema validator
+# (jsonschema, pydantic, hand-rolled) will agree on pass/fail semantics.
+_CALL_STRUCTURED_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "answer": {"type": "string"},
+    },
+    "required": ["answer"],
+    "additionalProperties": False,
+}
+
+_CALL_STRUCTURED_VALID_RESPONSE: dict[str, Any] = {"answer": "hello"}
+_CALL_STRUCTURED_INVALID_RESPONSE: dict[str, Any] = {"answer": 42}
+
+
+def _build_queued_call_fn(responses: list[Any]) -> tuple[Any, list[Any]]:
+    """Build a deterministic ``call_fn`` that returns a queued value per call.
+
+    The returned call_fn accepts the ``repair_context`` keyword (and, as
+    a defensive fallback, a single positional argument) and records
+    every call's ``repair_context``. The recorder is the second element
+    of the returned tuple so each test can assert exactly what the
+    production code passed.
+    """
+    recorded: list[Any] = []
+    queue = list(responses)
+
+    def call_fn(*args: Any, **kwargs: Any) -> Any:
+        repair_context: Any = kwargs.get("repair_context")
+        if repair_context is None and args:
+            repair_context = args[0]
+        recorded.append(repair_context)
+        if not queue:
+            raise AssertionError(
+                f"call_fn invoked more times than queued responses "
+                f"({len(responses)} queued; got call #{len(recorded)})"
+            )
+        return queue.pop(0)
+
+    return call_fn, recorded
+
+
+def test_call_structured_module_exposes_blocker_constant_and_entry(
+    provider_config: Any,
+) -> None:
+    """Issue #17: module must expose the validation blocker constant and entry point."""
+    for name in (
+        "STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER",
+        "call_structured",
+    ):
+        assert hasattr(provider_config, name), (
+            f"{PROVIDER_CONFIG_MODULE!r} must expose {name!r} (Issue #17); "
+            f"got attributes "
+            f"{sorted(a for a in dir(provider_config) if not a.startswith('_'))!r}"
+        )
+
+
+def test_call_structured_blocker_id_matches_pinned_value(
+    provider_config: Any,
+) -> None:
+    """The validation blocker id is part of the machine contract; it must be stable."""
+    assert (
+        provider_config.STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER
+        == EXPECTED_STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER
+    ), (
+        f"STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER must be exactly "
+        f"{EXPECTED_STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER!r}; got "
+        f"{provider_config.STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER!r}"
+    )
+    assert isinstance(provider_config.EXPECTED_BLOCKERS, dict)
+    assert (
+        provider_config.EXPECTED_BLOCKERS.get("structured_output_schema")
+        == EXPECTED_STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER
+    ), (
+        f"EXPECTED_BLOCKERS must include the structured_output_schema entry "
+        f"with the stable id; got {provider_config.EXPECTED_BLOCKERS!r}"
+    )
+
+
+def test_call_structured_passes_when_response_is_valid(
+    provider_config: Any,
+) -> None:
+    """A first-attempt valid response returns the value with no repair and no blockers."""
+    call_fn, recorded = _build_queued_call_fn([_CALL_STRUCTURED_VALID_RESPONSE])
+    result = provider_config.call_structured(
+        "anthropic",
+        {"type": "anthropic", "api_key_env": "ANTHROPIC_API_KEY"},
+        "claude-sonnet-4-5",
+        _CALL_STRUCTURED_SCHEMA,
+        call_fn,
+    )
+    assert isinstance(result, dict), (
+        f"call_structured must return a dict result; got {type(result).__name__}"
+    )
+    assert result.get("ok") is True, (
+        f"valid first-attempt response must yield ok=True; got result={result!r}"
+    )
+    assert result.get("value") == _CALL_STRUCTURED_VALID_RESPONSE, (
+        f"value must round-trip the validated response; got "
+        f"{result.get('value')!r}"
+    )
+    assert result.get("validation_errors") == [], (
+        f"success must report an empty validation_errors list; got "
+        f"{result.get('validation_errors')!r}"
+    )
+    assert result.get("blockers") == [], (
+        f"success must emit no blockers; got {result.get('blockers')!r}"
+    )
+    assert result.get("attempts") == 1, (
+        f"first-attempt success must have attempts=1; got "
+        f"{result.get('attempts')!r}"
+    )
+    assert len(recorded) == 1, (
+        f"first-attempt success must call call_fn exactly once; got "
+        f"{len(recorded)} calls"
+    )
+    assert recorded[0] is None, (
+        f"first call must receive repair_context=None; got {recorded[0]!r}"
+    )
+
+
+def test_call_structured_repairs_invalid_response_and_passes_on_retry(
+    provider_config: Any,
+) -> None:
+    """An invalid first response triggers a retry whose repair_context exposes errors + schema."""
+    call_fn, recorded = _build_queued_call_fn(
+        [_CALL_STRUCTURED_INVALID_RESPONSE, _CALL_STRUCTURED_VALID_RESPONSE]
+    )
+    result = provider_config.call_structured(
+        "anthropic",
+        {"type": "anthropic", "api_key_env": "ANTHROPIC_API_KEY"},
+        "claude-sonnet-4-5",
+        _CALL_STRUCTURED_SCHEMA,
+        call_fn,
+        max_repair_attempts=1,
+    )
+    assert isinstance(result, dict)
+    assert result.get("ok") is True, (
+        f"retry-with-valid-response must yield ok=True; got result={result!r}"
+    )
+    assert result.get("value") == _CALL_STRUCTURED_VALID_RESPONSE, (
+        f"value must be the repaired response; got {result.get('value')!r}"
+    )
+    assert result.get("attempts") == 2, (
+        f"first invalid + one retry must yield attempts=2; got "
+        f"{result.get('attempts')!r}"
+    )
+    assert result.get("blockers") == [], (
+        f"successful repair must emit no blockers; got {result.get('blockers')!r}"
+    )
+    assert len(recorded) == 2, (
+        f"expected exactly 2 calls (initial + 1 retry); got {len(recorded)}"
+    )
+    assert recorded[0] is None, (
+        f"first call must receive repair_context=None; got {recorded[0]!r}"
+    )
+    repair_context = recorded[1]
+    assert isinstance(repair_context, Mapping), (
+        f"retry call must receive a mapping as repair_context; got "
+        f"{type(repair_context).__name__}"
+    )
+    assert "validation_errors" in repair_context, (
+        f"repair_context must include 'validation_errors' for the LLM/caller "
+        f"to self-correct; got keys={sorted(repair_context.keys())!r}"
+    )
+    validation_errors = repair_context["validation_errors"]
+    assert isinstance(validation_errors, list) and validation_errors, (
+        f"repair_context['validation_errors'] must be a non-empty list; got "
+        f"{validation_errors!r}"
+    )
+    assert "schema" in repair_context, (
+        f"repair_context must include the 'schema' to validate against on "
+        f"retry; got keys={sorted(repair_context.keys())!r}"
+    )
+    assert repair_context["schema"] == _CALL_STRUCTURED_SCHEMA, (
+        f"repair_context['schema'] must round-trip the JSON Schema; got "
+        f"{repair_context['schema']!r}"
+    )
+
+
+def test_call_structured_stops_after_max_repair_attempts_with_stable_blocker(
+    provider_config: Any,
+) -> None:
+    """A persistently invalid response must stop after max_repair_attempts and return the blocker."""
+    max_repair_attempts = 2
+    call_fn, recorded = _build_queued_call_fn(
+        [_CALL_STRUCTURED_INVALID_RESPONSE] * (1 + max_repair_attempts)
+    )
+    result = provider_config.call_structured(
+        "anthropic",
+        {"type": "anthropic", "api_key_env": "ANTHROPIC_API_KEY"},
+        "claude-sonnet-4-5",
+        _CALL_STRUCTURED_SCHEMA,
+        call_fn,
+        max_repair_attempts=max_repair_attempts,
+    )
+    assert isinstance(result, dict)
+    assert result.get("ok") is False, (
+        f"final-failure must yield ok=False; got result={result!r}"
+    )
+    assert result.get("value") is None, (
+        f"final-failure must have value=None; got {result.get('value')!r}"
+    )
+    validation_errors = result.get("validation_errors")
+    assert isinstance(validation_errors, list) and validation_errors, (
+        f"final-failure must report a non-empty validation_errors list; got "
+        f"{validation_errors!r}"
+    )
+    assert result.get("attempts") == 1 + max_repair_attempts, (
+        f"attempts must equal 1 initial + max_repair_attempts retries; got "
+        f"{result.get('attempts')!r}"
+    )
+    assert len(recorded) == 1 + max_repair_attempts, (
+        f"call_fn must be invoked 1 + max_repair_attempts times; got "
+        f"{len(recorded)} calls"
+    )
+    blockers = result.get("blockers")
+    assert isinstance(blockers, list) and blockers, (
+        f"final-failure must emit at least one blocker; got {blockers!r}"
+    )
+    blocker_ids = [
+        b.get("id") for b in blockers if isinstance(b, dict)
+    ]
+    assert (
+        EXPECTED_STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER in blocker_ids
+    ), (
+        f"final-failure must emit blocker id "
+        f"{EXPECTED_STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER!r}; got "
+        f"{blocker_ids!r}"
+    )
+    for blocker in blockers:
+        assert isinstance(blocker, dict), (
+            f"every blocker must be a dict; got {type(blocker).__name__}"
+        )
+        assert (
+            isinstance(blocker.get("id"), str) and blocker["id"]
+        ), (
+            f"every blocker must have a non-empty id; got {blocker!r}"
+        )
+        message = blocker.get("message")
+        assert isinstance(message, str) and message, (
+            f"every blocker must carry a non-empty message string; got "
+            f"{message!r}"
+        )
+
+
+def test_call_structured_does_not_retry_when_max_repair_attempts_is_zero(
+    provider_config: Any,
+) -> None:
+    """max_repair_attempts=0 means: no repair retry at all, even on invalid responses."""
+    call_fn, recorded = _build_queued_call_fn([_CALL_STRUCTURED_INVALID_RESPONSE])
+    result = provider_config.call_structured(
+        "anthropic",
+        {"type": "anthropic", "api_key_env": "ANTHROPIC_API_KEY"},
+        "claude-sonnet-4-5",
+        _CALL_STRUCTURED_SCHEMA,
+        call_fn,
+        max_repair_attempts=0,
+    )
+    assert isinstance(result, dict)
+    assert result.get("ok") is False, (
+        f"max_repair_attempts=0 with an invalid response must yield ok=False; "
+        f"got result={result!r}"
+    )
+    assert result.get("attempts") == 1, (
+        f"max_repair_attempts=0 must yield attempts=1; got "
+        f"{result.get('attempts')!r}"
+    )
+    assert len(recorded) == 1, (
+        f"max_repair_attempts=0 must not call call_fn more than once; got "
+        f"{len(recorded)} calls"
+    )
+    assert recorded[0] is None, (
+        f"first call must still receive repair_context=None; got "
+        f"{recorded[0]!r}"
+    )
+    assert (
+        EXPECTED_STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER in _blocker_ids(result)
+    ), (
+        f"max_repair_attempts=0 final-failure must still emit the stable "
+        f"blocker id; got blocker_ids={_blocker_ids(result)!r}"
+    )

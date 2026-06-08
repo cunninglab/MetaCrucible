@@ -47,14 +47,19 @@ from typing import Any, Callable, Mapping
 
 __all__ = [
     "EXPECTED_BLOCKERS",
+    "EXPECTED_WARNINGS",
     "SECRET_FIELD_BLOCKER",
     "RUNTIME_ADAPTER_LEAK_BLOCKER",
     "STRUCTURED_OUTPUT_PROBE_BLOCKER",
     "STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER",
+    "USAGE_MISSING_WARNING",
+    "COST_MISSING_WARNING",
+    "PROVIDER_USAGE_SCHEMA_VERSION",
     "DEFAULT_PROVIDER_CONFIG",
     "resolve_provider_config",
     "run_structured_output_probe",
     "call_structured",
+    "record_provider_run_outcome",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -114,12 +119,33 @@ STRUCTURED_OUTPUT_PROBE_BLOCKER: str = (
 STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER: str = (
     "provider-config-structured-output-schema-validation-failed"
 )
-
+# Stable warning ids emitted by :func:`record_provider_run_outcome`
+# (Issue #18). Per the issue's AC2, missing usage/cost is a warning,
+# not a blocker: recording is observation, not enforcement. The ids
+# are the machine contract; downstream automation filters the
+# warning set out of the blocker set the same way the stream-json
+# parser does for ``stream-json-usage-missing``.
+USAGE_MISSING_WARNING: str = "provider-usage-missing"
+COST_MISSING_WARNING: str = "provider-cost-missing"
+# Schema version stamped on the ``provider_usage`` block in
+# ``state.json`` (Issue #18). Bumping this is a breaking change for
+# any consumer of state.json that branches on the provider_usage
+# shape.
+PROVIDER_USAGE_SCHEMA_VERSION: int = 1
+# Stable mapping from semantic key to stable warning id. Mirrors
+# :data:`EXPECTED_BLOCKERS` for the warning side. Callers and
+# downstream automation branch on the values verbatim; renaming
+# any value is a breaking change and must be paired with a
+# migration plan.
 EXPECTED_BLOCKERS: dict[str, str] = {
     "secret_field": SECRET_FIELD_BLOCKER,
     "runtime_leak": RUNTIME_ADAPTER_LEAK_BLOCKER,
     "structured_output_probe": STRUCTURED_OUTPUT_PROBE_BLOCKER,
     "structured_output_schema": STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER,
+}
+EXPECTED_WARNINGS: dict[str, str] = {
+    "usage_missing": USAGE_MISSING_WARNING,
+    "cost_missing": COST_MISSING_WARNING,
 }
 
 # Built-in defaults for the resolver. The defaults are the
@@ -840,3 +866,239 @@ def call_structured(
             ),
         ],
     }
+
+# --------------------------------------------------------------------------- #
+# Public: record provider run outcome (usage/cost) into state.json           #
+#          (Issue #18, ADR 0034)                                              #
+# --------------------------------------------------------------------------- #
+#
+# Issue #18 + ADR 0034: capture provider-neutral usage/cost data in
+# ``state.json`` so a future optimizer/receipt consumer can correlate
+# cost and tokens per run. The recorder is observation, not
+# enforcement: missing usage or cost is a warning, never a blocker,
+# and no hard cost cap is introduced.
+#
+# The on-disk shape in ``state.json`` is::
+#
+#     {
+#         "schema_version": 1,
+#         ...other state fields preserved...,
+#         "provider_usage": {
+#             "schema_version": <PROVIDER_USAGE_SCHEMA_VERSION>,
+#             "runs": [
+#                 {
+#                     "run_id": "run-abc",
+#                     "provider": "anthropic",
+#                     "model": "claude-sonnet-4-5",
+#                     "ts": "2026-06-08T00:00:00Z",
+#                     "usage": {<raw provider usage dict, or None>},
+#                     "cost": {<raw provider cost dict, or None>},
+#                 },
+#                 ...
+#             ],
+#         },
+#     }
+#
+# The ``runs`` list is keyed by ``run_id`` for idempotency: a
+# re-recorded run replaces its previous record (no double-count).
+# Raw ``usage`` and ``cost`` payloads are preserved verbatim so
+# Anthropic's ``input_tokens``/``output_tokens`` shape and OpenAI's
+# ``prompt_tokens``/``completion_tokens`` shape are both accepted
+# without coercion. Future ADR revisions can introduce
+# provider-specific normalizers without changing this function.
+
+
+def _now_iso_utc() -> str:
+    """Return the current UTC time as an ISO-8601 string with ``Z`` suffix.
+
+    Local copy of the helper that lives in :mod:`metacrucible.storage`
+    and :mod:`metacrucible.__main__`. We do not import those modules
+    here to keep the dependency graph one-way: ``provider_config``
+    is a leaf consumed by callers, not a consumer of ``storage``.
+    """
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc).isoformat(
+        timespec="seconds"
+    ).replace("+00:00", "Z")
+
+
+def record_provider_run_outcome(
+    storage: Any,
+    *,
+    run_id: str,
+    provider: str,
+    model: str,
+    usage: Mapping[str, Any] | None = None,
+    cost: Mapping[str, Any] | None = None,
+    timestamp: str | None = None,
+) -> dict[str, Any]:
+    """Record a provider run's usage and cost into ``state.json``.
+
+    Issue #18 + ADR 0034: provider-neutral usage/cost schema. The
+    recorder is observation, not enforcement:
+
+      - AC1: cost (and usage, when present) is recorded into the
+        ``provider_usage`` block of ``state.json``.
+      - AC2: missing ``usage`` or ``cost`` is a stable warning, never
+        a blocker. The result's ``ok`` is ``True`` whenever the
+        recorder successfully wrote ``state.json``; missing
+        fields never cause ``ok=False``.
+      - AC3: no hard cost cap is introduced. The function never
+        compares ``cost`` to any budget, threshold, or limit.
+        Cost is recorded, not policed.
+
+    Parameters
+    ----------
+    storage:
+        A :class:`metacrucible.storage.RepositoryStorage` instance
+        that owns the ``state.json`` file. The recorder reads the
+        current state, appends/replaces the ``provider_usage`` run
+        record, and writes the merged state back atomically.
+    run_id:
+        Stable identifier for the run (e.g. ``"run-abc"``). The
+        recorder is idempotent per ``run_id``: a re-recorded run
+        replaces the previous record so a retry does not
+        double-count tokens or cost.
+    provider:
+        Logical provider name (e.g. ``"anthropic"``,
+        ``"openai_compatible"``). Stored verbatim; not
+        normalized.
+    model:
+        Model name (e.g. ``"claude-sonnet-4-5"``). Stored verbatim.
+    usage:
+        Provider-neutral raw usage payload (any mapping). Common
+        shapes include Anthropic's
+        ``{"input_tokens": N, "output_tokens": M, ...}`` and
+        OpenAI's ``{"prompt_tokens": N, "completion_tokens": M, ...}``.
+        ``None`` (the default) means the provider did not supply
+        a usage block; a :data:`USAGE_MISSING_WARNING` is emitted.
+    cost:
+        Provider-neutral raw cost payload (any mapping). Common
+        shapes include ``{"usd": 0.001, "currency": "USD"}`` or
+        ``{"input_cost_usd": ..., "output_cost_usd": ...}``.
+        ``None`` (the default) means the provider did not supply
+        a cost block; a :data:`COST_MISSING_WARNING` is emitted.
+    timestamp:
+        ISO-8601 timestamp to stamp on the run record. ``None``
+        (the default) means "now" (UTC, ``Z`` suffix, second
+        precision).
+
+    Returns
+    -------
+    dict
+        ``{"ok": True, "state": <written state dict>,
+        "warnings": [{"id", "message"}, ...],
+        "blockers": []}``. The ``blockers`` key is always an empty
+        list (AC2: missing fields are never blockers). ``ok`` is
+        always ``True`` when ``storage`` exposes the read/write
+        methods; a missing ``storage`` or one without the right
+        methods raises ``AttributeError`` to the caller (the
+        recorder does not silently swallow contract violations).
+    """
+    if not hasattr(storage, "read_state") or not hasattr(storage, "write_state"):
+        raise AttributeError(
+            "record_provider_run_outcome requires a storage object with "
+            "read_state() and write_state() methods "
+            "(got {!r}; expected metacrucible.storage.RepositoryStorage)".format(
+                type(storage).__name__
+            )
+        )
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError(
+            f"run_id must be a non-empty string; got {run_id!r}"
+        )
+    if not isinstance(provider, str) or not provider:
+        raise ValueError(
+            f"provider must be a non-empty string; got {provider!r}"
+        )
+    if not isinstance(model, str) or not model:
+        raise ValueError(
+            f"model must be a non-empty string; got {model!r}"
+        )
+
+    warnings: list[dict[str, str]] = []
+    if not isinstance(usage, Mapping):
+        warnings.append(
+            {
+                "id": USAGE_MISSING_WARNING,
+                "message": (
+                    f"provider run {run_id!r} did not include a usage "
+                    "block; recording continues with usage=null"
+                ),
+            }
+        )
+        usage_payload: Mapping[str, Any] | None = None
+    else:
+        usage_payload = dict(usage)
+    if not isinstance(cost, Mapping):
+        warnings.append(
+            {
+                "id": COST_MISSING_WARNING,
+                "message": (
+                    f"provider run {run_id!r} did not include a cost "
+                    "block; recording continues with cost=null"
+                ),
+            }
+        )
+        cost_payload: Mapping[str, Any] | None = None
+    else:
+        cost_payload = dict(cost)
+
+    run_record: dict[str, Any] = {
+        "run_id": run_id,
+        "provider": provider,
+        "model": model,
+        "ts": timestamp if isinstance(timestamp, str) and timestamp else _now_iso_utc(),
+        "usage": usage_payload,
+        "cost": cost_payload,
+    }
+
+    # Read-modify-write state.json. Other state fields
+    # (current_best_revision, last_run_id, ...) are preserved so
+    # the rest of the CLI surface (init, promote, ...) keeps
+    # working unchanged.
+    try:
+        existing_raw = storage.read_state()
+    except Exception:
+        existing_raw = {}
+    existing: dict[str, Any] = (
+        dict(existing_raw) if isinstance(existing_raw, Mapping) else {}
+    )
+
+    provider_usage_raw: Any = existing.get("provider_usage")
+    if (
+        not isinstance(provider_usage_raw, Mapping)
+        or not isinstance(provider_usage_raw.get("runs"), list)
+    ):
+        provider_usage: dict[str, Any] = {
+            "schema_version": PROVIDER_USAGE_SCHEMA_VERSION,
+            "runs": [],
+        }
+    else:
+        provider_usage = dict(provider_usage_raw)
+        # Re-shape the runs list, keeping only dict entries.
+        provider_usage["runs"] = [
+            r for r in provider_usage["runs"] if isinstance(r, Mapping)
+        ]
+
+    # Idempotent per run_id: a re-recorded run replaces its previous
+    # entry so a retry does not double-count tokens or cost.
+    runs_list: list[Any] = [
+        r
+        for r in provider_usage["runs"]
+        if isinstance(r, Mapping) and r.get("run_id") != run_id
+    ]
+    runs_list.append(run_record)
+    provider_usage["runs"] = runs_list
+
+    new_state = dict(existing)
+    new_state["provider_usage"] = provider_usage
+    storage.write_state(new_state)
+
+    return {
+        "ok": True,
+        "state": new_state,
+        "warnings": warnings,
+        "blockers": [],
+    }
+

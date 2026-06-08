@@ -16,10 +16,6 @@ Issue #15 pins the contract from ADR 0034:
   - The resolver accepts layered dict configs in this precedence:
     built-in defaults < user config < project config < CLI overrides.
 
-These tests are the red step. They pin the public surface and the
-acceptance behaviors from issue #15. Once ``metacrucible.provider_config``
-exists, the tests turn green.
-
 References
 ----------
 - ADR 0034 (control-plane provider configuration).
@@ -28,6 +24,8 @@ References
 from __future__ import annotations
 
 import importlib
+import json
+from pathlib import Path
 from typing import Any, Mapping
 
 import pytest
@@ -1140,5 +1138,406 @@ def test_call_structured_does_not_retry_when_max_repair_attempts_is_zero(
         EXPECTED_STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER in _blocker_ids(result)
     ), (
         f"max_repair_attempts=0 final-failure must still emit the stable "
-        f"blocker id; got blocker_ids={_blocker_ids(result)!r}"
     )
+
+def test_provider_config_module_exposes_record_provider_run_outcome_surface(
+    provider_config: Any,
+) -> None:
+    """Issue #18: module must expose the provider-run-outcome recorder surface.
+
+    The recorder writes provider-neutral usage/cost data into
+    ``state.json``. The module must expose:
+
+      - ``USAGE_MISSING_WARNING`` / ``COST_MISSING_WARNING`` — stable
+        warning ids emitted when usage or cost is missing on a run.
+      - ``record_provider_run_outcome`` — the public entry point.
+    """
+    for name in (
+        "USAGE_MISSING_WARNING",
+        "COST_MISSING_WARNING",
+        "record_provider_run_outcome",
+    ):
+        assert hasattr(provider_config, name), (
+            f"{PROVIDER_CONFIG_MODULE!r} must expose {name!r} (Issue #18); "
+            f"got attributes "
+            f"{sorted(a for a in dir(provider_config) if not a.startswith('_'))!r}"
+        )
+
+
+def test_record_provider_run_outcome_writes_provider_usage_to_state_json(
+    provider_config: Any, tmp_path: Path
+) -> None:
+    """Issue #18 AC1: cost (and usage) is recorded into state.json.
+
+    The recorder must round-trip the raw usage and cost payloads
+    into a ``provider_usage`` block in ``state.json`` so a
+    downstream receipt writer can correlate cost and tokens per
+    run. Other state fields (current_best_revision, last_run_id)
+    must be preserved so the rest of the CLI surface keeps
+    working unchanged.
+    """
+    import importlib
+    storage_mod = importlib.import_module("metacrucible.storage")
+    repo = storage_mod.RepositoryStorage(tmp_path)
+    repo.write_state(
+        {
+            "current_best_revision": "rev-001",
+            "last_run_id": "run-prev",
+        }
+    )
+    result = provider_config.record_provider_run_outcome(
+        repo,
+        run_id="run-abc",
+        provider="anthropic",
+        model="claude-sonnet-4-5",
+        usage={"input_tokens": 11, "output_tokens": 7},
+        cost={"usd": 0.00123, "currency": "USD"},
+        timestamp="2026-06-08T00:00:00Z",
+    )
+    assert isinstance(result, dict)
+    assert result.get("ok") is True
+    # The on-disk state.json must carry the new block.
+    state_path = tmp_path / ".metacrucible" / "state.json"
+    assert state_path.is_file(), (
+        f"state.json must be written to {state_path}; "
+        f"state.json contents={state_path.read_text(encoding='utf-8') if state_path.exists() else 'missing'}"
+    )
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    assert payload.get("current_best_revision") == "rev-001", (
+        f"existing state fields must be preserved; got "
+        f"current_best_revision={payload.get('current_best_revision')!r}"
+    )
+    assert payload.get("last_run_id") == "run-prev", (
+        f"existing last_run_id must be preserved; got "
+        f"last_run_id={payload.get('last_run_id')!r}"
+    )
+    provider_usage = payload.get("provider_usage")
+    assert isinstance(provider_usage, dict), (
+        f"provider_usage block must be a dict on state.json; got "
+        f"{provider_usage!r}"
+    )
+    runs = provider_usage.get("runs")
+    assert isinstance(runs, list) and len(runs) == 1, (
+        f"provider_usage.runs must be a list with one entry; got {runs!r}"
+    )
+    record = runs[0]
+    assert record.get("run_id") == "run-abc"
+    assert record.get("provider") == "anthropic"
+    assert record.get("model") == "claude-sonnet-4-5"
+    assert record.get("ts") == "2026-06-08T00:00:00Z"
+    # Raw usage / cost must round-trip verbatim (provider-neutral).
+    assert record.get("usage") == {
+        "input_tokens": 11,
+        "output_tokens": 7,
+    }, (
+        f"usage payload must round-trip verbatim; got {record.get('usage')!r}"
+    )
+    assert record.get("cost") == {
+        "usd": 0.00123,
+        "currency": "USD",
+    }, (
+        f"cost payload must round-trip verbatim; got {record.get('cost')!r}"
+    )
+
+def test_record_provider_run_outcome_missing_usage_and_cost_warns_not_blocks(
+    provider_config: Any, tmp_path: Path
+) -> None:
+    """Issue #18 AC2: missing usage/cost is a warning, never a blocker.
+
+    The recorder must still write ``state.json`` when the caller
+    omits ``usage`` or ``cost`` (or both). The result must be
+    ``ok=True`` (recording succeeded) with stable warning ids, and
+    the ``blockers`` list must be empty (issue AC2: warn, do not
+    block). The on-disk record must still appear in
+    ``provider_usage.runs`` with ``usage`` / ``cost`` set to
+    ``null`` so the schema is stable for downstream consumers.
+    """
+    import importlib
+    storage_mod = importlib.import_module("metacrucible.storage")
+    repo = storage_mod.RepositoryStorage(tmp_path)
+    result = provider_config.record_provider_run_outcome(
+        repo,
+        run_id="run-no-usage",
+        provider="anthropic",
+        model="claude-sonnet-4-5",
+    )
+    assert isinstance(result, dict)
+    # AC2: ok=True because the recording itself succeeded. The
+    # missing usage/cost is a warning, not a failure.
+    assert result.get("ok") is True, (
+        f"missing usage/cost must NOT cause ok=False (AC2); got "
+        f"result={result!r}"
+    )
+    # Both missing fields emit their stable warning id.
+    warnings = result.get("warnings")
+    assert isinstance(warnings, list) and warnings, (
+        f"missing usage/cost must emit at least one warning; got {warnings!r}"
+    )
+    warning_ids = [
+        w.get("id") for w in warnings if isinstance(w, dict)
+    ]
+    assert provider_config.USAGE_MISSING_WARNING in warning_ids, (
+        f"missing usage must emit stable warning id "
+        f"{provider_config.USAGE_MISSING_WARNING!r}; got {warning_ids!r}"
+    )
+    assert provider_config.COST_MISSING_WARNING in warning_ids, (
+        f"missing cost must emit stable warning id "
+        f"{provider_config.COST_MISSING_WARNING!r}; got {warning_ids!r}"
+    )
+    # AC2 (the critical half): blockers must be empty so a missing
+    # field is *never* a blocker.
+    assert result.get("blockers") == [], (
+        f"missing usage/cost must NOT emit blockers (AC2); got "
+        f"blockers={result.get('blockers')!r}"
+    )
+    # The on-disk state.json still carries the run record so a
+    # downstream consumer can see the gap.
+    state_path = tmp_path / ".metacrucible" / "state.json"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    runs = payload["provider_usage"]["runs"]
+    assert len(runs) == 1
+    record = runs[0]
+    assert record.get("run_id") == "run-no-usage"
+    # usage and cost are recorded as None so the schema is stable
+    # (the field is always present; the value is the gap signal).
+    assert record.get("usage") is None, (
+        f"missing usage must be recorded as null; got "
+        f"usage={record.get('usage')!r}"
+    )
+    assert record.get("cost") is None, (
+        f"missing cost must be recorded as null; got "
+        f"cost={record.get('cost')!r}"
+    )
+
+
+def test_record_provider_run_outcome_only_usage_missing_warns_only_usage(
+    provider_config: Any, tmp_path: Path
+) -> None:
+    """AC2 granularity: only the missing field warns, not the present one.
+
+    When the caller supplies cost but omits usage, the result
+    carries exactly the USAGE_MISSING_WARNING — not the
+    COST_MISSING_WARNING. The on-disk record reflects the same
+    asymmetry: usage is null, cost round-trips.
+    """
+    import importlib
+    storage_mod = importlib.import_module("metacrucible.storage")
+    repo = storage_mod.RepositoryStorage(tmp_path)
+    result = provider_config.record_provider_run_outcome(
+        repo,
+        run_id="run-only-cost",
+        provider="openai_compatible",
+        model="gpt-4o",
+        cost={"usd": 0.0042, "currency": "USD"},
+    )
+    assert result.get("ok") is True
+    warning_ids = [
+        w.get("id") for w in result.get("warnings", [])
+        if isinstance(w, dict)
+    ]
+    assert provider_config.USAGE_MISSING_WARNING in warning_ids, (
+        f"missing usage must emit USAGE_MISSING_WARNING; got {warning_ids!r}"
+    )
+    assert provider_config.COST_MISSING_WARNING not in warning_ids, (
+        f"present cost must NOT emit COST_MISSING_WARNING; got {warning_ids!r}"
+    )
+    state_path = tmp_path / ".metacrucible" / "state.json"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    record = payload["provider_usage"]["runs"][0]
+    assert record.get("usage") is None
+    assert record.get("cost") == {"usd": 0.0042, "currency": "USD"}
+
+def test_record_provider_run_outcome_no_cost_cap_is_enforced(
+    provider_config: Any, tmp_path: Path
+) -> None:
+    """Issue #18 AC3: no hard cost cap is introduced.
+
+    The recorder must accept an arbitrarily large cost payload
+    without comparing it to any budget, threshold, or limit and
+    without raising. The result is ``ok=True`` and the run is
+    written to state.json verbatim. This is the negative-space
+    companion to AC2: the recorder is observation, not
+    enforcement, on both the missing-field axis and the
+    over-budget axis.
+    """
+    import importlib
+    storage_mod = importlib.import_module("metacrucible.storage")
+    repo = storage_mod.RepositoryStorage(tmp_path)
+    huge_cost = {"usd": 9_999_999.99, "currency": "USD"}
+    huge_usage = {
+        "input_tokens": 10**9,
+        "output_tokens": 10**9,
+    }
+    result = provider_config.record_provider_run_outcome(
+        repo,
+        run_id="run-huge",
+        provider="anthropic",
+        model="claude-opus-4",
+        usage=huge_usage,
+        cost=huge_cost,
+    )
+    assert isinstance(result, dict)
+    assert result.get("ok") is True, (
+        f"a huge cost payload must NOT be refused (AC3); got result={result!r}"
+    )
+    assert result.get("blockers") == [], (
+        f"a huge cost payload must NOT emit blockers (AC3); got "
+        f"blockers={result.get('blockers')!r}"
+    )
+    # The cost is recorded verbatim. No threshold, no clamp, no
+    # redaction.
+    state_path = tmp_path / ".metacrucible" / "state.json"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    record = payload["provider_usage"]["runs"][0]
+    assert record.get("cost") == huge_cost, (
+        f"huge cost must round-trip verbatim (no cap, no clamp); got "
+        f"cost={record.get('cost')!r}"
+    )
+    assert record.get("usage") == huge_usage, (
+        f"huge usage must round-trip verbatim; got "
+        f"usage={record.get('usage')!r}"
+    )
+
+
+def test_record_provider_run_outcome_is_idempotent_per_run_id(
+    provider_config: Any, tmp_path: Path
+) -> None:
+    """Re-recording the same run_id replaces the previous entry, not appends.
+
+    A retry of the same provider run (e.g. transient network error
+    followed by a successful retry) must not double-count tokens
+    or cost in ``state.json``. The recorder must treat ``run_id``
+    as the stable key: a second call with the same ``run_id``
+    replaces the previous record and keeps the runs list at length
+    1.
+    """
+    import importlib
+    storage_mod = importlib.import_module("metacrucible.storage")
+    repo = storage_mod.RepositoryStorage(tmp_path)
+    first = provider_config.record_provider_run_outcome(
+        repo,
+        run_id="run-retry",
+        provider="anthropic",
+        model="claude-sonnet-4-5",
+        usage={"input_tokens": 10, "output_tokens": 5},
+        cost={"usd": 0.0001, "currency": "USD"},
+    )
+    assert first.get("ok") is True
+    second = provider_config.record_provider_run_outcome(
+        repo,
+        run_id="run-retry",
+        provider="anthropic",
+        model="claude-sonnet-4-5",
+        usage={"input_tokens": 20, "output_tokens": 10},
+        cost={"usd": 0.0002, "currency": "USD"},
+    )
+    assert second.get("ok") is True
+    state_path = tmp_path / ".metacrucible" / "state.json"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    runs = payload["provider_usage"]["runs"]
+    assert len(runs) == 1, (
+        f"re-recording the same run_id must replace, not append; got "
+        f"len(runs)={len(runs)}; runs={runs!r}"
+    )
+    record = runs[0]
+    # The *second* call's values win because they reflect the
+    # successful retry.
+    assert record.get("usage") == {"input_tokens": 20, "output_tokens": 10}
+    assert record.get("cost") == {"usd": 0.0002, "currency": "USD"}
+
+
+def test_record_provider_run_outcome_appends_distinct_run_ids(
+    provider_config: Any, tmp_path: Path
+) -> None:
+    """Distinct run_ids accumulate; the recorder is a runs log, not a singleton."""
+    import importlib
+    storage_mod = importlib.import_module("metacrucible.storage")
+    repo = storage_mod.RepositoryStorage(tmp_path)
+    for i in range(3):
+        result = provider_config.record_provider_run_outcome(
+            repo,
+            run_id=f"run-{i}",
+            provider="anthropic",
+            model="claude-sonnet-4-5",
+            usage={"input_tokens": i, "output_tokens": i},
+            cost={"usd": 0.001 * i, "currency": "USD"},
+        )
+        assert result.get("ok") is True
+    state_path = tmp_path / ".metacrucible" / "state.json"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    runs = payload["provider_usage"]["runs"]
+    assert len(runs) == 3, (
+        f"three distinct run_ids must produce three records; got "
+        f"len(runs)={len(runs)}; runs={runs!r}"
+    )
+    run_ids = [r.get("run_id") for r in runs]
+    assert run_ids == ["run-0", "run-1", "run-2"], (
+        f"records must be ordered by insertion; got run_ids={run_ids!r}"
+    )
+
+def test_provider_config_module_exposes_expected_warnings(
+    provider_config: Any,
+) -> None:
+    """Issue #18: module must expose EXPECTED_WARNINGS (machine contract)."""
+    assert hasattr(provider_config, "EXPECTED_WARNINGS"), (
+        f"{PROVIDER_CONFIG_MODULE!r} must expose EXPECTED_WARNINGS "
+        f"(Issue #18); got attributes "
+        f"{sorted(a for a in dir(provider_config) if not a.startswith('_'))!r}"
+    )
+    assert isinstance(provider_config.EXPECTED_WARNINGS, dict)
+    assert (
+        provider_config.EXPECTED_WARNINGS.get("usage_missing")
+        == provider_config.USAGE_MISSING_WARNING
+    )
+    assert (
+        provider_config.EXPECTED_WARNINGS.get("cost_missing")
+        == provider_config.COST_MISSING_WARNING
+    )
+
+
+def test_record_provider_run_outcome_accepts_openai_shape(
+    provider_config: Any, tmp_path: Path
+) -> None:
+    """Issue #18: provider-neutral — OpenAI's prompt_tokens/completion_tokens shape.
+
+    The recorder must not normalize or coerce usage/cost payloads.
+    Anthropic's ``input_tokens``/``output_tokens`` and OpenAI's
+    ``prompt_tokens``/``completion_tokens`` are both accepted and
+    round-tripped verbatim so a future ADR can introduce
+    provider-specific normalizers without changing this function.
+    """
+    import importlib
+    storage_mod = importlib.import_module("metacrucible.storage")
+    repo = storage_mod.RepositoryStorage(tmp_path)
+    openai_usage = {
+        "prompt_tokens": 42,
+        "completion_tokens": 17,
+        "total_tokens": 59,
+    }
+    openai_cost = {
+        "input_cost_usd": 0.001,
+        "output_cost_usd": 0.003,
+        "currency": "USD",
+    }
+    result = provider_config.record_provider_run_outcome(
+        repo,
+        run_id="run-openai",
+        provider="openai_compatible",
+        model="gpt-4o",
+        usage=openai_usage,
+        cost=openai_cost,
+    )
+    assert result.get("ok") is True
+    state_path = tmp_path / ".metacrucible" / "state.json"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    record = payload["provider_usage"]["runs"][0]
+    assert record.get("usage") == openai_usage, (
+        f"OpenAI usage shape must round-trip verbatim; got "
+        f"usage={record.get('usage')!r}"
+    )
+    assert record.get("cost") == openai_cost, (
+        f"OpenAI cost shape must round-trip verbatim; got "
+        f"cost={record.get('cost')!r}"
+    )
+
+

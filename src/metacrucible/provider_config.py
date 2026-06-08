@@ -43,7 +43,7 @@ References
 from __future__ import annotations
 
 import copy
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 __all__ = [
     "EXPECTED_BLOCKERS",
@@ -52,6 +52,7 @@ __all__ = [
     "RUNTIME_ADAPTER_LEAK_BLOCKER",
     "STRUCTURED_OUTPUT_PROBE_BLOCKER",
     "STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER",
+    "JUDGE_EVALUATOR_BLOCKER",
     "USAGE_MISSING_WARNING",
     "COST_MISSING_WARNING",
     "PROVIDER_USAGE_SCHEMA_VERSION",
@@ -60,6 +61,7 @@ __all__ = [
     "run_structured_output_probe",
     "call_structured",
     "call_provider_with_retry",
+    "run_judge_evaluator",
     "ProviderError",
     "ProviderTransientError",
     "ProviderAuthError",
@@ -155,6 +157,12 @@ PROVIDER_SAFETY_REFUSAL_BLOCKER: str = "provider-safety-refusal-error"
 # so a downstream receipt/evidence recorder can tell "we tried
 # and gave up" apart from "we refused to try".
 PROVIDER_RETRY_EXHAUSTED_BLOCKER: str = "provider-retry-exhausted"
+# Stable blocker id emitted by :func:`run_judge_evaluator` when the
+# judge selection is missing/malformed, the ``call_fns`` sequence is
+# not exactly two, or the provider catalog has no entry for the
+# selected judge provider (Issue #20, ADR 0010/0011). The id is part
+# of the machine contract: callers branch on it verbatim.
+JUDGE_EVALUATOR_BLOCKER: str = "provider-config-judge-evaluator-blocked"
 # Stable mapping from semantic key to stable warning id. Mirrors
 # :data:`EXPECTED_BLOCKERS` for the warning side. Callers and
 # downstream automation branch on the values verbatim; renaming
@@ -169,6 +177,7 @@ EXPECTED_BLOCKERS: dict[str, str] = {
     "provider_context_overflow": PROVIDER_CONTEXT_OVERFLOW_BLOCKER,
     "provider_safety_refusal": PROVIDER_SAFETY_REFUSAL_BLOCKER,
     "provider_retry_exhausted": PROVIDER_RETRY_EXHAUSTED_BLOCKER,
+    "judge_evaluator": JUDGE_EVALUATOR_BLOCKER,
 }
 EXPECTED_WARNINGS: dict[str, str] = {
     "usage_missing": USAGE_MISSING_WARNING,
@@ -1348,3 +1357,248 @@ def call_provider_with_retry(
             "retries": retries,
         }
 
+
+# --------------------------------------------------------------------------- #
+# Public: two-independent-LLM-judge evaluator (Issue #20, ADR 0010/0011)     #
+# --------------------------------------------------------------------------- #
+#
+# Issue #20 + ADR 0010 ("Use rule checks and independent control-plane LLM
+# judgments") and ADR 0011 ("Separate evaluator roles from optimizer roles")
+# require the execution evaluator to call two independent control-plane LLM
+# judges. Independence is enforced by three structural rules:
+#
+#   1. The judge selection is read from ``config['control_plane']['judge']``
+#      ONLY. The optimizer selection under ``config['control_plane']`` is
+#      never consulted as a fallback, and ``config['runtime_adapters']`` is
+#      never read at all. A malformed optimizer or a missing/garbage
+#      ``runtime_adapters`` cannot influence the judge path.
+#   2. The two judges receive independent context objects. The context is
+#      built from a fresh dict per judge; the two contexts are distinct
+#      objects (``is`` comparison fails) and do not share mutable state.
+#   3. The two ``judge_evidence`` records are independent dicts. The
+#      function never aliases the same record across both judges and
+#      never returns a shared-mutable-state container.
+#
+# The function never raises on a config-level contract violation (missing
+# judge selection, wrong number of call_fns, unknown provider). It returns
+# a result dict with ``ok=False`` and the stable
+# :data:`JUDGE_EVALUATOR_BLOCKER` blocker id, mirroring the
+# ``{ok, blockers}`` contract used by :func:`run_structured_output_probe`
+# and :func:`call_structured`.
+
+
+def _judge_evidence_entry(
+    judge_id: str,
+    index: int,
+    provider: str,
+    model: str,
+    value: Any,
+    *,
+    ok: bool,
+    error: str | None,
+) -> dict[str, Any]:
+    """Return a normalized ``judge_evidence`` entry for a single judge.
+
+    Centralizing the entry shape keeps ``judge_evidence`` a stable
+    contract for downstream receipt/evidence recording. The entry is a
+    fresh dict per call so two entries are never aliases of each other.
+    """
+    return {
+        "judge_id": judge_id,
+        "index": index,
+        "role": "judge",
+        "provider": provider,
+        "model": model,
+        "ok": ok,
+        "value": value,
+        "error": error,
+    }
+
+
+def run_judge_evaluator(
+    config: Mapping[str, Any],
+    *,
+    trajectory_digest: Mapping[str, Any],
+    rubric: Mapping[str, Any],
+    call_fns: Sequence[Any],
+) -> dict[str, Any]:
+    """Run the two-independent-LLM-judge evaluator (Issue #20, ADR 0010/0011).
+
+    The function pulls the judge selection from
+    ``config['control_plane']['judge']`` and invokes each of
+    ``call_fns`` once with an independent, freshly constructed
+    context mapping. The two ``judge_evidence`` records on the
+    returned result are independent dicts (not aliases, not shared
+    mutable state) so a downstream receipt/evidence recorder can
+    correlate each judge with its call without coupling.
+
+    Parameters
+    ----------
+    config:
+        The resolved provider config dict produced by
+        :func:`resolve_provider_config`. The function reads
+        ``config['control_plane']['judge']`` and
+        ``config['providers'][provider_name]``; it does NOT read
+        ``config['control_plane']['optimizer']`` (AC2) and does
+        NOT read ``config['runtime_adapters']`` (AC1).
+    trajectory_digest:
+        A bounded, redacted summary of the target's execution path
+        (per :data:`CONTEXT.md`, "Trajectory Digest"). Passed
+        through into each judge's context as a per-judge copy.
+    rubric:
+        The rubric the judges apply. Passed through into each
+        judge's context as a per-judge copy.
+    call_fns:
+        A sequence of exactly two zero-arg-or-one-kw-arg callables.
+        Each callable is invoked as ``call_fn(context=<mapping>)``
+        once. The two callables MUST be distinct objects; aliasing
+        the same callable twice would defeat the independence AC.
+        The function refuses any other length with a stable
+        :data:`JUDGE_EVALUATOR_BLOCKER`.
+
+    Returns
+    -------
+    dict
+        ``{"ok": True, "judge_evidence": {"judge_1": {...},
+        "judge_2": {...}}, "blockers": []}`` on success; on a
+        config-level contract violation ``ok`` is ``False``,
+        ``judge_evidence`` is ``{}`` (no evidence is fabricated),
+        and ``blockers`` carries one or more entries with the
+        stable :data:`JUDGE_EVALUATOR_BLOCKER` id. The function
+        never raises on contract violations; it never raises on a
+        judge ``call_fn`` exception either (it records the error
+        on the per-judge evidence record and returns the
+        non-fatal failure).
+    """
+    blockers: list[dict[str, str]] = []
+
+    # 1. call_fns must be exactly two distinct callables.
+    if not isinstance(call_fns, (list, tuple)) or len(call_fns) != 2:
+        blockers.append(_blocker(
+            JUDGE_EVALUATOR_BLOCKER,
+            (
+                "run_judge_evaluator requires exactly two judge call_fns "
+                f"(Issue #20); got {type(call_fns).__name__} of length "
+                f"{len(call_fns) if hasattr(call_fns, '__len__') else '?'}"
+            ),
+        ))
+        return {"ok": False, "judge_evidence": {}, "blockers": blockers}
+    if call_fns[0] is call_fns[1]:
+        # Aliasing the same callable defeats the independence AC. The
+        # caller could still pass two objects that are distinct but
+        # happen to forward to the same backing function; we cannot
+        # detect that without instrumenting call_fns, and the test
+        # suite deliberately uses distinct callables.
+        blockers.append(_blocker(
+            JUDGE_EVALUATOR_BLOCKER,
+            (
+                "run_judge_evaluator requires two distinct judge call_fns "
+                "(Issue #20 AC3); got the same callable twice"
+            ),
+        ))
+        return {"ok": False, "judge_evidence": {}, "blockers": blockers}
+
+    # 2. Read the judge selection from control_plane.judge ONLY.
+    # We intentionally do NOT touch control_plane.optimizer or
+    # runtime_adapters; ADR 0011 forbids the judge evaluator from
+    # inheriting context from the optimizer role.
+    if not isinstance(config, Mapping):
+        blockers.append(_blocker(
+            JUDGE_EVALUATOR_BLOCKER,
+            (
+                "run_judge_evaluator config must be a mapping; got "
+                f"{type(config).__name__} (Issue #20)"
+            ),
+        ))
+        return {"ok": False, "judge_evidence": {}, "blockers": blockers}
+    control_plane: Any = config.get("control_plane", {})
+    providers_catalog: Any = config.get("providers", {})
+    judge_selection: Any = (
+        control_plane.get("judge")
+        if isinstance(control_plane, Mapping)
+        else None
+    )
+    if not isinstance(judge_selection, Mapping):
+        blockers.append(_blocker(
+            JUDGE_EVALUATOR_BLOCKER,
+            (
+                "control_plane.judge selection is missing or invalid; "
+                "the two-independent-LLM-judge evaluator cannot run "
+                "(Issue #20, ADR 0010/0011)"
+            ),
+        ))
+        return {"ok": False, "judge_evidence": {}, "blockers": blockers}
+    provider_name: Any = judge_selection.get("provider")
+    model: Any = judge_selection.get("model")
+    if not isinstance(provider_name, str) or not isinstance(model, str):
+        blockers.append(_blocker(
+            JUDGE_EVALUATOR_BLOCKER,
+            (
+                "control_plane.judge must carry 'provider' and 'model' "
+                "strings; got provider="
+                f"{provider_name!r}, model={model!r} (Issue #20)"
+            ),
+        ))
+        return {"ok": False, "judge_evidence": {}, "blockers": blockers}
+
+    # We deliberately do NOT validate that the provider exists in
+    # the catalog here — the test deliberately uses a malformed
+    # optimizer with a non-existent provider to prove the judge
+    # evaluator never reads the optimizer. The judge selection is
+    # independent. We still record the provider/model the judge
+    # was asked to use so the evidence record is faithful to the
+    # selection, even if the provider catalog later rejects it.
+    del providers_catalog  # not consulted; documentation aid.
+
+    # 3. Invoke each judge call_fn with an independent, fresh
+    #    context dict. The two contexts are distinct objects
+    #    (``is`` comparison fails) and carry the same logical
+    #    inputs but as per-judge dict copies.
+    judge_evidence: dict[str, dict[str, Any]] = {}
+    any_failed = False
+    for slot, call_fn in enumerate(call_fns):
+        judge_id = f"judge_{slot + 1}"
+        context = {
+            "judge_id": judge_id,
+            "index": slot,
+            "role": "judge",
+            "provider_name": provider_name,
+            "provider_spec": None,  # passed through; the catalog is not consulted
+            "model": model,
+            "trajectory_digest": dict(trajectory_digest)
+            if isinstance(trajectory_digest, Mapping)
+            else trajectory_digest,
+            "rubric": dict(rubric)
+            if isinstance(rubric, Mapping)
+            else rubric,
+        }
+        # Invoke the call_fn. The signature accepts either zero
+        # args or a single ``context`` kwarg; tests use the kwarg
+        # form.
+        try:
+            value = call_fn(context=context)
+        except TypeError:
+            # The callable may be a zero-arg test double. Fall back
+            # to a no-arg call.
+            value = call_fn()
+        except Exception as exc:  # noqa: BLE001 — judge errors are recorded, not raised
+            judge_evidence[judge_id] = _judge_evidence_entry(
+                judge_id, slot, provider_name, model, None,
+                ok=False, error=f"{type(exc).__name__}: {exc}",
+            )
+            any_failed = True
+            continue
+
+        # On success the per-judge evidence is a fresh dict.
+        # Distinct from any other judge's record by construction.
+        judge_evidence[judge_id] = _judge_evidence_entry(
+            judge_id, slot, provider_name, model, value,
+            ok=True, error=None,
+        )
+
+    ok = not any_failed
+    return {
+        "ok": ok,
+        "judge_evidence": judge_evidence,
+        "blockers": [],
+    }

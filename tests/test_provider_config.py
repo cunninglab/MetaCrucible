@@ -1760,3 +1760,448 @@ def test_call_provider_with_retry_records_retry_evidence(
     )
 
 
+# --------------------------------------------------------------------------- #
+# Issue #20: two-independent-LLM-judge evaluator                              #
+# --------------------------------------------------------------------------- #
+# Issue #20 + ADR 0010/0011 require two independent control-plane LLM judges
+# for execution evaluation. The judges share the same model selection
+# (``control_plane.judge``) but each gets its own context, its own call, and
+# its own evidence record. The judge evaluator must NOT pull credentials or
+# runtime config from ``runtime_adapters`` (the target runtime) and must NOT
+# pick the optimizer selection as a fallback. The two evidence records must
+# be independent (distinct dicts, distinct call contexts, distinct attempts)
+# so downstream evidence recording can correlate each judge with its
+# call without aliasing.
+#
+# Tests inject two deterministic ``call_fn`` doubles; production code calls
+# real LLM SDKs. No mocks are used.
+
+# Stable blocker id emitted by ``run_judge_evaluator`` when the judge
+# selection is missing or the call_fns sequence is malformed. Part of
+# the machine contract; renaming is a breaking change.
+EXPECTED_JUDGE_EVALUATOR_BLOCKER: str = (
+    "provider-config-judge-evaluator-blocked"
+)
+
+
+def _build_dual_judge_call_fns(
+    responses: list[Any],
+) -> tuple[list[Any], list[dict[str, Any]], list[int]]:
+    """Build two independent ``call_fn`` doubles that record their context.
+
+    The returned tuple is ``(call_fns, recorded_contexts, call_counts)``:
+
+    * ``call_fns`` is a list of two callables; each is invoked exactly
+      once in order. They are NOT aliases — the production code must
+      see two distinct callables.
+    * ``recorded_contexts`` is a list that grows in order of invocation
+      so a test can assert what context each judge actually saw.
+    * ``call_counts`` is a list of two ints so a test can assert each
+      judge was invoked exactly once (and that one judge did not
+      silently short-circuit the other).
+
+    Each ``call_fn`` pops the next response from ``responses``; a
+    misconfigured test that over-invokes the judges raises
+    ``AssertionError`` rather than silently passing.
+    """
+    recorded_contexts: list[dict[str, Any]] = []
+    call_counts_local: list[int] = [0, 0]
+    queue = list(responses)
+
+    def make_call_fn(slot: int) -> Any:
+        def call_fn(context: Any) -> Any:
+            call_counts_local[slot] += 1
+            recorded_contexts.append(context)
+            if not queue:
+                raise AssertionError(
+                    f"judge call_fn[{slot}] invoked more times than "
+                    f"queued responses"
+                )
+            return queue.pop(0)
+        return call_fn
+
+    return [make_call_fn(0), make_call_fn(1)], recorded_contexts, call_counts_local
+
+
+def test_provider_config_module_exposes_judge_evaluator_surface(
+    provider_config: Any,
+) -> None:
+    """Issue #20: module must expose the judge-evaluator entry point + blocker id."""
+    for name in (
+        "JUDGE_EVALUATOR_BLOCKER",
+        "run_judge_evaluator",
+    ):
+        assert hasattr(provider_config, name), (
+            f"{PROVIDER_CONFIG_MODULE!r} must expose {name!r} (Issue #20); "
+            f"got attributes "
+            f"{sorted(a for a in dir(provider_config) if not a.startswith('_'))!r}"
+        )
+
+
+def test_judge_evaluator_blocker_id_matches_pinned_value(
+    provider_config: Any,
+) -> None:
+    """The judge-evaluator blocker id is part of the machine contract."""
+    assert (
+        provider_config.JUDGE_EVALUATOR_BLOCKER
+        == EXPECTED_JUDGE_EVALUATOR_BLOCKER
+    ), (
+        f"JUDGE_EVALUATOR_BLOCKER must be exactly "
+        f"{EXPECTED_JUDGE_EVALUATOR_BLOCKER!r}; got "
+        f"{provider_config.JUDGE_EVALUATOR_BLOCKER!r}"
+    )
+    assert isinstance(provider_config.EXPECTED_BLOCKERS, dict)
+    assert (
+        provider_config.EXPECTED_BLOCKERS.get("judge_evaluator")
+        == EXPECTED_JUDGE_EVALUATOR_BLOCKER
+    ), (
+        f"EXPECTED_BLOCKERS must include the judge_evaluator entry with "
+        f"the stable id; got {provider_config.EXPECTED_BLOCKERS!r}"
+    )
+
+
+def test_run_judge_evaluator_invokes_two_distinct_call_fns(
+    provider_config: Any,
+) -> None:
+    """Issue #20 AC3: the two judges are two independent calls.
+
+    The evaluator must call each of the two call_fns exactly once. If
+    one call_fn is invoked twice (alias) or the second is never called
+    (short-circuit), the judges are not independent and the AC fails.
+    """
+    resolved = provider_config.resolve_provider_config()
+    assert resolved.get("ok") is True, (
+        f"baseline resolve must succeed; got {resolved!r}"
+    )
+    call_fns, _recorded, call_counts = _build_dual_judge_call_fns(
+        [{"judgment": "A"}, {"judgment": "B"}]
+    )
+    result = provider_config.run_judge_evaluator(
+        resolved["config"],
+        trajectory_digest={"summary": "artifact did X"},
+        rubric={"criteria": "1: clarity"},
+        call_fns=call_fns,
+    )
+    assert isinstance(result, dict), (
+        f"run_judge_evaluator must return a dict; got {type(result).__name__}"
+    )
+    assert call_counts == [1, 1], (
+        f"each judge call_fn must be invoked exactly once; got counts="
+        f"{call_counts!r}"
+    )
+
+
+def test_run_judge_evaluator_emits_two_independent_judge_evidence_records(
+    provider_config: Any,
+) -> None:
+    """Issue #20 AC3: the two evidence records are independent dicts.
+
+    The two ``judge_evidence`` entries must be distinct dict objects
+    (not aliases of the same dict, not shared mutable state). The
+    index/role fields must distinguish them and the recorded value
+    must reflect the call_fn that produced it.
+    """
+    resolved = provider_config.resolve_provider_config()
+    call_fns, _recorded, _counts = _build_dual_judge_call_fns(
+        [{"judgment": "A"}, {"judgment": "B"}]
+    )
+    result = provider_config.run_judge_evaluator(
+        resolved["config"],
+        trajectory_digest={"summary": "artifact did X"},
+        rubric={"criteria": "1: clarity"},
+        call_fns=call_fns,
+    )
+    evidence = result.get("judge_evidence")
+    assert isinstance(evidence, dict), (
+        f"judge_evidence must be a dict at a deterministic place on the "
+        f"result; got {evidence!r}"
+    )
+    assert set(evidence.keys()) >= {"judge_1", "judge_2"}, (
+        f"judge_evidence must carry two deterministic keys judge_1 and "
+        f"judge_2; got {sorted(evidence.keys())!r}"
+    )
+    record_1 = evidence["judge_1"]
+    record_2 = evidence["judge_2"]
+    assert isinstance(record_1, dict) and isinstance(record_2, dict), (
+        f"each judge_evidence record must be a dict; got "
+        f"{type(record_1).__name__} and {type(record_2).__name__}"
+    )
+    assert record_1 is not record_2, (
+        f"the two judge_evidence records must be distinct dict objects, "
+        f"not the same object (Issue #20 AC3); got id(record_1)="
+        f"{id(record_1)} id(record_2)={id(record_2)}"
+    )
+    assert record_1.get("value") == {"judgment": "A"}, (
+        f"judge_1 record must carry the response of the first call_fn; "
+        f"got {record_1.get('value')!r}"
+    )
+    assert record_2.get("value") == {"judgment": "B"}, (
+        f"judge_2 record must carry the response of the second call_fn; "
+        f"got {record_2.get('value')!r}"
+    )
+    # Mutating one record must not affect the other (independent state).
+    record_1["value"] = {"judgment": "MUTATED"}
+    assert record_2.get("value") == {"judgment": "B"}, (
+        f"judge_2 record must not share mutable state with judge_1; "
+        f"mutating judge_1.value leaked into judge_2.value="
+        f"{record_2.get('value')!r}"
+    )
+
+
+def test_run_judge_evaluator_passes_independent_contexts_to_each_judge(
+    provider_config: Any,
+) -> None:
+    """Issue #20 AC3: the two judges receive distinct context objects.
+
+    The context the function passes to each ``call_fn`` must be a
+    fresh dict per judge. Aliasing the same context object across
+    both judges would couple their inputs and break the
+    "independent" guarantee.
+    """
+    resolved = provider_config.resolve_provider_config()
+    call_fns, recorded_contexts, _counts = _build_dual_judge_call_fns(
+        [{"judgment": "A"}, {"judgment": "B"}]
+    )
+    result = provider_config.run_judge_evaluator(
+        resolved["config"],
+        trajectory_digest={"summary": "artifact did X"},
+        rubric={"criteria": "1: clarity"},
+        call_fns=call_fns,
+    )
+    assert result.get("ok") is True, (
+        f"two-passing-judges must yield ok=True; got result={result!r}"
+    )
+    assert len(recorded_contexts) == 2, (
+        f"both judges must have been invoked; got {len(recorded_contexts)} "
+        f"recorded contexts"
+    )
+    ctx_1 = recorded_contexts[0]
+    ctx_2 = recorded_contexts[1]
+    assert isinstance(ctx_1, dict) and isinstance(ctx_2, dict), (
+        f"each judge context must be a mapping; got "
+        f"{type(ctx_1).__name__} and {type(ctx_2).__name__}"
+    )
+    assert ctx_1 is not ctx_2, (
+        f"the two judge contexts must be distinct dict objects, not the "
+        f"same object (Issue #20 AC3); got id(ctx_1)={id(ctx_1)} "
+        f"id(ctx_2)={id(ctx_2)}"
+    )
+    # Mutating one context must not leak into the other.
+    ctx_1["_leak_marker"] = "MUTATED"
+    assert "_leak_marker" not in ctx_2, (
+        f"judge contexts must not share mutable state; mutating ctx_1 "
+        f"leaked into ctx_2: {ctx_2!r}"
+    )
+
+
+def test_run_judge_evaluator_does_not_use_optimizer_selection(
+    provider_config: Any,
+) -> None:
+    """Issue #20 AC2: judge selection is independent from optimizer.
+
+    Even if the optimizer selection is malformed, missing, or points
+    at a provider that does not exist, the judge evaluator must
+    succeed because it never reads ``control_plane.optimizer``. A
+    same-context self-evaluation bias is exactly what ADR 0011
+    forbids.
+    """
+    user = {
+        "control_plane": {
+            "judge": {
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-5",
+            },
+            # Optimizer points at a provider the catalog does not
+            # contain. The judge evaluator must still work.
+            "optimizer": {
+                "provider": "DOES_NOT_EXIST",
+                "model": "broken",
+            },
+        },
+    }
+    resolved = provider_config.resolve_provider_config(user=user)
+    assert resolved.get("ok") is True, (
+        f"resolver must accept a malformed optimizer selection (the "
+        f"judge evaluator must not depend on it); got {resolved!r}"
+    )
+    call_fns, _recorded, _counts = _build_dual_judge_call_fns(
+        [{"judgment": "ok"}, {"judgment": "fine"}]
+    )
+    result = provider_config.run_judge_evaluator(
+        resolved["config"],
+        trajectory_digest={"summary": "artifact did X"},
+        rubric={"criteria": "1: clarity"},
+        call_fns=call_fns,
+    )
+    assert result.get("ok") is True, (
+        f"judge evaluator must succeed independently of optimizer "
+        f"selection; got result={result!r}"
+    )
+    evidence = result.get("judge_evidence")
+    assert isinstance(evidence, dict)
+    for key in ("judge_1", "judge_2"):
+        record = evidence[key]
+        assert record.get("provider") == "anthropic", (
+            f"{key} evidence must use the judge selection "
+            f"(provider=anthropic); got {record.get('provider')!r} "
+            f"(Issue #20 AC2: judge context independent from optimizer)"
+        )
+        assert record.get("model") == "claude-sonnet-4-5", (
+            f"{key} evidence must use the judge selection model; got "
+            f"{record.get('model')!r}"
+        )
+
+
+def test_run_judge_evaluator_does_not_use_runtime_adapters(
+    provider_config: Any,
+) -> None:
+    """Issue #20 AC1: judge is not the target runtime.
+
+    The ``runtime_adapters`` section configures target execution
+    (the Claude Code binary, etc.). The judge evaluator must not
+    read or depend on it; a missing or malformed runtime_adapters
+    must not block the judge from running.
+    """
+    user = {
+        "control_plane": {
+            "judge": {
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-5",
+            },
+        },
+        "runtime_adapters": {
+            # Garbage adapter — must not influence the judge path.
+            "claude_code": {
+                "binary": "definitely-not-claude",
+                "mode": "subscription",
+                "_judge_attempt": "this must not leak into the judge call",
+            },
+        },
+    }
+    resolved = provider_config.resolve_provider_config(user=user)
+    assert resolved.get("ok") is True, (
+        f"baseline resolve must succeed even with weird runtime_adapters; "
+        f"got {resolved!r}"
+    )
+    call_fns, recorded_contexts, _counts = _build_dual_judge_call_fns(
+        [{"judgment": "ok"}, {"judgment": "fine"}]
+    )
+    result = provider_config.run_judge_evaluator(
+        resolved["config"],
+        trajectory_digest={"summary": "artifact did X"},
+        rubric={"criteria": "1: clarity"},
+        call_fns=call_fns,
+    )
+    assert result.get("ok") is True, (
+        f"judge evaluator must succeed independently of runtime_adapters; "
+        f"got result={result!r}"
+    )
+    # The recorded context for each judge must not contain any
+    # runtime_adapters field (Issue #20 AC1).
+    for ctx in recorded_contexts:
+        assert isinstance(ctx, dict)
+        assert "runtime_adapters" not in ctx, (
+            f"judge context must not include runtime_adapters (the judge "
+            f"is not the target runtime); got context={ctx!r}"
+        )
+        assert "runtime_adapter" not in ctx, (
+            f"judge context must not include any runtime_adapter field; "
+            f"got context={ctx!r}"
+        )
+
+
+def test_run_judge_evaluator_blocks_when_judge_selection_missing(
+    provider_config: Any,
+) -> None:
+    """Issue #20: a missing judge selection is a stable blocker, never an exception."""
+    user = {
+        "control_plane": {
+            # judge deliberately nulled out (override with None).
+            # The user layer replaces the default control_plane.judge
+            # selection with None; the resolver still passes (it only
+            # rejects runtime-leak and secret fields, not a None
+            # selection); the judge evaluator then blocks.
+            "judge": None,
+            "optimizer": {
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-5",
+            },
+        },
+    }
+    resolved = provider_config.resolve_provider_config(user=user)
+    assert resolved.get("ok") is True, (
+        f"resolver must accept a None judge selection; got {resolved!r}"
+    )
+    assert resolved["config"]["control_plane"].get("judge") is None, (
+        f"resolved config must have control_plane.judge=None; got "
+        f"{resolved['config'].get('control_plane')!r}"
+    )
+    call_fns, _recorded, _counts = _build_dual_judge_call_fns(
+        [{"judgment": "A"}, {"judgment": "B"}]
+    )
+    result = provider_config.run_judge_evaluator(
+        resolved["config"],
+        trajectory_digest={"summary": "x"},
+        rubric={"criteria": "y"},
+        call_fns=call_fns,
+    )
+    assert isinstance(result, dict)
+    assert result.get("ok") is False, (
+        f"missing judge selection must yield ok=False; got {result!r}"
+    )
+    assert (
+        EXPECTED_JUDGE_EVALUATOR_BLOCKER in _blocker_ids(result)
+    ), (
+        f"missing judge selection must emit blocker id "
+        f"{EXPECTED_JUDGE_EVALUATOR_BLOCKER!r}; got "
+        f"blocker_ids={_blocker_ids(result)!r}"
+    )
+    # Neither judge should have been invoked when the selection is
+    # missing — evidence should not be fabricated.
+    evidence = result.get("judge_evidence")
+    assert evidence is None or evidence == {}, (
+        f"no judge evidence must be produced when the selection is "
+        f"missing; got {evidence!r}"
+    )
+
+
+def test_run_judge_evaluator_requires_exactly_two_call_fns(
+    provider_config: Any,
+) -> None:
+    """Issue #20: the judge evaluator is two-judge, not one, not three."""
+    resolved = provider_config.resolve_provider_config()
+    call_fns, _recorded, _counts = _build_dual_judge_call_fns(
+        [{"judgment": "A"}, {"judgment": "B"}]
+    )
+    # 1 call_fn is a contract violation — the evaluator is two-judge.
+    result_one = provider_config.run_judge_evaluator(
+        resolved["config"],
+        trajectory_digest={"summary": "x"},
+        rubric={"criteria": "y"},
+        call_fns=call_fns[:1],
+    )
+    assert result_one.get("ok") is False, (
+        f"exactly one call_fn must yield ok=False; got {result_one!r}"
+    )
+    assert (
+        EXPECTED_JUDGE_EVALUATOR_BLOCKER in _blocker_ids(result_one)
+    ), (
+        f"exactly one call_fn must emit the stable blocker id; got "
+        f"blocker_ids={_blocker_ids(result_one)!r}"
+    )
+    # 3 call_fns is also a contract violation.
+    result_three = provider_config.run_judge_evaluator(
+        resolved["config"],
+        trajectory_digest={"summary": "x"},
+        rubric={"criteria": "y"},
+        call_fns=call_fns + [call_fns[0]],
+    )
+    assert result_three.get("ok") is False, (
+        f"three call_fns must yield ok=False; got {result_three!r}"
+    )
+    assert (
+        EXPECTED_JUDGE_EVALUATOR_BLOCKER in _blocker_ids(result_three)
+    ), (
+        f"three call_fns must emit the stable blocker id; got "
+        f"blocker_ids={_blocker_ids(result_three)!r}"
+    )

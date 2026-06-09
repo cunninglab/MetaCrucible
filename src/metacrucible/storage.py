@@ -34,17 +34,29 @@ import datetime as _dt
 import hashlib
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 __all__ = [
     "CacheIdentity",
     "CleanupReport",
+    "DENY_KEYS",
+    "RECEIPT_DEFAULT_SUMMARY_REF",
+    "RECEIPT_DEFAULT_TRAJECTORY_DIGEST_REF",
+    "RECEIPT_REF_FIELDS",
+    "RECEIPT_REF_LIST_FIELDS",
     "RepositoryStorage",
+    "SUMMARY_ALLOWED_TOP_KEYS",
     "UserGlobalStorage",
+    "build_receipt_payload",
+    "build_summary_payload",
+    "build_trajectory_digest_payload",
+    "compute_benchmark_digest",
+    "compute_executable_benchmark_digest",
 ]
 
 
@@ -73,6 +85,98 @@ DEFAULT_RAW_RETENTION_DAYS = 30
 #: evidence (transcripts, normalized event streams, model outputs).
 RAW_SUBDIR = "raw"
 
+#: Default filename of the sibling summary referenced from a receipt.
+#: The receipt is the bundle entrypoint; ``summary.json`` lives next
+#: to it in the same evidence bundle directory.
+RECEIPT_DEFAULT_SUMMARY_REF = "summary.json"
+
+#: Default filename of the sibling trajectory digest referenced from
+#: a receipt. Like the summary, it lives next to ``receipt.json``.
+RECEIPT_DEFAULT_TRAJECTORY_DIGEST_REF = "trajectory-digest.json"
+
+#: Sibling-relative string reference fields on a receipt. Each value
+#: must be a flat filename living in the same evidence bundle
+#: directory; absolute paths, path-separator usage, and parent
+#: traversal are rejected at build time (ADR 0030 — receipt is the
+#: bundle entrypoint; the bundle is the unit of sharing).
+RECEIPT_REF_FIELDS: frozenset[str] = frozenset(
+    {"summary_ref", "trajectory_digest_ref"}
+)
+
+#: Sibling-relative list-of-string reference fields on a receipt.
+#: Each item must be a flat filename in the same bundle directory.
+RECEIPT_REF_LIST_FIELDS: frozenset[str] = frozenset(
+    {"case_result_refs", "event_log_refs"}
+)
+
+#: Keys that must NEVER appear in a summary. The summary is an
+#: aggregate view; raw event streams, full model outputs, raw local
+#: paths, and held-out evidence fed to the optimizer are out of scope
+#: (ADR 0030). The allowlist is the actual filter; this set is a
+#: belt-and-braces guarantee that a renamed key cannot sneak in.
+DENY_KEYS: frozenset[str] = frozenset(
+    {
+        "raw_events",
+        "events",
+        "event_log",
+        "transcript",
+        "full_model_output",
+        "model_output",
+        "raw_output",
+        "stdout",
+        "stderr",
+        "local_path",
+        "workspace_path",
+        "home_path",
+        "path",
+        "held_out_evidence",
+        "held_out_optimizer_context",
+    }
+)
+
+#: Allowlist of top-level keys permitted in a summary. The summary is
+#: strictly aggregate (ADR 0030): only the listed fields are kept;
+#: everything else is dropped at build time. ``schema_version`` is
+#: always re-stamped so a caller-provided value cannot bypass it.
+SUMMARY_ALLOWED_TOP_KEYS: frozenset[str] = frozenset(
+    {
+        "aggregate_status",
+        "status",
+        "counts",
+        "split_summaries",
+        "weakest_dimensions",
+        "accepted_revision_id",
+        "best_revision_id",
+        "blockers",
+        "warnings",
+        "cost_summary",
+        "duration",
+    }
+)
+
+#: A string that looks like a Unix absolute path, a home-rooted path,
+#: or a Windows drive-letter path. The summary and trajectory
+#: builders use this to reject values that would leak local paths
+#: into a shared bundle.
+_ABS_PATH_RE = re.compile(
+    r"(?:(?<=[\s,:\[\{\"])|^)"
+    r"(?:/|~|\$HOME|[A-Za-z]:[\\/])"
+    r"[^\s\"',]+"
+)
+
+#: Pattern for strings that smell like a secret (API key, bearer
+#: token, etc.). Trajectory digest and summary scrub these out of
+#: text fields to defend against accidental leakage from raw
+#: transcripts that a caller pasted in.
+_SECRET_RE = re.compile(
+    r"(?i)(?:sk-[A-Za-z0-9_-]{8,}|sk-ant-[A-Za-z0-9_-]{8,}"
+    r"|ghp_[A-Za-z0-9]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}"
+    r"|Bearer\s+[A-Za-z0-9._-]{8,})"
+)
+
+#: Marker used in place of any string value the scrubber rewrites.
+_REDACTED_PATH = "[redacted:absolute-path]"
+_REDACTED_SECRET = "[redacted:secret]"
 
 
 # --------------------------------------------------------------------------- #
@@ -376,26 +480,62 @@ class UserGlobalStorage:
     # -- Receipt / summary / trajectory digest -------------------------------
 
     def write_receipt(self, run_id: str, payload: Mapping[str, Any]) -> Path:
-        """Write ``<bundle>/receipt.json`` for ``run_id``."""
-        merged = {"schema_version": SCHEMA_VERSION, **dict(payload)}
+        """Write ``<bundle>/receipt.json`` for ``run_id``.
+
+        The payload is normalized through :func:`build_receipt_payload`
+        before being written: ``schema_version`` is stamped, default
+        sibling refs are applied, and every ref is validated as a
+        flat sibling-relative filename. The public signature is
+        preserved (Issue #26: keep write_* compatibility) — caller
+        can pass either a fully-shaped receipt or a partial one and
+        the builder fills in / hardens the rest.
+        """
+        normalized = build_receipt_payload(payload)
         return _atomic_write_json(
-            self.evidence_bundle_dir(run_id) / "receipt.json", merged
+            self.evidence_bundle_dir(run_id) / "receipt.json", normalized
         )
 
     def write_summary(self, run_id: str, payload: Mapping[str, Any]) -> Path:
-        """Write ``<bundle>/summary.json`` for ``run_id``."""
-        merged = {"schema_version": SCHEMA_VERSION, **dict(payload)}
+        """Write ``<bundle>/summary.json`` for ``run_id``.
+
+        The payload is normalized through :func:`build_summary_payload`:
+        the top-level allowlist is enforced, forbidden keys are
+        dropped, absolute paths and secrets in string values are
+        scrubbed, and ``schema_version`` is stamped. The public
+        signature is preserved.
+        """
+        normalized = build_summary_payload(payload)
         return _atomic_write_json(
-            self.evidence_bundle_dir(run_id) / "summary.json", merged
+            self.evidence_bundle_dir(run_id) / "summary.json", normalized
         )
 
     def write_trajectory_digest(
-        self, run_id: str, payload: Mapping[str, Any]
+        self,
+        run_id: str,
+        payload: Mapping[str, Any],
+        *,
+        max_steps: int | None = None,
+        max_text_chars: int | None = None,
     ) -> Path:
-        """Write ``<bundle>/trajectory-digest.json`` for ``run_id``."""
-        merged = {"schema_version": SCHEMA_VERSION, **dict(payload)}
+        """Write ``<bundle>/trajectory-digest.json`` for ``run_id``.
+
+        The payload is normalized through
+        :func:`build_trajectory_digest_payload`: step count is capped
+        at ``max_steps`` (when given), per-step text is capped at
+        ``max_text_chars`` (when given), forbidden keys are stripped,
+        secrets and absolute paths are scrubbed from every string,
+        and ``schema_version`` is stamped. The public signature is
+        preserved; the two bound kwargs are new and default to
+        ``None`` (no bound).
+        """
+        normalized = build_trajectory_digest_payload(
+            payload,
+            max_steps=max_steps,
+            max_text_chars=max_text_chars,
+        )
         return _atomic_write_json(
-            self.evidence_bundle_dir(run_id) / "trajectory-digest.json", merged
+            self.evidence_bundle_dir(run_id) / "trajectory-digest.json",
+            normalized,
         )
 
     def write_raw_evidence(
@@ -564,6 +704,407 @@ class UserGlobalStorage:
             pruned_at=pruned_at,
             removed_count=len(removed),
         ).as_dict()
+
+
+# --------------------------------------------------------------------------- #
+# Evidence Bundle v1 builders (Issue #26)                                     #
+# --------------------------------------------------------------------------- #
+#
+# The receipt, summary, and trajectory digest are the three durable
+# artifacts of an evidence bundle (ADR 0024 / 0030). The receipt is
+# the bundle entrypoint and binds run identity to artifact, benchmark,
+# envelope, harness, adapter, and model identities. The summary is
+# an aggregate view; the trajectory digest is a bounded, redacted
+# narrative of execution. Builders here enforce the v1 contract:
+#
+#   - schema_version is stamped on every artifact (overrides caller).
+#   - the receipt only carries sibling-relative refs (no absolute
+#     paths, no parent traversal, no sub-path separators).
+#   - the summary is a strict allowlist; raw events / model output /
+#     local paths / held-out evidence are dropped.
+#   - the trajectory digest caps step count and per-step text, and
+#     scrubs secrets and absolute paths.
+#   - benchmark identity has two distinct scopes: ``benchmark_sha``
+#     covers the full provided payload; ``executable_benchmark_sha``
+#     covers eligible reviewed cases after split selection.
+#
+# These builders are public so the tests can drive the contract
+# without going through the filesystem write path.
+
+
+def _validate_relative_sibling_ref(value: Any, *, field: str) -> str:
+    """Validate that ``value`` is a flat sibling-relative filename.
+
+    The receipt is the bundle entrypoint; its refs must point at
+    files living next to it (the same evidence bundle directory).
+    Anything that would let a ref escape the bundle is rejected:
+    absolute paths, home-rooted prefixes, path separators, parent
+    traversal, empty / whitespace strings, and null bytes.
+    """
+    if not isinstance(value, str) or not value:
+        raise ValueError(
+            f"receipt {field!r} must be a non-empty string; got {value!r}"
+        )
+    if value != value.strip():
+        raise ValueError(
+            f"receipt {field!r} must be untrimmed; got {value!r}"
+        )
+    if os.path.isabs(value):
+        raise ValueError(
+            f"receipt {field!r} must be relative; got absolute {value!r}"
+        )
+    if value.startswith(("~", "$HOME")):
+        raise ValueError(
+            f"receipt {field!r} must be relative; got home-rooted {value!r}"
+        )
+    if "/" in value or "\\" in value:
+        raise ValueError(
+            f"receipt {field!r} must be a flat filename without "
+            f"path separators; got {value!r}"
+        )
+    if value in {".", ".."}:
+        raise ValueError(
+            f"receipt {field!r} must not be a parent-directory "
+            f"reference; got {value!r}"
+        )
+    if "\x00" in value:
+        raise ValueError(
+            f"receipt {field!r} must not contain null bytes; got {value!r}"
+        )
+    return value
+
+
+def _strip_volatile_for_executable(case: Mapping[str, Any]) -> dict[str, Any]:
+    """Default mask for :func:`compute_executable_benchmark_digest`.
+
+    Drops pure-volatile keys (timestamps, source paths, raw model
+    output) while keeping the case identity and content that an
+    eligibility check would care about. The default mask is the
+    minimum needed to make the executable hash stable against
+    re-saves that only touch mtime or absolute paths.
+
+    Unknown extra fields are kept; changing a content field on an
+    eligible reviewed case still moves the executable hash.
+    """
+    dropped = {
+        "mtime",
+        "ctime",
+        "atime",
+        "timestamp",
+        "recorded_at",
+        "source_path",
+        "abs_path",
+        "model_output",
+        "raw_output",
+        "transcript",
+    }
+    return {k: v for k, v in case.items() if k not in dropped}
+
+
+def _eligible_reviewed_cases(benchmark_payload: Any) -> list[dict[str, Any]]:
+    """Return the list of eligible reviewed cases from a benchmark payload.
+
+    Accepts either a parsed benchmark JSONL (first record metadata,
+    rest cases), a bare list of case records, or a dict that already
+    contains ``eligible_eval_cases`` / ``eligible_held_out_cases``.
+    Eligibility = ``status == "reviewed"`` (ADR 0029). Generated and
+    disabled cases are excluded so they cannot move the executable
+    hash.
+    """
+    if isinstance(benchmark_payload, Mapping):
+        # Pre-partitioned payload (e.g. from BenchmarkResult.as_dict()).
+        eval_cases = benchmark_payload.get("eligible_eval_cases")
+        held_cases = benchmark_payload.get("eligible_held_out_cases")
+        if isinstance(eval_cases, list) or isinstance(held_cases, list):
+            out: list[dict[str, Any]] = []
+            if isinstance(eval_cases, list):
+                out.extend(c for c in eval_cases if isinstance(c, Mapping))
+            if isinstance(held_cases, list):
+                out.extend(c for c in held_cases if isinstance(c, Mapping))
+            return out
+        # Otherwise treat as a list under ``cases``/``records``.
+        for key in ("cases", "records"):
+            value = benchmark_payload.get(key)
+            if isinstance(value, list):
+                benchmark_payload = value
+                break
+        else:
+            return []
+    if not isinstance(benchmark_payload, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for record in benchmark_payload:
+        if not isinstance(record, Mapping):
+            continue
+        if record.get("record_type") == "metadata":
+            continue
+        if record.get("status") == "reviewed":
+            out.append(dict(record))
+    return out
+
+
+def compute_benchmark_digest(benchmark_payload: Any) -> str:
+    """SHA-256 of the canonical JSON of the *full* benchmark payload.
+
+    The benchmark hash identifies the benchmark file *as provided*;
+    any change to the payload (generated cases, disabled cases, even
+    whitespace-stable formatting) shifts it. This is the input-side
+    identity for a run; the executable hash in
+    :func:`compute_executable_benchmark_digest` is the eligibility-
+    side identity.
+    """
+    encoded = json.dumps(
+        benchmark_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def compute_executable_benchmark_digest(
+    benchmark_payload: Any,
+    *,
+    mask_fn: Any = None,
+) -> str:
+    """SHA-256 of the canonical JSON of eligible reviewed cases.
+
+    Filters the benchmark payload to status=reviewed cases only
+    (ADR 0029), applies ``mask_fn`` to each case (default drops
+    volatile keys via :func:`_strip_volatile_for_executable`), and
+    hashes the sorted list. Generated, disabled, and other
+    non-eligible cases cannot move this hash; changes to any
+    eligible reviewed case (including its content) can.
+    """
+    cases = _eligible_reviewed_cases(benchmark_payload)
+    if mask_fn is None:
+        mask_fn = _strip_volatile_for_executable
+    masked = [mask_fn(c) for c in cases]
+    encoded = json.dumps(
+        masked,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def build_receipt_payload(
+    payload: Mapping[str, Any],
+    *,
+    default_summary_ref: str = RECEIPT_DEFAULT_SUMMARY_REF,
+    default_trajectory_digest_ref: str = RECEIPT_DEFAULT_TRAJECTORY_DIGEST_REF,
+) -> dict[str, Any]:
+    """Normalize a receipt payload to the v1 contract.
+
+    The receipt is the bundle entrypoint. This builder:
+
+      - stamps ``schema_version = SCHEMA_VERSION`` (overrides caller)
+      - applies default sibling refs (``summary.json`` /
+        ``trajectory-digest.json``) when the caller did not provide
+        them
+      - validates every ref in :data:`RECEIPT_REF_FIELDS` and every
+        list item in :data:`RECEIPT_REF_LIST_FIELDS` as a flat
+        sibling-relative filename
+      - passes through the ADR-pinned fields (run_id, run_type,
+        status, artifact, envelope, benchmark_sha,
+        executable_benchmark_sha, evaluation_harness,
+        optimizer_harness, runtime_adapter, model_identities,
+        execution_boundary_id / execution_boundary_object,
+        case_result_refs, event_log_refs, blockers) verbatim
+
+    Any other keys the caller passed in (custom extensions) are
+    kept; the v1 contract is "validate the listed fields, do not
+    forbid unknown ones". The validate-not-allowlist posture is
+    deliberate: future ADR amendments can add fields without
+    invalidating existing receipts.
+    """
+    raw = dict(payload)
+    out: dict[str, Any] = {}
+    # Apply defaults when caller omitted them; preserve caller value
+    # otherwise (after validation).
+    summary_ref = raw.get("summary_ref", default_summary_ref)
+    trajectory_digest_ref = raw.get(
+        "trajectory_digest_ref", default_trajectory_digest_ref
+    )
+    out["summary_ref"] = _validate_relative_sibling_ref(
+        summary_ref, field="summary_ref"
+    )
+    out["trajectory_digest_ref"] = _validate_relative_sibling_ref(
+        trajectory_digest_ref, field="trajectory_digest_ref"
+    )
+    # Carry through all other fields, then validate list-ref items.
+    for key, value in raw.items():
+        if key in out:
+            # ``summary_ref`` / ``trajectory_digest_ref`` already handled.
+            continue
+        if key in RECEIPT_REF_LIST_FIELDS:
+            if not isinstance(value, list):
+                raise ValueError(
+                    f"receipt {key!r} must be a list of sibling-relative "
+                    f"filenames; got {type(value).__name__}"
+                )
+            out[key] = [
+                _validate_relative_sibling_ref(item, field=f"{key}[]")
+                for item in value
+            ]
+        else:
+            out[key] = value
+    out["schema_version"] = SCHEMA_VERSION
+    return out
+
+
+def _scrub_string(value: str) -> str:
+    """Redact absolute paths and secrets from a string value."""
+    scrubbed = _ABS_PATH_RE.sub(_REDACTED_PATH, value)
+    scrubbed = _SECRET_RE.sub(_REDACTED_SECRET, scrubbed)
+    return scrubbed
+
+
+def _scrub_summary_value(value: Any) -> Any:
+    """Recursively scrub a single summary value.
+
+    Drops forbidden keys, rewrites strings that look like absolute
+    local paths or secrets. The summary is the shared view of a run;
+    raw local paths and secrets must never appear in it.
+    """
+    if isinstance(value, Mapping):
+        cleaned: dict[str, Any] = {}
+        for k, v in value.items():
+            if k in DENY_KEYS:
+                continue
+            cleaned[k] = _scrub_summary_value(v)
+        return cleaned
+    if isinstance(value, list):
+        return [_scrub_summary_value(v) for v in value]
+    if isinstance(value, str):
+        return _scrub_string(value)
+    return value
+
+
+def build_summary_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Build a v1 summary payload from an arbitrary input mapping.
+
+    The summary is a strict allowlist of aggregate fields (ADR 0030).
+    The builder:
+
+      - keeps only the keys in :data:`SUMMARY_ALLOWED_TOP_KEYS`
+      - recursively scrubs any DENY_KEYS (belt-and-braces) and any
+        string values that look like absolute local paths or
+        secrets
+      - stamps ``schema_version = SCHEMA_VERSION``
+
+    A caller-provided ``schema_version`` is dropped — the v1 stamp
+    is authoritative.
+    """
+    raw = dict(payload)
+    out: dict[str, Any] = {}
+    for key, value in raw.items():
+        if key == "schema_version":
+            # Always re-stamp; caller cannot bypass.
+            continue
+        if key not in SUMMARY_ALLOWED_TOP_KEYS:
+            continue
+        out[key] = _scrub_summary_value(value)
+    out["schema_version"] = SCHEMA_VERSION
+    return out
+
+
+def _redact_trajectory_step(step: Any) -> Any:
+    """Strip forbidden keys from a single trajectory step and scrub strings."""
+    if not isinstance(step, Mapping):
+        return step
+    cleaned: dict[str, Any] = {}
+    for k, v in step.items():
+        if k in DENY_KEYS:
+            continue
+        if isinstance(v, str):
+            cleaned[k] = _scrub_string(v)
+        else:
+            cleaned[k] = v
+    return cleaned
+
+
+def build_trajectory_digest_payload(
+    payload: Mapping[str, Any],
+    *,
+    max_steps: int | None = None,
+    max_text_chars: int | None = None,
+) -> dict[str, Any]:
+    """Build a v1 trajectory digest payload from an arbitrary mapping.
+
+    The trajectory digest is a bounded, redacted narrative of
+    execution. The builder:
+
+      - stamps ``schema_version = SCHEMA_VERSION``
+      - caps the ``steps`` list to ``max_steps`` items when
+        provided; records the cap in ``steps_truncated`` so a
+        reviewer can see that content was clipped
+      - caps any per-step ``text`` field to ``max_text_chars``
+        characters and appends an explicit truncation marker
+      - scrubs absolute paths and secrets out of every string
+        field on every step
+      - drops the DENY_KEYS fields from each step (transcript,
+        full model output, raw events, etc.)
+
+    The fields the digest is *expected* to carry — step index,
+    action, status, check, blocker — are kept verbatim; the digest
+    is for reviewers and judges, not a re-export of the raw
+    transcript.
+    """
+    raw = dict(payload)
+    out: dict[str, Any] = {}
+    for key, value in raw.items():
+        if key == "schema_version":
+            continue
+        if key == "steps" and isinstance(value, list):
+            steps: list[Any] = []
+            for step in value:
+                steps.append(_redact_trajectory_step(step))
+            truncated = False
+            if max_steps is not None and len(steps) > max_steps:
+                steps = steps[:max_steps]
+                truncated = True
+            if max_text_chars is not None:
+                capped: list[Any] = []
+                for step in steps:
+                    if isinstance(step, Mapping) and isinstance(
+                        step.get("text"), str
+                    ):
+                        text = step["text"]
+                        if len(text) > max_text_chars:
+                            text = (
+                                text[:max_text_chars]
+                                + f" ...[truncated at {max_text_chars} chars]"
+                            )
+                            truncated = True
+                        new_step = dict(step)
+                        new_step["text"] = text
+                        capped.append(new_step)
+                    else:
+                        capped.append(step)
+                steps = capped
+            out["steps"] = steps
+            if truncated:
+                out["steps_truncated"] = True
+            continue
+        # Scrub non-step string fields too (status, action, blockers
+        # summary, etc.) so a transcript pasted in ``meta`` cannot
+        # leak a token.
+        if isinstance(value, str):
+            out[key] = _scrub_string(value)
+        elif isinstance(value, Mapping):
+            out[key] = _scrub_summary_value(value)
+        elif isinstance(value, list):
+            out[key] = [
+                _scrub_summary_value(v) if not isinstance(v, Mapping)
+                else _redact_trajectory_step(v)
+                for v in value
+            ]
+        else:
+            out[key] = value
+    out["schema_version"] = SCHEMA_VERSION
+    return out
 
 
 # --------------------------------------------------------------------------- #

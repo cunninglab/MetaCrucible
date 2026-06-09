@@ -1450,3 +1450,394 @@ def test_evaluate_runtime_neutrality_blocker_appears_on_evidence_verdict(
         f"runtime-neutrality BLOCKED must surface a blocker on the "
         f"verdict (Issue #23 AC2); got blocker_ids={blocker_ids!r}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Issue #24 - routing-surface-safety profile (cap=1 + HITL)                   #
+# --------------------------------------------------------------------------- #
+#
+# Pins the contract from ADR 0027 ("routing edit budget is capped at 1, and
+# routing changes require explicit confirmation'') and ADR 0032 ("Routing
+# revisions remain capped at one selected edit and require explicit
+# confirmation before they can enter a candidate revision'') and the three
+# acceptance criteria from issue #24:
+#
+#   1. **Triggered when routing is touched**. The ``routing-surface-safety``
+#      profile is selected by :func:`select_triggers` only when the
+#      ``routing_touched`` flag is ``True`` (existing test covers the
+#      trigger surface). The evaluator below adds the *content* check: a
+#      real :class:`ProfileResult` that records what the profile observed
+#      in the proposed revision.
+#
+#   2. **Can block acceptance**. When the evaluator returns ``BLOCKED``
+#      (or ``FAIL``) for a cap or HITL violation, feeding the result into
+#      :func:`evaluate_acceptance` with the built-in blocking spec must
+#      flip the verdict to ``accepted=False`` and surface the blocker on
+#      the verdict's ``blockers`` list.
+#
+#   3. **Aligns with routing cap=1 and HITL flow**. The evaluator enforces
+#      two domain rules (ADR 0027 / ADR 0032):
+#
+#      - ``routing-surface-safety.cap-exceeded``: the proposed revision
+#        carries more than one routing change (the routing edit budget is
+#        1, so anything beyond that is a cap violation).
+#      - ``routing-surface-safety.hitl-required``: the proposed revision
+#        carries a routing change without explicit human confirmation
+#        (routing changes always require HITL confirmation before they
+#        can enter a candidate revision).
+#
+# A clean proposal (no routing changes, or exactly one routing change
+# with ``human_confirmed=True``) yields ``PASS`` with an optional
+# finding so evidence round-trips what the profile observed.
+
+
+def test_routing_surface_safety_module_exposes_issue24_surface(
+    profiles: Any,
+) -> None:
+    """Issue #24 surface: the new symbols must exist on the module.
+
+    The routing-surface-safety profile is exposed as a public
+    function (``evaluate_routing_surface_safety``) and a public
+    constant (``ROUTING_SURFACE_CAP``) so callers can branch on
+    the cap without duplicating the number 1 across the codebase.
+    The existing ``routing-surface-safety`` id / version constants
+    are part of the issue #21 surface; this test pins the
+    issue #24 additions.
+    """
+    for name in (
+        "evaluate_routing_surface_safety",
+        "ROUTING_SURFACE_CAP",
+    ):
+        assert hasattr(profiles, name), (
+            f"{PROFILES_MODULE!r} must expose {name!r} (Issue #24); "
+            f"got attributes "
+            f"{sorted(a for a in dir(profiles) if not a.startswith('_'))!r}"
+        )
+
+
+def test_routing_surface_cap_constant_is_one(profiles: Any) -> None:
+    """Issue #24 AC3: the routing edit budget is 1 (ADR 0027 / 0032).
+
+    ADR 0027: ``routing edit budget is capped at 1''. ADR 0032:
+    ``Routing revisions remain capped at one selected edit and
+    require explicit confirmation before they can enter a
+    candidate revision.'' The cap is the machine contract; a
+    silent bump to 2 (or a typo) would let a single round
+    silently rewrite two routing fields.
+    """
+    cap = profiles.ROUTING_SURFACE_CAP
+    assert cap == 1, (
+        f"ROUTING_SURFACE_CAP must equal 1 (ADR 0027 routing edit "
+        f"budget cap); got {cap!r}"
+    )
+
+
+def test_evaluate_routing_surface_safety_passes_with_no_routing_changes(
+    profiles: Any,
+) -> None:
+    """Issue #24: a proposal with no routing changes is a clean PASS.
+
+    A proposal that touches zero routing fields is trivially
+    compliant: there is no cap to exceed and no confirmation to
+    demand. The profile records the no-touch outcome as a PASS
+    with no findings (the framework's clean-default convention).
+    """
+    result = profiles.evaluate_routing_surface_safety(
+        {"routing_changes": [], "human_confirmed": False}
+    )
+    assert isinstance(result, profiles.ProfileResult), (
+        f"evaluate_routing_surface_safety must return a ProfileResult; "
+        f"got {type(result).__name__}"
+    )
+    assert result.profile_id == "routing-surface-safety", (
+        f"result must carry profile_id='routing-surface-safety' "
+        f"(Issue #24); got {result.profile_id!r}"
+    )
+    assert result.version == "v1", (
+        f"result version must be 'v1' (Issue #24); got {result.version!r}"
+    )
+    assert result.status == "PASS", (
+        f"a proposal with no routing changes must PASS; "
+        f"got status={result.status!r}"
+    )
+    assert result.blockers == (), (
+        f"a clean proposal must not emit blockers; "
+        f"got {result.blockers!r}"
+    )
+
+
+def test_evaluate_routing_surface_safety_passes_with_one_change_and_confirmation(
+    profiles: Any,
+) -> None:
+    """Issue #24 AC3: one routing change with human confirmation PASSes.
+
+    The cap is 1 and the change is human-confirmed, so the
+    profile is satisfied. A finding is emitted to record what
+    the profile observed so evidence round-trips the change
+    through :func:`evaluate_acceptance`.
+    """
+    result = profiles.evaluate_routing_surface_safety(
+        {
+            "routing_changes": [{"field": "description", "old": "a", "new": "b"}],
+            "human_confirmed": True,
+        }
+    )
+    assert result.status == "PASS", (
+        f"one human-confirmed routing change must PASS; "
+        f"got status={result.status!r}"
+    )
+    assert result.blockers == (), (
+        f"a compliant proposal must not emit blockers; "
+        f"got {result.blockers!r}"
+    )
+    assert len(result.findings) >= 1, (
+        f"a proposal with a routing change must emit a finding so "
+        f"evidence round-trips the change (Issue #24 AC3); "
+        f"got {result.findings!r}"
+    )
+
+
+def test_evaluate_routing_surface_safety_blocks_when_cap_exceeded(
+    profiles: Any,
+) -> None:
+    """Issue #24 AC3: more than 1 routing change is a cap violation.
+
+    ADR 0027: ``routing edit budget is capped at 1''. A
+    proposal that carries two or more routing changes must
+    BLOCK with a cap-exceeded blocker so a single round
+    cannot silently rewrite two routing fields.
+    """
+    result = profiles.evaluate_routing_surface_safety(
+        {
+            "routing_changes": [
+                {"field": "description"},
+                {"field": "name"},
+            ],
+            "human_confirmed": True,
+        }
+    )
+    assert result.status == "BLOCKED", (
+        f"a proposal with more than 1 routing change must BLOCK "
+        f"(Issue #24 AC3 cap=1); got status={result.status!r}"
+    )
+    assert len(result.blockers) >= 1, (
+        f"cap violation must emit at least one blocker; "
+        f"got blockers={result.blockers!r}"
+    )
+    blocker_ids = [b["id"] for b in result.blockers if isinstance(b, Mapping)]
+    assert any("cap" in bid for bid in blocker_ids), (
+        f"cap violation blocker id must mention 'cap' (Issue #24 AC3); "
+        f"got blocker_ids={blocker_ids!r}"
+    )
+
+
+def test_evaluate_routing_surface_safety_blocks_when_hitl_missing(
+    profiles: Any,
+) -> None:
+    """Issue #24 AC3: routing change without human confirmation is HITL violation.
+
+    ADR 0032: ``Routing revisions [...] require explicit
+    confirmation before they can enter a candidate revision.''
+    A proposal that carries a routing change without
+    ``human_confirmed=True`` must BLOCK with a HITL blocker.
+    """
+    result = profiles.evaluate_routing_surface_safety(
+        {
+            "routing_changes": [{"field": "description"}],
+            "human_confirmed": False,
+        }
+    )
+    assert result.status == "BLOCKED", (
+        f"a routing change without human confirmation must BLOCK "
+        f"(Issue #24 AC3 HITL); got status={result.status!r}"
+    )
+    assert len(result.blockers) >= 1, (
+        f"HITL violation must emit at least one blocker; "
+        f"got blockers={result.blockers!r}"
+    )
+    blocker_ids = [b["id"] for b in result.blockers if isinstance(b, Mapping)]
+    assert any("hitl" in bid for bid in blocker_ids), (
+        f"HITL violation blocker id must mention 'hitl' (Issue #24 AC3); "
+        f"got blocker_ids={blocker_ids!r}"
+    )
+
+
+def test_evaluate_routing_surface_safety_blocks_on_both_cap_and_hitl(
+    profiles: Any,
+) -> None:
+    """Issue #24 AC3: a proposal can violate both cap=1 and HITL at once.
+
+    A proposal with multiple routing changes and no human
+    confirmation is two distinct violations. The profile must
+    surface both blockers so a reviewer can fix them
+    independently; the framework's evidence convention is
+    "all blockers on the result, not just the first one."
+    """
+    result = profiles.evaluate_routing_surface_safety(
+        {
+            "routing_changes": [
+                {"field": "description"},
+                {"field": "name"},
+            ],
+            "human_confirmed": False,
+        }
+    )
+    assert result.status == "BLOCKED", (
+        f"a proposal violating both cap and HITL must BLOCK; "
+        f"got status={result.status!r}"
+    )
+    blocker_ids = [b["id"] for b in result.blockers if isinstance(b, Mapping)]
+    assert any("cap" in bid for bid in blocker_ids), (
+        f"combined violation must surface the cap blocker; "
+        f"got blocker_ids={blocker_ids!r}"
+    )
+    assert any("hitl" in bid for bid in blocker_ids), (
+        f"combined violation must surface the hitl blocker; "
+        f"got blocker_ids={blocker_ids!r}"
+    )
+
+
+def test_evaluate_routing_surface_safety_rejects_non_mapping_proposal(
+    profiles: Any,
+) -> None:
+    """Issue #24 (defensive): a non-mapping proposal is a programming error.
+
+    The proposal must be a mapping (e.g. ``{"routing_changes": [...],
+    "human_confirmed": bool}``). Passing a list, a string, or
+    ``None`` is a programmer error and must raise
+    :class:`ValueError` rather than silently BLOCKing.
+    """
+    for bad in (None, [], "proposal", 42):
+        with pytest.raises(ValueError):
+            profiles.evaluate_routing_surface_safety(bad)
+
+
+def test_evaluate_routing_surface_safety_blocks_acceptance_on_cap_violation(
+    profiles: Any,
+) -> None:
+    """Issue #24 AC2: cap-violation BLOCKED must block acceptance.
+
+    The routing-surface-safety profile is built-in blocking
+    (ADR 0033: ``routing-surface-safety.v1 runs when routing is
+    touched''). Feeding the cap-violation result into
+    :func:`evaluate_acceptance` with the built-in blocking spec
+    must flip the verdict to ``accepted=False`` and surface the
+    cap blocker.
+    """
+    spec_index = {s.id: s for s in profiles.BUILTIN_PROFILES}
+    spec = spec_index["routing-surface-safety"]
+    eval_result = profiles.evaluate_routing_surface_safety(
+        {
+            "routing_changes": [
+                {"field": "description"},
+                {"field": "name"},
+            ],
+            "human_confirmed": True,
+        }
+    )
+    verdict = profiles.evaluate_acceptance(
+        [eval_result],
+        profile_specs={_spec_id(spec): spec},
+    )
+    assert verdict["accepted"] is False, (
+        f"routing-surface-safety cap-violation BLOCKED must set "
+        f"accepted=False (Issue #24 AC2); got verdict={verdict!r}"
+    )
+    blocker_ids = _blocker_ids(verdict)
+    assert any("cap" in bid for bid in blocker_ids), (
+        f"cap blocker must surface on the verdict; "
+        f"got blocker_ids={blocker_ids!r}"
+    )
+
+
+def test_evaluate_routing_surface_safety_blocks_acceptance_on_hitl_violation(
+    profiles: Any,
+) -> None:
+    """Issue #24 AC2: HITL-violation BLOCKED must block acceptance.
+
+    The HITL gate (``routing changes require explicit
+    confirmation'') is a hard acceptance rule. A BLOCKED result
+    for missing confirmation must flip acceptance to
+    ``accepted=False`` and surface the HITL blocker.
+    """
+    spec_index = {s.id: s for s in profiles.BUILTIN_PROFILES}
+    spec = spec_index["routing-surface-safety"]
+    eval_result = profiles.evaluate_routing_surface_safety(
+        {
+            "routing_changes": [{"field": "description"}],
+            "human_confirmed": False,
+        }
+    )
+    verdict = profiles.evaluate_acceptance(
+        [eval_result],
+        profile_specs={_spec_id(spec): spec},
+    )
+    assert verdict["accepted"] is False, (
+        f"routing-surface-safety HITL-violation BLOCKED must set "
+        f"accepted=False (Issue #24 AC2); got verdict={verdict!r}"
+    )
+    blocker_ids = _blocker_ids(verdict)
+    assert any("hitl" in bid for bid in blocker_ids), (
+        f"HITL blocker must surface on the verdict; "
+        f"got blocker_ids={blocker_ids!r}"
+    )
+
+
+def test_evaluate_routing_surface_safety_pass_allows_acceptance(
+    profiles: Any,
+) -> None:
+    """Issue #24 AC2 (positive): a clean PASS must keep acceptance green.
+
+    A proposal with one human-confirmed routing change yields
+    ``status='PASS'``; fed into :func:`evaluate_acceptance` with
+    the built-in blocking spec, the verdict must be
+    ``accepted=True`` and the per-profile finding must surface
+    as a supplemental finding (the framework's evidence
+    convention for supplemental review layers — even a
+    blocking profile's findings round-trip through the verdict).
+    """
+    spec_index = {s.id: s for s in profiles.BUILTIN_PROFILES}
+    spec = spec_index["routing-surface-safety"]
+    eval_result = profiles.evaluate_routing_surface_safety(
+        {
+            "routing_changes": [{"field": "description", "new": "updated"}],
+            "human_confirmed": True,
+        }
+    )
+    verdict = profiles.evaluate_acceptance(
+        [eval_result],
+        profile_specs={_spec_id(spec): spec},
+    )
+    assert verdict["accepted"] is True, (
+        f"clean routing-surface-safety PASS must keep accepted=True "
+        f"(Issue #24 AC2); got verdict={verdict!r}"
+    )
+    assert _blocker_ids(verdict) == [], (
+        f"clean PASS verdict must carry no blockers; "
+        f"got {_blocker_ids(verdict)!r}"
+    )
+
+
+def test_routing_surface_safety_trigger_runs_only_when_routing_touched(
+    profiles: Any,
+) -> None:
+    """Issue #24 AC1: the profile is selected only when routing is touched.
+
+    ADR 0033: ``routing-surface-safety.v1 runs when routing is
+    touched''. The :func:`select_triggers` helper already
+    implements this rule; the test pins the behavior so the
+    routing-surface-safety profile is never added to a
+    triggered set for a non-routing-touching round.
+    """
+    off = profiles.select_triggers(routing_touched=False)
+    on = profiles.select_triggers(routing_touched=True)
+    off_ids = {_spec_id(s) for s in off}
+    on_ids = {_spec_id(s) for s in on}
+    assert "routing-surface-safety" not in off_ids, (
+        f"routing-surface-safety must NOT be triggered when routing is "
+        f"untouched (Issue #24 AC1); got {off_ids!r}"
+    )
+    assert "routing-surface-safety" in on_ids, (
+        f"routing-surface-safety MUST be triggered when routing is "
+        f"touched (Issue #24 AC1); got {on_ids!r}"
+    )

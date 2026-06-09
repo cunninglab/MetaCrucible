@@ -97,8 +97,10 @@ __all__ = [
     "SECRET_PRIVACY_RISK_VERSION",
     "ProfileResult",
     "ProfileSpec",
+    "ROUTING_SURFACE_CAP",
     "compute_evaluation_harness_sha",
     "evaluate_acceptance",
+    "evaluate_routing_surface_safety",
     "evaluate_runtime_neutrality",
     "select_supplemental",
     "select_triggers",
@@ -841,4 +843,222 @@ def evaluate_runtime_neutrality(
                 "target": target,
             },
         ),
+    )
+
+
+
+# --------------------------------------------------------------------------- #
+# Routing-surface-safety evaluator (Issue #24)                                #
+# --------------------------------------------------------------------------- #
+#
+# Pins the contract from ADR 0027 ("routing edit budget is capped at 1, and
+# routing changes require explicit confirmation'') and ADR 0032 ("Routing
+# revisions remain capped at one selected edit and require explicit
+# confirmation before they can enter a candidate revision'') and the three
+# acceptance criteria from issue #24:
+#
+#   1. **Triggered when routing is touched**. The
+#      ``routing-surface-safety`` profile is selected by
+#      :func:`select_triggers` when ``routing_touched=True``; the
+#      evaluator below adds the *content* check (counting the
+#      routing changes in the proposal and verifying the HITL
+#      flag) so the profile produces a real
+#      :class:`ProfileResult` that the rest of the framework can
+#      consume.
+#
+#   2. **Can block acceptance**. The built-in
+#      ``routing-surface-safety.v1`` spec is ``blocking=True``
+#      (ADR 0033: hard-coded safety profile). When the evaluator
+#      returns ``BLOCKED`` (cap exceeded and/or HITL missing),
+#      feeding the result into :func:`evaluate_acceptance` with
+#      the built-in spec must flip the verdict to
+#      ``accepted=False`` and surface the blocker on the
+#      verdict's ``blockers`` list.
+#
+#   3. **Aligns with routing cap=1 and HITL flow**. The
+#      evaluator enforces two domain rules:
+#
+#      - :data:`ROUTING_SURFACE_CAP` (=1): the proposed
+#        revision carries more than one routing change
+#        (:data:`routing-surface-safety.cap-exceeded` blocker).
+#      - HITL gate: a routing change lacks explicit human
+#        confirmation (:data:`routing-surface-safety.hitl-required`
+#        blocker).
+#
+# A clean proposal (zero routing changes, or exactly one
+# routing change with ``human_confirmed=True``) yields ``PASS``
+# with an optional per-change finding so evidence round-trips
+# what the profile observed through
+# :func:`evaluate_acceptance`.
+
+#: Maximum number of routing surface edits per round (ADR 0027 /
+#: ADR 0032: ``routing edit budget is capped at 1''). The cap
+#: is the machine contract; the constant is part of the public
+#: surface so callers (downstream tools, judges, optimizers)
+#: can branch on the number without re-hardcoding 1.
+ROUTING_SURFACE_CAP: int = 1
+
+
+def evaluate_routing_surface_safety(
+    proposal: Mapping[str, Any],
+) -> ProfileResult:
+    """Evaluate the routing-surface-safety profile for ``proposal``.
+
+    The function reads the proposal's routing changes and
+    confirmation flag and returns a real
+    :class:`ProfileResult` so the result plugs into
+    :func:`evaluate_acceptance` and the findings/blockers flow
+    into the evidence verdict.
+
+    Parameters
+    ----------
+    proposal:
+        The proposal-shaped input mapping. The function looks
+        up:
+
+          * ``proposal["routing_changes"]`` — a sequence of
+            routing surface changes (e.g. edits to ``name`` /
+            ``description`` for Skills; ``name`` /
+            ``description`` / ``tools`` / ``spawns`` /
+            ``output`` for subagents). An empty sequence
+            trivially passes the cap check.
+          * ``proposal["human_confirmed"]`` — ``bool`` flag
+            indicating whether the routing change has explicit
+            human confirmation. A non-mapping ``proposal``
+            argument is a programming error and raises
+            :class:`ValueError`.
+
+    Returns
+    -------
+    ProfileResult
+        A real :class:`ProfileResult` for the
+        ``routing-surface-safety`` profile.
+
+        * If the proposal has zero routing changes, returns
+          ``status='PASS'`` with no findings (a clean
+          no-touch round).
+        * If the proposal has exactly one routing change and
+          ``human_confirmed=True``, returns ``status='PASS'``
+          with a per-change finding so evidence round-trips
+          the change.
+        * If the proposal has more than one routing change,
+          returns ``status='BLOCKED'`` with a
+          ``routing-surface-safety.cap-exceeded`` blocker
+          (the cap is :data:`ROUTING_SURFACE_CAP` = 1).
+        * If the proposal has at least one routing change
+          and ``human_confirmed=False``, returns
+          ``status='BLOCKED'`` with a
+          ``routing-surface-safety.hitl-required`` blocker
+          (routing changes always require explicit
+          confirmation).
+        * Cap and HITL violations may co-occur; both blockers
+          are surfaced so a reviewer can fix them
+          independently.
+
+    Raises
+    ------
+    ValueError
+        If ``proposal`` is not a mapping. A missing routing
+        change list or confirmation flag is a BLOCKED
+        condition, not a programming error; a non-mapping
+        ``proposal`` argument is a programming error.
+    """
+    if not isinstance(proposal, Mapping):
+        raise ValueError(
+            f"evaluate_routing_surface_safety requires a mapping "
+            f"input; got {type(proposal).__name__}"
+        )
+
+    # Coerce the routing changes to a sequence. Anything that
+    # is not a sequence (None, a scalar, a generator) is
+    # treated as no-routing-changes; this matches the
+    # framework's "be liberal in what you accept" reading of
+    # proposal metadata.
+    raw_changes = proposal.get("routing_changes", ())
+    if not isinstance(raw_changes, (list, tuple, frozenset, set)):
+        routing_changes: tuple[Mapping[str, Any], ...] = ()
+    else:
+        routing_changes = tuple(raw_changes)
+    human_confirmed = bool(proposal.get("human_confirmed", False))
+
+    blockers: list[Mapping[str, str]] = []
+    findings: list[Mapping[str, Any]] = []
+
+    # Cap check: more than ROUTING_SURFACE_CAP routing
+    # changes is a cap violation. The blocker id is stable so
+    # downstream automation (judges, optimizers, reports) can
+    # group on it.
+    if len(routing_changes) > ROUTING_SURFACE_CAP:
+        blockers.append(
+            {
+                "id": "routing-surface-safety.cap-exceeded",
+                "message": (
+                    f"proposal carries {len(routing_changes)} "
+                    f"routing changes; the routing edit budget is "
+                    f"capped at {ROUTING_SURFACE_CAP} (ADR 0027 / "
+                    "ADR 0032)"
+                ),
+                "change_count": len(routing_changes),
+                "cap": ROUTING_SURFACE_CAP,
+            }
+        )
+
+    # HITL check: at least one routing change without
+    # explicit human confirmation is a HITL violation. The
+    # blocker id is stable for downstream grouping.
+    if routing_changes and not human_confirmed:
+        blockers.append(
+            {
+                "id": "routing-surface-safety.hitl-required",
+                "message": (
+                    "routing changes require explicit human "
+                    "confirmation before they can enter a "
+                    "candidate revision (ADR 0032)"
+                ),
+                "change_count": len(routing_changes),
+                "human_confirmed": False,
+            }
+        )
+
+    # Findings on PASS: when the proposal carries exactly one
+    # routing change and the cap/HITL gates are satisfied, a
+    # per-change finding is emitted so evidence round-trips
+    # what the profile observed through
+    # ``evaluate_acceptance``.
+    if (
+        not blockers
+        and len(routing_changes) == 1
+        and human_confirmed
+    ):
+        change = routing_changes[0]
+        field = ""
+        if isinstance(change, Mapping):
+            raw_field = change.get("field", "")
+            if isinstance(raw_field, str):
+                field = raw_field
+        findings.append(
+            {
+                "id": "routing-surface-safety.change.recorded",
+                "message": (
+                    f"routing change field={field!r} is "
+                    f"human-confirmed and within the cap=1 budget"
+                ),
+                "field": field,
+                "human_confirmed": True,
+            }
+        )
+
+    if blockers:
+        return ProfileResult(
+            profile_id=ROUTING_SURFACE_SAFETY_ID,
+            version=ROUTING_SURFACE_SAFETY_VERSION,
+            status="BLOCKED",
+            blockers=tuple(blockers),
+        )
+
+    return ProfileResult(
+        profile_id=ROUTING_SURFACE_SAFETY_ID,
+        version=ROUTING_SURFACE_SAFETY_VERSION,
+        status="PASS",
+        findings=tuple(findings),
     )

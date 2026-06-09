@@ -70,6 +70,7 @@ acceptance criteria from issue #22:
 """
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 from typing import Any, Iterable, Mapping, Sequence
@@ -1840,4 +1841,431 @@ def test_routing_surface_safety_trigger_runs_only_when_routing_touched(
     assert "routing-surface-safety" in on_ids, (
         f"routing-surface-safety MUST be triggered when routing is "
         f"touched (Issue #24 AC1); got {on_ids!r}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Issue #25 - secret-privacy-risk evaluator (always-on, hash-bound)            #
+# --------------------------------------------------------------------------- #
+#
+# Issue #25 acceptance criteria:
+#
+#   1. secret-privacy-risk runs on every run (via trigger selection,
+#      regardless of routing touched). The existing
+#      ``test_select_triggers_runs_secret_privacy_risk_for_all_runs``
+#      pins the trigger side; the new tests below add an evaluator
+#      integration test so the profile is *evaluated* in addition to
+#      being selected.
+#   2. high-confidence secret risks block acceptance through a real
+#      profile evaluator/result.
+#   3. the fake-secret fixture exception is reviewed and hash-bound;
+#      mismatches/missing review must block.
+
+
+def test_secret_privacy_risk_module_exposes_issue25_surface(
+    profiles: Any,
+) -> None:
+    """Issue #25 surface: the module must expose the evaluator.
+
+    The contract is the public function
+    :func:`evaluate_secret_privacy_risk`; callers (downstream
+    tools, judges, optimizers) branch on the symbol's existence
+    so it must be part of the public surface.
+    """
+    assert hasattr(profiles, "evaluate_secret_privacy_risk"), (
+        f"{PROFILES_MODULE!r} must expose 'evaluate_secret_privacy_risk' "
+        f"(Issue #25); got attributes "
+        f"{sorted(a for a in dir(profiles) if not a.startswith('_'))!r}"
+    )
+
+
+def test_evaluate_secret_privacy_risk_runs_for_every_run(
+    profiles: Any,
+) -> None:
+    """Issue #25 AC1: the profile is evaluated for every run.
+
+    Independent of the routing surface, the secret-privacy-risk
+    profile must be in the triggered set (re-pinned here for the
+    evaluator integration) and the built-in spec must be
+    ``blocking=True`` so a FAIL / BLOCKED verdict on the
+    evaluator's output flips acceptance to ``False`` through
+    :func:`evaluate_acceptance`.
+    """
+    for routing_touched in (False, True):
+        triggered = profiles.select_triggers(routing_touched=routing_touched)
+        ids = {_spec_id(s) for s in triggered}
+        assert "secret-privacy-risk" in ids, (
+            f"select_triggers must include secret-privacy-risk for every "
+            f"run (Issue #25 AC1); routing_touched={routing_touched} got "
+            f"{ids!r}"
+        )
+    spec_index = {s.id: s for s in profiles.BUILTIN_PROFILES}
+    spec = spec_index["secret-privacy-risk"]
+    assert spec.blocking is True, (
+        f"secret-privacy-risk spec must be blocking=True so the "
+        f"evaluator's FAIL / BLOCKED verdict can block acceptance "
+        f"(Issue #25 AC1); got spec.blocking={spec.blocking!r}"
+    )
+
+
+def test_evaluate_secret_privacy_risk_returns_profile_result(
+    profiles: Any,
+) -> None:
+    """Issue #25 AC2: the evaluator returns a real ProfileResult.
+
+    A clean artifact (no body, or a body with no high-confidence
+    secret patterns) yields ``status='PASS'`` with no blockers.
+    The result carries the profile id and version so evidence
+    round-trips through :func:`evaluate_acceptance`.
+    """
+    result = profiles.evaluate_secret_privacy_risk({})
+    assert isinstance(result, profiles.ProfileResult), (
+        f"evaluate_secret_privacy_risk must return a ProfileResult; "
+        f"got {type(result).__name__}"
+    )
+    assert result.profile_id == "secret-privacy-risk", (
+        f"result must carry profile_id='secret-privacy-risk' "
+        f"(Issue #25 AC2); got {result.profile_id!r}"
+    )
+    assert result.version == "v1", (
+        f"result must carry version='v1' (Issue #25 AC2); got "
+        f"{result.version!r}"
+    )
+    assert result.status == "PASS", (
+        f"a clean artifact with no body must PASS; got "
+        f"status={result.status!r}"
+    )
+    assert result.blockers == (), (
+        f"a clean artifact must not emit blockers; got {result.blockers!r}"
+    )
+
+
+def test_evaluate_secret_privacy_risk_passes_on_clean_body(
+    profiles: Any,
+) -> None:
+    """Issue #25 AC2 (positive): a body with no secrets is a clean PASS.
+
+    A body that contains only prose / configuration with no
+    high-confidence secret patterns must yield ``status='PASS'``
+    and emit no blockers.
+    """
+    body = (
+        "This Skill reads a Markdown file and prints a summary.\n"
+        "It does not call any external services.\n"
+    )
+    result = profiles.evaluate_secret_privacy_risk({"body": body})
+    assert result.status == "PASS", (
+        f"a body with no high-confidence secret patterns must PASS; "
+        f"got status={result.status!r} blockers={result.blockers!r}"
+    )
+    assert result.blockers == (), (
+        f"a clean body must not emit blockers; got {result.blockers!r}"
+    )
+
+
+def test_evaluate_secret_privacy_risk_blocks_on_high_confidence_aws_key(
+    profiles: Any,
+) -> None:
+    """Issue #25 AC2: a high-confidence AWS access key must BLOCK.
+
+    ``AKIA[0-9A-Z]{16}`` is the canonical AWS access key id; the
+    pattern is high-confidence (low false positive rate). The
+    evaluator must surface a BLOCKED result with a
+    ``secret-privacy-risk.detected`` blocker so a downstream
+    acceptance aggregator can flip ``accepted=False``.
+    """
+    # Canonical AWS access key id shape; the body below is a
+    # reference example that appears in AWS public docs.
+    body = "aws_access_key_id = AKIAIOSFODNN7EXAMPLE"
+    result = profiles.evaluate_secret_privacy_risk({"body": body})
+    assert result.status == "BLOCKED", (
+        f"a body containing an AWS access key must BLOCK; got "
+        f"status={result.status!r} blockers={result.blockers!r}"
+    )
+    # ``ProfileResult`` is a dataclass, not a Mapping; iterate the
+    # blockers field directly so the helper (``_blocker_ids``,
+    # which targets verdict dicts) is not needed here.
+    blocker_ids = [b["id"] for b in result.blockers if isinstance(b, Mapping)]
+    assert any(bid.startswith("secret-privacy-risk") for bid in blocker_ids), (
+        f"the blocker id must be rooted at 'secret-privacy-risk' so "
+        f"downstream automation can group on it; got {blocker_ids!r}"
+    )
+
+
+def test_evaluate_secret_privacy_risk_blocks_acceptance_on_real_secret(
+    profiles: Any,
+) -> None:
+    """Issue #25 AC2: a real secret must block acceptance end-to-end.
+
+    The built-in ``secret-privacy-risk`` spec is
+    ``blocking=True`` (ADR 0033: hard-coded safety profile).
+    Feeding a BLOCKED secret-privacy-risk result into
+    :func:`evaluate_acceptance` with the built-in spec must flip
+    the verdict to ``accepted=False`` and surface the
+    ``secret-privacy-risk.*`` blocker on the verdict's
+    ``blockers`` list.
+    """
+    spec_index = {s.id: s for s in profiles.BUILTIN_PROFILES}
+    spec = spec_index["secret-privacy-risk"]
+    body = "token = ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    eval_result = profiles.evaluate_secret_privacy_risk({"body": body})
+    verdict = profiles.evaluate_acceptance(
+        [eval_result],
+        profile_specs={_spec_id(spec): spec},
+    )
+    assert verdict["accepted"] is False, (
+        f"secret-privacy-risk BLOCKED must set accepted=False "
+        f"(Issue #25 AC2); got verdict={verdict!r}"
+    )
+    blocker_ids = _blocker_ids(verdict)
+    assert any(
+        bid.startswith("secret-privacy-risk") for bid in blocker_ids
+    ), (
+        f"the secret-privacy-risk blocker must surface on the "
+        f"verdict (Issue #25 AC2); got blocker_ids={blocker_ids!r}"
+    )
+
+
+def test_evaluate_secret_privacy_risk_rejects_non_mapping_artifact(
+    profiles: Any,
+) -> None:
+    """Issue #25 (defensive): a non-mapping artifact is a programming error.
+
+    The artifact must be a mapping (e.g. ``{"body": "..."}``).
+    Passing a list, a string, or ``None`` is a programmer error
+    and must raise :class:`ValueError` rather than silently
+    BLOCKing.
+    """
+    for bad in (None, "body text", ["body"], 42):
+        with pytest.raises(ValueError):
+            profiles.evaluate_secret_privacy_risk(bad)
+
+
+def test_evaluate_secret_privacy_risk_allows_reviewed_fake_with_matching_hash(
+    profiles: Any,
+) -> None:
+    """Issue #25 AC3: a reviewed fake fixture with a matching hash PASSes.
+
+    The fake-secret fixture exception has two parts:
+
+      * a *reviewed* marker — the candidate is listed in the
+        artifact's ``reviewed_fake_secrets`` sequence.
+      * a *hash binding* — the candidate's ``fixture_sha256``
+        equals the SHA-256 hex digest of the actual fixture
+        text being allowed. A reviewer pins the digest to the
+        fixture content so any future drift is detected.
+
+    When both parts match, the candidate is treated as a
+    reviewed fake fixture and the body yields ``status='PASS'``.
+    """
+    fake = "AKIAIOSFODNN7EXAMPLE"
+    fixture_sha = hashlib.sha256(fake.encode("utf-8")).hexdigest()
+    body = (
+        "## Fake AWS key (test fixture)\n"
+        f"aws_access_key_id = {fake}\n"
+    )
+    artifact = {
+        "body": body,
+        "reviewed_fake_secrets": (
+            {
+                "fixture_id": "aws-docs-example",
+                "match": fake,
+                "fixture_sha256": fixture_sha,
+            },
+        ),
+    }
+    result = profiles.evaluate_secret_privacy_risk(artifact)
+    assert result.status == "PASS", (
+        f"a reviewed fake fixture with a matching SHA-256 must PASS "
+        f"(Issue #25 AC3); got status={result.status!r} "
+        f"blockers={result.blockers!r}"
+    )
+    assert result.blockers == (), (
+        f"a reviewed fake fixture with a matching SHA-256 must not "
+        f"emit blockers; got {result.blockers!r}"
+    )
+
+
+def test_evaluate_secret_privacy_risk_blocks_on_mismatched_fixture_hash(
+    profiles: Any,
+) -> None:
+    """Issue #25 AC3: a mismatched ``fixture_sha256`` must BLOCK.
+
+    The hash binding is the contract: the reviewer's
+    ``fixture_sha256`` must equal the SHA-256 of the fixture
+    content. A mismatch means the reviewer's bound hash no
+    longer matches the actual fixture text — the content
+    drifted (or the reviewer bound the wrong fixture) and the
+    candidate is treated as a real secret.
+    """
+    fake = "AKIAIOSFODNN7EXAMPLE"
+    wrong_sha = hashlib.sha256(b"a different fixture content").hexdigest()
+    body = f"aws_access_key_id = {fake}\n"
+    artifact = {
+        "body": body,
+        "reviewed_fake_secrets": (
+            {
+                "fixture_id": "aws-docs-example",
+                "match": fake,
+                "fixture_sha256": wrong_sha,  # bound to the wrong content
+            },
+        ),
+    }
+    result = profiles.evaluate_secret_privacy_risk(artifact)
+    assert result.status == "BLOCKED", (
+        f"a mismatched fixture_sha256 must BLOCK (Issue #25 AC3); "
+        f"got status={result.status!r} blockers={result.blockers!r}"
+    )
+    blocker_ids = [b["id"] for b in result.blockers if isinstance(b, Mapping)]
+    assert any(
+        "hash" in bid or "mismatch" in bid or "binding" in bid
+        for bid in blocker_ids
+    ), (
+        f"the BLOCKED result must surface a hash-binding blocker "
+        f"so a reviewer can fix the bound hash; got {blocker_ids!r}"
+    )
+
+
+def test_evaluate_secret_privacy_risk_mismatch_blocker_carries_fixture_id(
+    profiles: Any,
+) -> None:
+    """Issue #25 review finding: mismatch blocker carries the listed fixture_id.
+
+    The contract is that the reviewer's ``fixture_id`` is echoed
+    on the ``secret-privacy-risk.reviewed-hash-mismatch``
+    blocker so a downstream report can link the binding failure
+    back to the reviewer. When the bound ``fixture_sha256``
+    does not match the actual fixture text, the candidate is
+    still listed in ``reviewed_fake_secrets`` and the reviewer's
+    ``fixture_id`` must reach the blocker even though the
+    binding is stale.
+    """
+    fake = "AKIAIOSFODNN7EXAMPLE"
+    wrong_sha = hashlib.sha256(b"a different fixture content").hexdigest()
+    body = f"aws_access_key_id = {fake}\n"
+    artifact = {
+        "body": body,
+        "reviewed_fake_secrets": (
+            {
+                "fixture_id": "aws-docs-example",
+                "match": fake,
+                "fixture_sha256": wrong_sha,  # bound to the wrong content
+            },
+        ),
+    }
+    result = profiles.evaluate_secret_privacy_risk(artifact)
+    assert result.status == "BLOCKED", (
+        f"a mismatched fixture_sha256 must BLOCK (Issue #25 AC3); "
+        f"got status={result.status!r} blockers={result.blockers!r}"
+    )
+    mismatch_blockers = [
+        b
+        for b in result.blockers
+        if isinstance(b, Mapping)
+        and b.get("id") == "secret-privacy-risk.reviewed-hash-mismatch"
+    ]
+    assert mismatch_blockers, (
+        f"a mismatched fixture_sha256 must surface a "
+        f"reviewed-hash-mismatch blocker (Issue #25 review finding); "
+        f"got blockers={result.blockers!r}"
+    )
+    blocker = mismatch_blockers[0]
+    assert blocker.get("fixture_id") == "aws-docs-example", (
+        f"the reviewed-hash-mismatch blocker must carry the "
+        f"reviewer-provided fixture_id 'aws-docs-example' (Issue #25 "
+        f"review finding); got fixture_id={blocker.get('fixture_id')!r} "
+        f"blocker={blocker!r}"
+    )
+
+
+
+def test_evaluate_secret_privacy_risk_blocks_on_unreviewed_secret(
+    profiles: Any,
+) -> None:
+    """Issue #25 AC3: a real secret with no reviewed entry must BLOCK.
+
+    The fake-fixture exception only applies to reviewed
+    candidates. A secret that has no entry in
+    ``reviewed_fake_secrets`` is, by definition, a real secret
+    and must be blocked regardless of any other reviewed
+    entries being present.
+    """
+    fake = "AKIAIOSFODNN7EXAMPLE"
+    other_fake = "AKIA2222222222222222"  # also matches the pattern
+    fixture_sha = hashlib.sha256(fake.encode("utf-8")).hexdigest()
+    body = (
+        f"aws_access_key_id = {fake}\n"
+        f"other_key = {other_fake}\n"
+    )
+    artifact = {
+        "body": body,
+        "reviewed_fake_secrets": (
+            {
+                "fixture_id": "aws-docs-example",
+                "match": fake,
+                "fixture_sha256": fixture_sha,
+            },
+        ),
+    }
+    result = profiles.evaluate_secret_privacy_risk(artifact)
+    assert result.status == "BLOCKED", (
+        f"an unreviewed secret alongside a reviewed fake must BLOCK "
+        f"(Issue #25 AC3); got status={result.status!r} "
+        f"blockers={result.blockers!r}"
+    )
+    blocker_ids = [b["id"] for b in result.blockers if isinstance(b, Mapping)]
+    assert any(
+        "unreviewed" in bid or "no-review" in bid or "detected" in bid
+        for bid in blocker_ids
+    ), (
+        f"the BLOCKED result must surface an unreviewed-secret "
+        f"blocker; got {blocker_ids!r}"
+    )
+
+
+def test_evaluate_secret_privacy_risk_blocks_when_reviewed_list_empty(
+    profiles: Any,
+) -> None:
+    """Issue #25 AC3: an empty ``reviewed_fake_secrets`` list is not a review.
+
+    Passing an empty list is a degenerate case: the candidate
+    cannot be reviewed because nothing is listed. The evaluator
+    must treat the candidate as unreviewed and BLOCK.
+    """
+    body = "aws_access_key_id = AKIAIOSFODNN7EXAMPLE\n"
+    artifact = {"body": body, "reviewed_fake_secrets": ()}
+    result = profiles.evaluate_secret_privacy_risk(artifact)
+    assert result.status == "BLOCKED", (
+        f"a body with a real secret and an empty reviewed list "
+        f"must BLOCK (Issue #25 AC3); got status={result.status!r} "
+        f"blockers={result.blockers!r}"
+    )
+
+
+def test_evaluate_secret_privacy_risk_blocks_on_non_string_fixture_sha(
+    profiles: Any,
+) -> None:
+    """Issue #25 AC3 (defensive): a non-string ``fixture_sha256`` is invalid.
+
+    The hash binding is a SHA-256 hex digest, which is a
+    non-empty string. A ``None`` / bytes / int in the
+    ``fixture_sha256`` slot is a degenerate review; the
+    evaluator must treat the candidate as unreviewed and BLOCK.
+    """
+    body = "aws_access_key_id = AKIAIOSFODNN7EXAMPLE\n"
+    artifact = {
+        "body": body,
+        "reviewed_fake_secrets": (
+            {
+                "fixture_id": "aws-docs-example",
+                "match": "AKIAIOSFODNN7EXAMPLE",
+                "fixture_sha256": None,  # not a hex digest
+            },
+        ),
+    }
+    result = profiles.evaluate_secret_privacy_risk(artifact)
+    assert result.status == "BLOCKED", (
+        f"a non-string fixture_sha256 must be treated as invalid "
+        f"and BLOCK (Issue #25 AC3); got status={result.status!r} "
+        f"blockers={result.blockers!r}"
     )

@@ -78,6 +78,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -102,6 +103,7 @@ __all__ = [
     "evaluate_acceptance",
     "evaluate_routing_surface_safety",
     "evaluate_runtime_neutrality",
+    "evaluate_secret_privacy_risk",
     "select_supplemental",
     "select_triggers",
     "weakest_darwin_dimensions",
@@ -1061,4 +1063,331 @@ def evaluate_routing_surface_safety(
         version=ROUTING_SURFACE_SAFETY_VERSION,
         status="PASS",
         findings=tuple(findings),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Secret-privacy-risk evaluator (Issue #25)                                   #
+# --------------------------------------------------------------------------- #
+#
+# Pins the contract from ADR 0033 (``secret-privacy-risk.v1 runs for
+# every run (hard-coded) [...] hard-coded safety profile'') and the
+# three acceptance criteria from issue #25:
+#
+#   1. **Runs on every run**. The :func:`select_triggers` helper
+#      unconditionally adds :data:`SECRET_PRIVACY_RISK_ID` to the
+#      triggered set; the evaluator below plugs into that
+#      trigger so the profile produces a real
+#      :class:`ProfileResult` for every artifact, regardless of
+#      whether routing is touched.
+#
+#   2. **High-confidence secret risks block acceptance**. The
+#      built-in :data:`SECRET_PRIVACY_RISK_ID` spec is
+#      ``blocking=True`` (ADR 0033: hard-coded safety profile).
+#      When the evaluator returns ``BLOCKED`` (an unreviewed
+#      high-confidence match, or a reviewed match with a stale
+#      hash binding), feeding the result into
+#      :func:`evaluate_acceptance` with the built-in spec must
+#      flip the verdict to ``accepted=False`` and surface the
+#      ``secret-privacy-risk.*`` blocker on the verdict's
+#      ``blockers`` list.
+#
+#   3. **Fake-secret fixture exception is reviewed and
+#      hash-bound**. A reviewer can mark a candidate as a fake
+#      fixture by listing it in the artifact's
+#      ``reviewed_fake_secrets`` sequence. The exception has two
+#      parts that must both be satisfied for the candidate to
+#      pass:
+#
+#      * a *reviewed* marker — the candidate text appears in at
+#        least one entry of ``reviewed_fake_secrets``;
+#      * a *hash binding* — the entry's ``fixture_sha256`` is a
+#        non-empty string that equals the SHA-256 hex digest of
+#        the actual fixture text being allowed. The binding
+#        pins the reviewer's approval to the fixture content so
+#        any drift is detected.
+#
+#      A candidate listed in ``reviewed_fake_secrets`` but with
+#      a stale or non-string ``fixture_sha256`` is treated as a
+#      real secret (the reviewer's binding is broken; the
+#      candidate is no longer trusted). A candidate not in the
+#      list at all is also a real secret. Both cases BLOCK.
+#
+# The pattern library is intentionally small and high-
+# confidence (low false positive rate). Adding a pattern is a
+# contract change because the harness identity digest includes
+# the profile's content hash; new patterns must be paired with
+# a content-hash bump.
+
+#: Built-in high-confidence secret/privacy pattern library (Issue
+#: #25). Each entry is a ``(pattern_id, compiled_regex)`` pair;
+#: the ``pattern_id`` is the machine-readable identifier that
+#: shows up on blockers and findings so downstream automation
+#: can group on it. Patterns are intentionally narrow (no
+#: whitespace, no ambiguous prefixes) so the false-positive rate
+#: stays low. The library is read-only after module load so the
+#: harness identity digest is byte-stable.
+_SECRET_PRIVACY_RISK_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    # Canonical AWS access key id; the 20-character body
+    # ``AKIA[0-9A-Z]{16}`` is a well-known high-confidence
+    # shape that appears in AWS public docs and SDKs.
+    ("aws-access-key-id", re.compile(r"AKIA[0-9A-Z]{16}")),
+    # GitHub personal access token (classic); 36 characters
+    # following the ``ghp_`` prefix.
+    (
+        "github-personal-access-token",
+        re.compile(r"ghp_[A-Za-z0-9]{36}"),
+    ),
+    # Stripe live secret key; the ``sk_live_`` prefix flags a
+    # production (non-test) secret that should never appear in
+    # a Skill or subagent source.
+    (
+        "stripe-live-secret-key",
+        re.compile(r"sk_live_[A-Za-z0-9]{24,}"),
+    ),
+)
+
+
+def _sha256_hex(text: str) -> str:
+    """Return the SHA-256 hex digest of ``text`` UTF-8 bytes.
+
+    The hash binding is a plain hex digest so a reviewer can
+    audit the digest without running the code (the binding is
+    part of the evidence convention; the reviewer pins the
+    digest next to the fixture text in a test corpus).
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def evaluate_secret_privacy_risk(
+    artifact: Mapping[str, Any],
+) -> ProfileResult:
+    """Evaluate the secret-privacy-risk profile for ``artifact``.
+
+    The function reads the artifact's ``body`` (the text to
+    scan) and ``reviewed_fake_secrets`` (the reviewer's
+    hash-bound fake-fixture list) and returns a real
+    :class:`ProfileResult` so the result plugs into
+    :func:`evaluate_acceptance` and the blockers flow into the
+    evidence verdict.
+
+    Parameters
+    ----------
+    artifact:
+        The artifact-shaped input mapping. The function looks
+        up:
+
+          * ``artifact["body"]`` — the text content to scan
+            for high-confidence secret patterns. A non-str
+            (None, missing, or wrong type) is treated as the
+            empty string; a clean empty body trivially
+            passes.
+          * ``artifact["reviewed_fake_secrets"]`` — an optional
+            sequence of mappings, each carrying a reviewed
+            fake-fixture exception. The contract for each
+            entry is:
+
+              * ``match`` (str): the exact candidate text
+                being allowed. The candidate is only
+                considered reviewed if it appears verbatim
+                in the body (so a typo or extra whitespace
+                falls through to the unreviewed path).
+              * ``fixture_sha256`` (str): the SHA-256 hex
+                digest of the actual fixture text. The
+                binding must equal ``sha256(match)``; a
+                stale or non-string binding is treated as
+                an invalid review.
+              * ``fixture_id`` (str, optional): a reviewer-
+                assigned identifier echoed on the blocker
+                so a downstream report can link the
+                binding failure back to the reviewer.
+
+            An entry that is not a mapping, or is missing
+            ``match`` / ``fixture_sha256`` as strings, is
+            silently dropped from the reviewed set (a
+            degenerate review is the same as no review).
+
+        A non-mapping ``artifact`` argument is a programming
+        error and raises :class:`ValueError`.
+
+    Returns
+    -------
+    ProfileResult
+        A real :class:`ProfileResult` for the
+        ``secret-privacy-risk`` profile.
+
+        * If the body has zero matches across the pattern
+          library, returns ``status='PASS'`` (a clean body
+          trivially passes).
+        * If every match in the body has a corresponding
+          ``reviewed_fake_secrets`` entry whose
+          ``fixture_sha256`` equals the SHA-256 of the
+          actual match text, returns ``status='PASS'``. The
+          reviewed fake-fixture exception is *hash-bound*,
+          so a fixture that drifts in content is no longer
+          trusted even if it remains listed.
+        * Otherwise returns ``status='BLOCKED'`` with one
+          blocker per unreviewed or stale-binding match.
+          The blocker id is rooted at
+          ``secret-privacy-risk.`` so downstream automation
+          can group on it. Two sub-ids are emitted:
+
+          * ``secret-privacy-risk.reviewed-hash-mismatch``:
+            the candidate is listed in
+            ``reviewed_fake_secrets`` but the bound
+            ``fixture_sha256`` does not match the actual
+            SHA-256 of the candidate text. The reviewer's
+            binding is stale (or was bound to the wrong
+            fixture).
+          * ``secret-privacy-risk.unreviewed-secret``: the
+            candidate has no entry in
+            ``reviewed_fake_secrets`` at all; this is a
+            real secret.
+
+    Raises
+    ------
+    ValueError
+        If ``artifact`` is not a mapping. A missing body or
+        an empty reviewed list is a normal PASS / BLOCKED
+        condition, not a programming error; a non-mapping
+        ``artifact`` argument is a programming error.
+    """
+    if not isinstance(artifact, Mapping):
+        raise ValueError(
+            f"evaluate_secret_privacy_risk requires a mapping input; "
+            f"got {type(artifact).__name__}"
+        )
+
+    # ``body`` is the text to scan. A non-str (None, missing,
+    # or a wrong type) is treated as the empty string so the
+    # function does not have to special-case missing inputs
+    # in tests or in callers that build the artifact
+    # incrementally.
+    raw_body = artifact.get("body")
+    body = raw_body if isinstance(raw_body, str) else ""
+
+    # ``reviewed_fake_secrets`` is the reviewer's hash-bound
+    # list. A non-sequence (None, scalar, generator) is
+    # treated as no review; this matches the framework's
+    # "be liberal in what you accept" reading of
+    # review metadata.
+    raw_reviewed = artifact.get("reviewed_fake_secrets", ())
+    if not isinstance(raw_reviewed, (list, tuple, frozenset, set)):
+        reviewed_entries: tuple[Mapping[str, Any], ...] = ()
+    else:
+        reviewed_entries = tuple(raw_reviewed)
+
+    # Walk the reviewed entries once and split them into two
+    # sets:
+    #   * ``reviewed_matches``: ``match -> fixture_id`` for
+    #     entries whose hash binding is valid (the bound
+    #     ``fixture_sha256`` equals ``sha256(match)``). A
+    #     match in this set clears the candidate.
+    #   * ``listed_matches``: ``match -> fixture_id`` for entries
+    #     that name the match in ``match`` even if the hash
+    #     binding is invalid. A match in this map but not in
+    #     ``reviewed_matches`` triggers a
+    #     ``reviewed-hash-mismatch`` blocker; the blocker carries
+    #     ``listed_matches[candidate]`` (or ``<unknown>``) as
+    #     its ``fixture_id`` so a downstream report can link the
+    #     binding failure back to the reviewer.
+    #
+    # A degenerate entry (not a mapping, missing ``match``
+    # or ``fixture_sha256`` as a non-empty string) is
+    # silently dropped. Silently dropping a degenerate
+    # review is safe: a missing or invalid review is the
+    # same as no review, and the candidate then falls
+    # through to the unreviewed-secret path (which BLOCKs).
+    reviewed_matches: dict[str, str] = {}
+    listed_matches: dict[str, str] = {}
+    for entry in reviewed_entries:
+        if not isinstance(entry, Mapping):
+            continue
+        match = entry.get("match")
+        fixture_sha = entry.get("fixture_sha256")
+        fixture_id_raw = entry.get("fixture_id", "")
+        fixture_id = (
+            fixture_id_raw
+            if isinstance(fixture_id_raw, str) and fixture_id_raw
+            else "<unknown>"
+        )
+        if not isinstance(match, str) or not isinstance(fixture_sha, str):
+            # A non-string ``fixture_sha256`` is the
+            # degenerate-review case the contract calls out:
+            # it is not a valid SHA-256 hex digest and must
+            # be treated as no review.
+            continue
+        listed_matches[match] = fixture_id
+        if _sha256_hex(match) == fixture_sha:
+            reviewed_matches[match] = fixture_id
+
+    blockers: list[Mapping[str, str]] = []
+
+    for pattern_id, pattern in _SECRET_PRIVACY_RISK_PATTERNS:
+        for match in pattern.finditer(body):
+            candidate = match.group(0)
+            if candidate in reviewed_matches:
+                # Reviewed and the hash binding is valid;
+                # the fake-fixture exception clears the
+                # candidate. Continue to the next match.
+                continue
+            if candidate in listed_matches:
+                # The reviewer listed the candidate but the
+                # bound ``fixture_sha256`` does not match
+                # the SHA-256 of the actual candidate text.
+                # The binding is stale (the fixture drifted
+                # or the reviewer bound the wrong fixture);
+                # the candidate is treated as a real
+                # secret. The blocker id includes
+                # ``fixture_id`` (when known) so a
+                # downstream report can link the binding
+                # failure back to the reviewer.
+                fixture_id = listed_matches.get(
+                    candidate, "<unknown>"
+                )
+                blockers.append(
+                    {
+                        "id": "secret-privacy-risk.reviewed-hash-mismatch",
+                        "message": (
+                            f"high-confidence {pattern_id!r} match "
+                            f"{candidate!r} is listed in "
+                            f"reviewed_fake_secrets but the bound "
+                            f"fixture_sha256 does not match the "
+                            f"SHA-256 of the actual fixture text; "
+                            f"the reviewer's binding is stale "
+                            f"(Issue #25 AC3)."
+                        ),
+                        "pattern_id": pattern_id,
+                        "match": candidate,
+                        "fixture_id": fixture_id,
+                    }
+                )
+                continue
+            # No reviewed entry at all: the candidate is a
+            # real secret.
+            blockers.append(
+                {
+                    "id": "secret-privacy-risk.unreviewed-secret",
+                    "message": (
+                        f"high-confidence {pattern_id!r} match "
+                        f"{candidate!r} has no reviewed_fake_secrets "
+                        f"entry; this is a real secret (Issue #25 AC2)."
+                    ),
+                    "pattern_id": pattern_id,
+                    "match": candidate,
+                }
+            )
+
+    if blockers:
+        return ProfileResult(
+            profile_id=SECRET_PRIVACY_RISK_ID,
+            version=SECRET_PRIVACY_RISK_VERSION,
+            status="BLOCKED",
+            blockers=tuple(blockers),
+        )
+
+    return ProfileResult(
+        profile_id=SECRET_PRIVACY_RISK_ID,
+        version=SECRET_PRIVACY_RISK_VERSION,
+        status="PASS",
     )

@@ -19,9 +19,10 @@ Issue #6 pins the public behavior of the ``metacrucible init`` subcommand:
     (driven by ``init --check``) reports the ``missing-reviewed-case``
     blocker (ADR 0029 lists missing reviewed eval/held-out cases as
     one of the fixed small machine-stable set of invalid benchmark
-    blocker codes) and exits with a stable nonzero status. The
-    blocker id must surface in both human output and the parseable
-    JSON output so CI and tooling can branch on it.
+    blocker codes) and exits with the stable ``EXIT_BLOCKED`` code
+    (Issue #27 task 27.1). The blocker id must surface in both
+    human output and the parseable JSON output so CI and tooling
+    can branch on it.
 
 These tests are the red step: the ``init`` subcommand is not yet
 implemented, so invoking ``metacrucible init`` exits with an argparse
@@ -47,6 +48,7 @@ References
 - ADR 0029 (benchmark JSONL v1 schema + missing-reviewed-case blocker).
 - ADR 0035 (init is noninteractive; does not emit BLOCKED bundles).
 - Issue #6 acceptance criteria.
+- Issue #27 task 27.1 (stable exit-code matrix).
 """
 from __future__ import annotations
 
@@ -59,6 +61,8 @@ from typing import Any
 
 import pytest
 
+from metacrucible.exit_codes import EXIT_BLOCKED
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REPO_DIR_NAME = ".metacrucible"
 BENCHMARK_FILE_NAME = "benchmark.jsonl"
@@ -70,11 +74,9 @@ BENCHMARK_FILE_NAME = "benchmark.jsonl"
 #: in both human and JSON output).
 MISSING_REVIEWED_CASE_BLOCKER = "missing-reviewed-case"
 
-
 # --------------------------------------------------------------------------- #
 # Helpers                                                                     #
 # --------------------------------------------------------------------------- #
-
 
 def _run_metacrucible(
     argv: list[str], *, cwd: Path
@@ -92,7 +94,6 @@ def _run_metacrucible(
         text=True,
         cwd=str(cwd),
     )
-
 
 def _init_workspace(tmp_path: Path) -> Path:
     """Run ``init`` against a fresh workspace dir and return that dir.
@@ -112,11 +113,9 @@ def _init_workspace(tmp_path: Path) -> Path:
     )
     return workspace
 
-
 # --------------------------------------------------------------------------- #
 # AC1 — ``init`` creates the workspace envelope and empty benchmark           #
 # --------------------------------------------------------------------------- #
-
 
 def test_init_subcommand_is_recognized(tmp_path: Path) -> None:
     """``init`` must be a recognized ``metacrucible`` subcommand.
@@ -141,7 +140,6 @@ def test_init_subcommand_is_recognized(tmp_path: Path) -> None:
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
 
-
 def test_init_exits_zero_on_fresh_workspace(tmp_path: Path) -> None:
     """``init`` must exit 0 on a fresh workspace dir (smoke test)."""
     workspace = tmp_path / "ws-exit-zero"
@@ -153,7 +151,6 @@ def test_init_exits_zero_on_fresh_workspace(tmp_path: Path) -> None:
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
 
-
 def test_init_creates_repository_envelope_directory(tmp_path: Path) -> None:
     """``init`` must create ``<workspace>/.metacrucible/`` (ADR 0016)."""
     workspace = _init_workspace(tmp_path / "ws-envelope")
@@ -162,7 +159,6 @@ def test_init_creates_repository_envelope_directory(tmp_path: Path) -> None:
         f"{REPO_DIR_NAME}/ must be created inside the workspace by "
         f"`metacrucible init`; got {sorted(p.name for p in workspace.iterdir())!r}"
     )
-
 
 def test_init_creates_envelope_json(tmp_path: Path) -> None:
     """``init`` must create ``<workspace>/.metacrucible/envelope.json``.
@@ -183,7 +179,6 @@ def test_init_creates_envelope_json(tmp_path: Path) -> None:
         f"envelope.json must parse as a JSON object; got {type(payload).__name__}"
     )
 
-
 def test_init_creates_state_json(tmp_path: Path) -> None:
     """``init`` must create ``<workspace>/.metacrucible/state.json``.
 
@@ -203,7 +198,6 @@ def test_init_creates_state_json(tmp_path: Path) -> None:
         f"state.json must parse as a JSON object; got {type(payload).__name__}"
     )
 
-
 def test_init_creates_empty_benchmark_container(tmp_path: Path) -> None:
     """``init`` must create a benchmark file at the workspace root.
 
@@ -219,11 +213,9 @@ def test_init_creates_empty_benchmark_container(tmp_path: Path) -> None:
         f"{sorted(p.name for p in workspace.iterdir())!r}"
     )
 
-
 # --------------------------------------------------------------------------- #
 # AC2 — empty benchmark is a structurally valid JSONL container               #
 # --------------------------------------------------------------------------- #
-
 
 def test_empty_benchmark_parses_as_jsonl(tmp_path: Path) -> None:
     """The empty benchmark file must parse as JSONL with a metadata record.
@@ -252,7 +244,6 @@ def test_empty_benchmark_parses_as_jsonl(tmp_path: Path) -> None:
             )
     assert records, "empty benchmark must have at least the metadata record"
 
-
 def test_empty_benchmark_first_record_is_metadata(tmp_path: Path) -> None:
     """The first JSONL record must declare itself as ``metadata``.
 
@@ -280,11 +271,9 @@ def test_empty_benchmark_first_record_is_metadata(tmp_path: Path) -> None:
         f"(ADR 0029); got {record_type!r} (full first record: {first!r})"
     )
 
-
 # --------------------------------------------------------------------------- #
 # AC3 — re-running init is stable (idempotent or explicit)                    #
 # --------------------------------------------------------------------------- #
-
 
 def test_init_rerun_is_stable_and_does_not_crash(tmp_path: Path) -> None:
     """A second ``init`` on the same workspace must not crash.
@@ -315,7 +304,6 @@ def test_init_rerun_is_stable_and_does_not_crash(tmp_path: Path) -> None:
         f"second `init` failed argparse parsing; stderr={second.stderr!r}"
     )
 
-
 def test_init_rerun_preserves_existing_envelope_json(tmp_path: Path) -> None:
     """Re-running ``init`` must not silently overwrite the envelope.
 
@@ -339,11 +327,9 @@ def test_init_rerun_preserves_existing_envelope_json(tmp_path: Path) -> None:
         f"before={before!r} after={after!r}"
     )
 
-
 # --------------------------------------------------------------------------- #
 # AC4 — ``--json`` output is machine-parseable                                 #
 # --------------------------------------------------------------------------- #
-
 
 def test_init_json_output_is_parseable(tmp_path: Path) -> None:
     """``init --json`` must emit a parseable JSON object on stdout.
@@ -376,7 +362,6 @@ def test_init_json_output_is_parseable(tmp_path: Path) -> None:
         f"init --json must return a JSON object; got {type(payload).__name__} "
         f"({payload!r})"
     )
-
 
 def test_init_json_output_has_stable_machine_fields(tmp_path: Path) -> None:
     """``init --json`` must include stable, machine-branchable fields.
@@ -418,11 +403,9 @@ def test_init_json_output_has_stable_machine_fields(tmp_path: Path) -> None:
         f"{sorted(payload.keys())!r}"
     )
 
-
 # --------------------------------------------------------------------------- #
 # AC5 — empty benchmark cannot run: missing-reviewed-case blocker             #
 # --------------------------------------------------------------------------- #
-
 
 def _init_and_check(tmp_path: Path) -> subprocess.CompletedProcess[str]:
     """Initialize a workspace and run ``init --check`` against it."""
@@ -437,22 +420,21 @@ def _init_and_check(tmp_path: Path) -> subprocess.CompletedProcess[str]:
         ["init", "--check", str(workspace)], cwd=REPO_ROOT
     )
 
-
 def test_init_check_exits_nonzero_for_empty_benchmark(tmp_path: Path) -> None:
-    """``init --check`` must exit nonzero when the benchmark has no reviewed cases.
+    """``init --check`` must exit ``EXIT_BLOCKED`` on an empty benchmark.
 
     The empty benchmark is "valid but not runnable" (ADR 0025); the
-    check pass must surface that as a stable nonzero exit code so
-    automation can branch on it. We don't pin the exact nonzero value
-    (ADR 0027 will pin the full exit-code matrix); we pin the floor.
+    check pass must surface that as the stable ``EXIT_BLOCKED`` exit
+    code (Issue #27 task 27.1) so automation can branch on it
+    without re-deriving the matrix. The pre-Issue-#27 floor was
+    "nonzero"; the new contract pins the exact value.
     """
     result = _init_and_check(tmp_path)
-    assert result.returncode != 0, (
-        f"`init --check` must exit nonzero for an empty benchmark "
-        f"(missing-reviewed-case blocker); got rc=0 "
+    assert result.returncode == EXIT_BLOCKED, (
+        f"`init --check` must exit {EXIT_BLOCKED} for an empty benchmark "
+        f"(missing-reviewed-case blocker); got rc={result.returncode} "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
-
 
 def test_init_check_human_output_contains_blocker_id(tmp_path: Path) -> None:
     """Human output of ``init --check`` must mention ``missing-reviewed-case``.
@@ -462,9 +444,9 @@ def test_init_check_human_output_contains_blocker_id(tmp_path: Path) -> None:
     failure → fix.
     """
     result = _init_and_check(tmp_path)
-    assert result.returncode != 0, (
-        f"`init --check` must exit nonzero on empty benchmark; "
-        f"got rc=0 stdout={result.stdout!r}"
+    assert result.returncode == EXIT_BLOCKED, (
+        f"`init --check` must exit {EXIT_BLOCKED} on empty benchmark; "
+        f"got rc={result.returncode} stdout={result.stdout!r}"
     )
     combined = f"{result.stdout}\n{result.stderr}"
     assert MISSING_REVIEWED_CASE_BLOCKER in combined, (
@@ -472,7 +454,6 @@ def test_init_check_human_output_contains_blocker_id(tmp_path: Path) -> None:
         f"{MISSING_REVIEWED_CASE_BLOCKER!r} blocker id (ADR 0029); "
         f"got stdout={result.stdout!r} stderr={result.stderr!r}"
     )
-
 
 def test_init_check_json_output_is_parseable_and_has_blockers(
     tmp_path: Path,
@@ -494,9 +475,9 @@ def test_init_check_json_output_is_parseable_and_has_blockers(
     result = _run_metacrucible(
         ["init", "--check", str(workspace), "--json"], cwd=REPO_ROOT
     )
-    assert result.returncode != 0, (
-        f"`init --check --json` must exit nonzero on empty benchmark; "
-        f"got rc=0 stdout={result.stdout!r}"
+    assert result.returncode == EXIT_BLOCKED, (
+        f"`init --check --json` must exit {EXIT_BLOCKED} on empty "
+        f"benchmark; got rc={result.returncode} stdout={result.stdout!r}"
     )
     try:
         payload = json.loads(result.stdout)
@@ -534,3 +515,62 @@ def test_init_check_json_output_is_parseable_and_has_blockers(
         f"{MISSING_REVIEWED_CASE_BLOCKER!r} (ADR 0029); "
         f"got blocker_ids={blocker_ids!r} (full blockers={blockers!r})"
     )
+
+
+# --------------------------------------------------------------------------- #
+# AC6 — init BLOCKED path does not emit an evidence bundle (Issue #27 27.2)  #
+# --------------------------------------------------------------------------- #
+#
+# ADR 0035: ``init`` is a non-emitting BLOCKED category. The
+# ``init --check`` BLOCKED exit must surface the missing-reviewed-
+# case blocker through CLI output only — no evidence bundle is
+# written. The test pins the no-bundle contract for the existing
+# ``init --check`` flow so a future change that accidentally
+# couples ``init`` to a bundle helper fails loud.
+
+def test_init_check_blocked_does_not_create_evidence_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``init --check`` BLOCKED must not write a user-global evidence bundle.
+
+    The init BLOCKED path is a non-emitting category (ADR 0035).
+    Blockers are reported through CLI output; no
+    ``$HOME/.metacrucible/evidence/`` directory is created.
+
+    HOME is pinned to a temp dir so the test cannot leak evidence
+    into the developer's real ``~/.metacrucible/`` if it
+    misbehaves.
+    """
+    fake_home = tmp_path / "home"
+    fake_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    workspace = tmp_path / "ws-init-blocked"
+    workspace.mkdir(parents=True, exist_ok=True)
+    init = _run_metacrucible(["init", str(workspace)], cwd=REPO_ROOT)
+    assert init.returncode == 0, (
+        f"`init` must exit 0 before --check; got rc={init.returncode} "
+        f"stderr={init.stderr!r}"
+    )
+
+    result = _run_metacrucible(
+        ["init", "--check", str(workspace), "--json"], cwd=REPO_ROOT
+    )
+    assert result.returncode == EXIT_BLOCKED, (
+        f"`init --check --json` must exit {EXIT_BLOCKED} on empty "
+        f"benchmark; got rc={result.returncode} stdout={result.stdout!r}"
+    )
+
+    evidence_root = fake_home / ".metacrucible" / "evidence"
+    if evidence_root.exists():
+        contents = sorted(p.name for p in evidence_root.iterdir())
+        assert contents == [], (
+            f"`init --check` must NOT create an evidence bundle "
+            f"(ADR 0035 non-emitting category); found {contents!r} "
+            f"under {evidence_root}"
+        )
+    # If the evidence root was never created, that is the cleanest
+    # possible signal that no bundle was written. The above branch
+    # covers the case where the root exists but is empty (which can
+    # happen if a previous test in the same run-id namespace wrote
+    # to a sibling directory).

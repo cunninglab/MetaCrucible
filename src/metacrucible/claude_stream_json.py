@@ -23,9 +23,30 @@ missing values are warnings rather than blockers").
 
 The parser is robust against mixed stdout: non-JSON lines are
 classified as diagnostics (sub-tool warnings, debug output) and
-counted separately so they do not inflate the raw event count. When
-the number of malformed lines exceeds a small threshold the parser
-emits a blocker because the output may now be hiding real events.
+counted separately so they do not inflate the raw event count. The
+count of malformed lines is exposed on the evidence dict as
+``malformed_line_count`` so callers can see how much noise was
+absorbed; it is a diagnostic, never a contribution to evidence.
+
+Diagnostic, not evidence source of truth (ADR 0035)
+---------------------------------------------------
+
+The stream-json parser is the adapter-side producer of evidence
+fields. Non-JSON lines are **diagnostics**: they are counted, they
+may produce a blocker when the run is too noisy to classify, and
+they are surfaced on the evidence dict for the caller's own
+diagnostics — but they do **not** contribute to the receipt,
+summary, or trajectory digest. The receipt / summary / trajectory
+digest writers (ADR 0030) read only the well-formed fields on the
+evidence dict; they never open or parse the raw stream-json log
+themselves. Optional ``event_log_refs`` on a receipt are opaque
+sibling-relative refs supplied by the caller, not parsed by
+MetaCrucible for truth.
+
+When the number of malformed lines exceeds a small threshold the
+parser emits a blocker. The blocker is a *classification* signal:
+"this output is too noisy to classify", not a claim that the
+stream-json log is authoritative evidence.
 """
 from __future__ import annotations
 
@@ -163,6 +184,11 @@ def parse_stream_json(
 
         - ``start_captured`` / ``completion_captured`` (bool)
         - ``raw_event_count`` (int) — well-formed JSON events only
+        - ``malformed_line_count`` (int) — non-JSON lines absorbed as
+          diagnostics; they do not contribute to ``raw_event_count``
+          and are never used as evidence. The count is exposed so
+          callers (logs, dashboards) can see how much noise was
+          absorbed; it is not a classification signal in itself.
         - ``final_output`` (str | None) — ``result.result`` field
         - ``exit_code`` (int) — caller-supplied
         - ``stderr`` (str) — caller-supplied
@@ -301,6 +327,7 @@ def parse_stream_json(
         "start_captured": start_captured,
         "completion_captured": completion_captured,
         "raw_event_count": raw_event_count,
+        "malformed_line_count": malformed_line_count,
         "final_output": final_output,
         "exit_code": exit_code,
         "stderr": stderr,

@@ -15,6 +15,21 @@ as ``python -m metacrucible``. This module owns the CLI surface:
 The remaining MVP subcommands from ADR 0035 (``review``, ``bootstrap``,
 ``optimize``, ``synthesize``, ``inspect``, ``baseline create``,
 ``evaluate``) land in later waves per ``docs/roadmap.md``.
+
+Exit codes
+----------
+
+The exact integer returned by :func:`main` is pinned by
+:mod:`metacrucible.exit_codes`` so scripts and CI can branch on it
+without re-deriving the matrix:
+
+  - ``0`` — success.
+  - ``1`` — argparse usage error (unknown subcommand, missing
+    required positional/flag, or invalid argument).
+  - ``2`` — semantic blocker (the command ran, but a precondition
+    prevented the requested outcome).
+  - ``3`` — uncaught exception past the command dispatcher; an
+    English error message is written to stderr first.
 """
 from __future__ import annotations
 
@@ -27,11 +42,16 @@ from typing import Any, Sequence
 
 from . import __version__
 from .benchmark import SPLIT_EVAL, SPLIT_HELD_OUT
+from .exit_codes import (
+    EXIT_BLOCKED,
+    EXIT_INTERNAL_ERROR,
+    EXIT_OK,
+    EXIT_USER_ERROR,
+)
 from .promote import promote_case
 from .storage import RepositoryStorage
 
 __all__ = ["main"]
-
 
 #: Name of the benchmark container at the workspace root. ADR 0025
 #: pins the empty benchmark as a valid container; the loader
@@ -42,11 +62,6 @@ BENCHMARK_FILE_NAME = "benchmark.jsonl"
 #: has no reviewed cases. Pinned by ADR 0029's "fixed small
 #: machine-stable set" of invalid benchmark blocker codes.
 MISSING_REVIEWED_CASE_BLOCKER = "missing-reviewed-case"
-
-#: Exit code returned by ``init --check`` when validation surfaces
-#: at least one blocker. Distinct from argparse's exit 2 so callers
-#: can branch on the semantic outcome.
-CHECK_BLOCKED_EXIT_CODE = 2
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -281,7 +296,15 @@ def _check_workspace(workspace: Path) -> dict[str, Any]:
 
 
 def _emit(payload: dict[str, Any], *, as_json: bool) -> None:
-    """Write ``payload`` to stdout in JSON or human form."""
+    """Write ``payload`` to stdout in JSON or human form.
+
+    The human form is a key/value summary that keeps the CLI's
+    own prose English-only (Issue #27 task 27.4). User-controlled
+    freeform text (currently ``review_note`` from ``promote``) is
+    masked in the human surface so a multilingual review note
+    never contaminates the English prose contract. The full
+    value is preserved by ``--json`` for callers that need it.
+    """
     if as_json:
         print(json.dumps(payload, indent=2, sort_keys=True))
         return
@@ -298,8 +321,22 @@ def _emit(payload: dict[str, Any], *, as_json: bool) -> None:
                         print(f"- {blocker}")
             else:
                 print(f"{key}: (none)")
+        elif key == "review_note":
+            # User-controlled freeform text; the operator does not
+            # need it echoed back as part of the English prose
+            # surface, and a non-ASCII note would otherwise
+            # contaminate the human-only contract. Use ``--json``
+            # to retrieve the verbatim value.
+            if isinstance(value, str) and value:
+                print(
+                    f"{key}: <{len(value)} chars, hidden in "
+                    f"human output; use --json to view>"
+                )
+            else:
+                print(f"{key}: (empty)")
         else:
             print(f"{key}: {value}")
+
 
 def cmd_promote(args: argparse.Namespace) -> int:
     """Run the ``promote`` subcommand; return the process exit code."""
@@ -315,7 +352,7 @@ def cmd_promote(args: argparse.Namespace) -> int:
         dry_run=not args.apply,
     )
     _emit(result, as_json=args.json)
-    return 0 if not result["blockers"] else CHECK_BLOCKED_EXIT_CODE
+    return EXIT_OK if not result["blockers"] else EXIT_BLOCKED
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -332,7 +369,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             "blockers": result["blockers"],
         }
         _emit(payload, as_json=args.json)
-        return 0 if result["ok"] else CHECK_BLOCKED_EXIT_CODE
+        return EXIT_OK if result["ok"] else EXIT_BLOCKED
     # ``--no-isolation`` gate (Issue #13 AC3+AC4). The flag is a
     # safety escape hatch for callers that intentionally want to
     # skip copy-on-write masking; the gate refuses the call unless
@@ -354,7 +391,7 @@ def cmd_init(args: argparse.Namespace) -> int:
                 "blockers": gate["blockers"],
             }
             _emit(payload, as_json=args.json)
-            return CHECK_BLOCKED_EXIT_CODE
+            return EXIT_BLOCKED
     paths = _create_workspace(workspace)
     # Boundary report (ADR 0031, Issue #13 AC1). When
     # ``--no-isolation`` is set the gate above has already passed,
@@ -381,16 +418,22 @@ def cmd_init(args: argparse.Namespace) -> int:
         "boundary_report": boundary_report,
     }
     _emit(payload, as_json=args.json)
-    return 0
+    return EXIT_OK
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point for the ``metacrucible`` console script.
 
-    Returns the process exit code. Argparse's ``--help`` / ``--version``
-    actions raise ``SystemExit`` to terminate; we catch those here and
-    translate to a clean integer return value so the console-script
-    wrapper and unit tests get a stable contract.
+    Returns the process exit code, pinned by
+    :mod:`metacrucible.exit_codes`. Argparse's ``--help`` /
+    ``--version`` actions raise ``SystemExit`` to terminate; we
+    catch those here and translate to a clean integer return value
+    so the console-script wrapper and unit tests get a stable
+    contract.
+
+    Any uncaught exception past the command dispatcher is mapped
+    to ``EXIT_INTERNAL_ERROR`` with a one-line English message on
+    stderr; the caller treats this as a bug report.
     """
     parser = _build_parser()
     args_list = list(sys.argv[1:] if argv is None else argv)
@@ -402,17 +445,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             "A workbench for improving portable agent capabilities. "
             "Run 'metacrucible --help' for usage."
         )
-        return 0
+        return EXIT_OK
     try:
         args = parser.parse_args(args_list)
     except SystemExit as exc:
+        # Argparse raises SystemExit on --help / --version (code 0
+        # or None) and on usage errors (code 2). Map success to
+        # EXIT_OK; map any nonzero (i.e. usage error) to
+        # EXIT_USER_ERROR so the contract stays distinct from the
+        # blocked (2) and internal (3) codes.
         code = exc.code
-        return 0 if code is None else int(code)
-    if getattr(args, "command", None) == "init":
-        return cmd_init(args)
-    if getattr(args, "command", None) == "promote":
-        return cmd_promote(args)
-    return 0
+        if code is None or int(code) == 0:
+            return EXIT_OK
+        return EXIT_USER_ERROR
+    try:
+        if getattr(args, "command", None) == "init":
+            return cmd_init(args)
+        if getattr(args, "command", None) == "promote":
+            return cmd_promote(args)
+        return EXIT_OK
+    except Exception as exc:  # noqa: BLE001 - exit-code firewall
+        # Catch-all so an uncaught command-handler bug still
+        # returns a stable code; the English message is the
+        # diagnostic the caller reads.
+        print(
+            f"metacrucible: internal error: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return EXIT_INTERNAL_ERROR
 
 
 if __name__ == "__main__":

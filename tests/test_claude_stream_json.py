@@ -784,6 +784,231 @@ def test_parse_stream_json_malformed_lines_do_not_crash(
 
 
 # --------------------------------------------------------------------------- #
+# Issue #27 task 27.3: JSONL logs are diagnostics, not evidence               #
+# --------------------------------------------------------------------------- #
+
+
+def test_parse_stream_json_clean_run_reports_zero_malformed_line_count(
+    stream_json_mod: Any,
+) -> None:
+    """A well-formed run must report ``malformed_line_count == 0``.
+
+    The field is the diagnostic counterpart of ``raw_event_count``:
+    a clean run that produced only JSON events has zero
+    diagnostics. Exposing the count makes the "JSONL is
+    diagnostics, not evidence" contract observable; the count
+    is part of the evidence dict, not a hidden internal.
+    """
+    text = _successful_run()
+    evidence = stream_json_mod.parse_stream_json(
+        text, adapter_version=ADAPTER_VERSION
+    )
+    assert "malformed_line_count" in evidence, (
+        f"evidence dict must expose malformed_line_count (Issue #27 "
+        f"task 27.3); got keys {sorted(evidence.keys())!r}"
+    )
+    assert evidence["malformed_line_count"] == 0, (
+        f"a clean run must report zero diagnostics; got "
+        f"malformed_line_count={evidence.get('malformed_line_count')!r}"
+    )
+
+
+def test_parse_stream_json_malformed_lines_increment_diagnostic_count_only(
+    stream_json_mod: Any,
+) -> None:
+    """Non-JSON lines must show up in ``malformed_line_count`` and
+    MUST NOT show up in ``raw_event_count``.
+
+    This is the contract: malformed lines are *diagnostics*. The
+    count is exposed so callers can see how much noise was
+    absorbed; the well-formed event count is independent and is
+    the only count that reflects the run's evidence. A non-JSON
+    line that the parser absorbed must add 1 to
+    ``malformed_line_count`` and 0 to ``raw_event_count``.
+    """
+    text = (
+        _emit(_make_init_event())
+        + "\n"
+        + "first stray debug line\n"
+        + _emit(_make_user_event("hi"))
+        + "\n"
+        + "second stray debug line\n"
+        + _emit(_make_assistant_event())
+        + "\n"
+        + "third stray debug line\n"
+        + _emit(_make_result_event())
+        + "\n"
+    )
+    evidence = stream_json_mod.parse_stream_json(
+        text, adapter_version=ADAPTER_VERSION
+    )
+    # Three non-JSON lines were absorbed.
+    assert evidence.get("malformed_line_count") == 3, (
+        f"three non-JSON lines must show as three diagnostics; got "
+        f"malformed_line_count={evidence.get('malformed_line_count')!r}"
+    )
+    # Four well-formed events: init + user + assistant + result.
+    assert evidence.get("raw_event_count") == 4, (
+        f"raw_event_count must NOT count non-JSON lines; got "
+        f"raw_event_count={evidence.get('raw_event_count')!r}"
+    )
+
+
+def test_parse_stream_json_single_stray_diagnostic_does_not_block(
+    stream_json_mod: Any,
+) -> None:
+    """A single non-JSON line is a diagnostic, not a blocker.
+
+    The threshold is the classifier: at the threshold the output
+    is too noisy to trust; below it, the run still classifies
+    from the well-formed events. A single stray debug line is
+    below threshold; the run must still report start and
+    completion and must not emit the
+    ``stream-json-malformed-line`` blocker.
+    """
+    text = (
+        _emit(_make_init_event())
+        + "\n"
+        + "single stray debug line\n"
+        + _emit(_make_user_event("hi"))
+        + "\n"
+        + _emit(_make_assistant_event())
+        + "\n"
+        + _emit(_make_result_event())
+        + "\n"
+    )
+    evidence = stream_json_mod.parse_stream_json(
+        text, adapter_version=ADAPTER_VERSION
+    )
+    # The diagnostic is recorded...
+    assert evidence.get("malformed_line_count") == 1, (
+        f"a single non-JSON line must increment the diagnostic count; "
+        f"got malformed_line_count={evidence.get('malformed_line_count')!r}"
+    )
+    # ...but the run still classifies from the well-formed events.
+    assert evidence.get("start_captured") is True, (
+        f"a single stray line must not lose the init event; got "
+        f"start_captured={evidence.get('start_captured')!r}"
+    )
+    assert evidence.get("completion_captured") is True, (
+        f"a single stray line must not lose the result event; got "
+        f"completion_captured={evidence.get('completion_captured')!r}"
+    )
+    # ...and is below the noise threshold, so no blocker.
+    assert EXPECTED_BLOCKERS["malformed_line"] not in _blocker_ids(evidence), (
+        f"a single stray line is below the noise threshold and must "
+        f"not emit the malformed-line blocker; got "
+        f"blocker_ids={_blocker_ids(evidence)!r}"
+    )
+
+
+def test_parse_stream_json_threshold_malformed_lines_classifies_run(
+    stream_json_mod: Any,
+) -> None:
+    """At/above the noise threshold the parser emits a classifier
+    blocker; the run's classification is still observable.
+
+    The blocker is a *classification* signal — the output is too
+    noisy to trust — not a claim that the stream-json log is
+    authoritative evidence. The well-formed fields are still
+    populated from the events the parser did manage to read; the
+    caller (the receipt writer) branches on the blocker id, not
+    on the stream-json log content.
+    """
+    text = (
+        _emit(_make_init_event())
+        + "\n"
+        + "stray line one\n"
+        + "stray line two\n"
+        + _emit(_make_user_event("hi"))
+        + "\n"
+        + _emit(_make_assistant_event())
+        + "\n"
+        + _emit(_make_result_event())
+        + "\n"
+    )
+    evidence = stream_json_mod.parse_stream_json(
+        text, adapter_version=ADAPTER_VERSION
+    )
+    # The diagnostic count is the number of non-JSON lines.
+    assert evidence.get("malformed_line_count") == 2, (
+        f"two non-JSON lines must show as two diagnostics; got "
+        f"malformed_line_count={evidence.get('malformed_line_count')!r}"
+    )
+    # The well-formed fields are still populated — init/result
+    # were observed, so the run can still be classified.
+    assert evidence.get("start_captured") is True, (
+        f"the init event is well-formed and must still be captured; "
+        f"got start_captured={evidence.get('start_captured')!r}"
+    )
+    assert evidence.get("completion_captured") is True, (
+        f"the result event is well-formed and must still be "
+        f"captured; got "
+        f"completion_captured={evidence.get('completion_captured')!r}"
+    )
+    # The blocker is present. The message is a classification
+    # signal, not a claim that the stream-json log is authoritative.
+    blockers = _blocker_ids(evidence)
+    assert EXPECTED_BLOCKERS["malformed_line"] in blockers, (
+        f"at-threshold noise must emit the malformed-line blocker; "
+        f"got blocker_ids={blockers!r}"
+    )
+    # Pull the actual blocker entry and assert the message is
+    # the "too noisy to classify" classification signal, not
+    # an authoritative-evidence claim.
+    msg = next(
+        b["message"]
+        for b in evidence["blockers"]
+        if b.get("id") == EXPECTED_BLOCKERS["malformed_line"]
+    )
+    assert "classify" in msg, (
+        f"malformed-line blocker message must describe the output as "
+        f"too noisy to classify (a classification signal, not an "
+        f"authoritative-evidence claim); got {msg!r}"
+    )
+
+
+def test_parse_stream_json_diagnostic_lines_do_not_appear_in_blockers_below_threshold(
+    stream_json_mod: Any,
+) -> None:
+    """A run with diagnostic lines but a clean init/result pair
+    must not list the diagnostic as a blocker.
+
+    The diagnostic is recorded on ``malformed_line_count`` and
+    visible to the caller; the receipt / summary / trajectory
+    digest are populated from the well-formed events. Diagnostic
+    noise is not a blocker below the threshold; the run
+    classifies as "completed with noise" rather than "blocked
+    by noise".
+    """
+    text = (
+        _emit(_make_init_event())
+        + "\n"
+        + "stray debug line\n"
+        + _emit(_make_user_event("hi"))
+        + "\n"
+        + _emit(_make_assistant_event())
+        + "\n"
+        + _emit(_make_result_event())
+        + "\n"
+    )
+    evidence = stream_json_mod.parse_stream_json(
+        text, adapter_version=ADAPTER_VERSION
+    )
+    assert evidence.get("malformed_line_count") == 1
+    assert evidence.get("start_captured") is True
+    assert evidence.get("completion_captured") is True
+    # The only non-trivial blocker ids are the ones that reflect
+    # missing init/result/runner-version. The diagnostic noise
+    # does not contribute a blocker entry.
+    blocker_id_set = set(_blocker_ids(evidence))
+    assert EXPECTED_BLOCKERS["malformed_line"] not in blocker_id_set, (
+        f"below-threshold diagnostic noise must not appear as a "
+        f"blocker; got blocker_ids={blocker_id_set!r}"
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Optional-field handling: warnings, not blockers (ADR 0028)                   #
 # --------------------------------------------------------------------------- #
 

@@ -10,6 +10,7 @@ from typing import Any, Iterable
 import pytest
 
 from metacrucible.benchmark import PENDING_GENERATED_BLOCKER, load_benchmark
+from metacrucible.exit_codes import EXIT_BLOCKED, EXIT_USER_ERROR
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BENCHMARK_FILE_NAME = "benchmark.jsonl"
@@ -66,13 +67,18 @@ def _generated_case(case_id: str, **extras: Any) -> dict[str, Any]:
 
 
 def test_promote_requires_case_id_split_and_reviewer(tmp_path: Path) -> None:
-    """Argparse must reject promote calls that omit required review fields."""
+    """Argparse must reject promote calls that omit required review fields.
+
+    Issue #27 task 27.1: argparse usage errors map to ``EXIT_USER_ERROR``
+    (1) so they stay distinct from the semantic blocked (2) and
+    internal (3) exit codes.
+    """
     workspace = tmp_path / "ws-promote-required"
     workspace.mkdir()
 
     result = _run_metacrucible(["promote", str(workspace)], cwd=REPO_ROOT)
 
-    assert result.returncode == 2
+    assert result.returncode == EXIT_USER_ERROR
     assert "--case-id" in result.stderr
     assert "--split" in result.stderr
     assert "--reviewed-by" in result.stderr
@@ -267,7 +273,11 @@ def test_promote_apply_appends_history_record(tmp_path: Path) -> None:
 def test_promote_blocks_empty_reviewer_identity(
     tmp_path: Path, reviewed_by: str
 ) -> None:
-    """Promotion must require an explicit non-empty reviewer identity."""
+    """Promotion must require an explicit non-empty reviewer identity.
+
+    Issue #27 task 27.1: the empty-reviewer precondition maps to the
+    stable ``EXIT_BLOCKED`` code so callers can branch on it.
+    """
     workspace = tmp_path / "ws-promote-empty-reviewer"
     workspace.mkdir()
     benchmark = workspace / BENCHMARK_FILE_NAME
@@ -289,7 +299,7 @@ def test_promote_blocks_empty_reviewer_identity(
         cwd=REPO_ROOT,
     )
 
-    assert result.returncode == 2
+    assert result.returncode == EXIT_BLOCKED
     payload = json.loads(result.stdout)
     assert [blocker["id"] for blocker in payload["blockers"]] == [
         "promote-empty-reviewed-by"
@@ -328,12 +338,15 @@ def test_promote_default_review_note_is_empty_string(tmp_path: Path) -> None:
     records = [json.loads(line) for line in benchmark.read_text(encoding="utf-8").splitlines()]
     assert records[1]["review_note"] == ""
 
-
 @pytest.mark.parametrize("status", ["reviewed", "disabled"])
 def test_promote_blocks_cases_that_are_not_generated(
     tmp_path: Path, status: str
 ) -> None:
-    """Only generated cases may be promoted; existing provenance must stay intact."""
+    """Only generated cases may be promoted; existing provenance must stay intact.
+
+    Issue #27 task 27.1: the not-generated precondition maps to the
+    stable ``EXIT_BLOCKED`` code.
+    """
     workspace = tmp_path / "ws-promote-not-generated"
     workspace.mkdir()
     benchmark = workspace / BENCHMARK_FILE_NAME
@@ -368,7 +381,7 @@ def test_promote_blocks_cases_that_are_not_generated(
         cwd=REPO_ROOT,
     )
 
-    assert result.returncode == 2
+    assert result.returncode == EXIT_BLOCKED
     payload = json.loads(result.stdout)
     assert [blocker["id"] for blocker in payload["blockers"]] == [
         "promote-case-not-generated"
@@ -377,7 +390,6 @@ def test_promote_blocks_cases_that_are_not_generated(
     assert records[1]["status"] == status
     assert records[1]["reviewed_by"] == "bob"
     assert records[1]["review_note"] == "original"
-
 
 def test_promote_one_case_preserves_remaining_generated_blocker(tmp_path: Path) -> None:
     """Promoting one generated case must not hide other pending generated cases."""
@@ -411,7 +423,6 @@ def test_promote_one_case_preserves_remaining_generated_blocker(tmp_path: Path) 
     assert PENDING_GENERATED_BLOCKER in blocker_ids
     assert [case["case_id"] for case in loaded.pending_generated_cases] == ["gen-2"]
     assert [case["case_id"] for case in loaded.eligible_eval_cases] == ["gen-1"]
-
 
 def test_promote_preserves_jsonl_case_order_and_removes_literal_sentinel(
     tmp_path: Path,
@@ -456,9 +467,12 @@ def test_promote_preserves_jsonl_case_order_and_removes_literal_sentinel(
     assert "BOOTSTRAP_PENDING_REVIEW" not in records[1]
     assert not (workspace / f"{BENCHMARK_FILE_NAME}.tmp").exists()
 
-
 def test_promote_blocks_unknown_case_id(tmp_path: Path) -> None:
-    """Promotion must report a stable blocker when the target case is absent."""
+    """Promotion must report a stable blocker when the target case is absent.
+
+    Issue #27 task 27.1: the missing-case precondition maps to the
+    stable ``EXIT_BLOCKED`` code.
+    """
     workspace = tmp_path / "ws-promote-missing"
     workspace.mkdir()
     benchmark = workspace / BENCHMARK_FILE_NAME
@@ -480,7 +494,7 @@ def test_promote_blocks_unknown_case_id(tmp_path: Path) -> None:
         cwd=REPO_ROOT,
     )
 
-    assert result.returncode == 2
+    assert result.returncode == EXIT_BLOCKED
     payload = json.loads(result.stdout)
     assert [blocker["id"] for blocker in payload["blockers"]] == [
         "promote-case-not-found"

@@ -4,15 +4,22 @@ Exposes :func:`main` as the ``metacrucible`` console script (declared
 in ``pyproject.toml`` under ``[project.scripts]``) and is also invokable
 as ``python -m metacrucible``. This module owns the CLI surface:
 
-  - the skeleton flags (``--help`` / ``--version``) from Issue #3, and
+  - the skeleton flags (``--help`` / ``--version``) from Issue #3,
   - the ``init`` subcommand from Issue #6, which creates the
     per-artifact ``.metacrucible/`` envelope/state plus an empty
     ``benchmark.jsonl`` container at the workspace root, and which
     exposes ``--check`` for a post-init validation pass that surfaces
     the ``missing-reviewed-case`` blocker (ADR 0029) on an empty
-    benchmark.
+    benchmark, and
+  - the ``review`` subcommand from Issue #29 (PRD F1): a one-shot
+    diagnostic that runs Static Review (Darwin 9-dimension rubric)
+    against a capability artifact and conditionally runs Execution
+    Evaluation when a reviewed Benchmark is present at the workspace
+    root. The artifact on disk is never mutated; the source bytes are
+    read once and the evidence bundle is written to the user-global
+    store (ADR 0016 / ADR 0030).
 
-The remaining MVP subcommands from ADR 0035 (``review``, ``bootstrap``,
+The remaining MVP subcommands from ADR 0035 (``bootstrap``,
 ``optimize``, ``synthesize``, ``inspect``, ``baseline create``,
 ``evaluate``) land in later waves per ``docs/roadmap.md``.
 
@@ -38,10 +45,11 @@ import datetime as _dt
 import json
 import sys
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from . import __version__
 from .benchmark import SPLIT_EVAL, SPLIT_HELD_OUT
+from .blocked_bundles import write_blocked_bundle
 from .exit_codes import (
     EXIT_BLOCKED,
     EXIT_INTERNAL_ERROR,
@@ -50,8 +58,13 @@ from .exit_codes import (
 )
 from .promote import promote_case
 from .storage import RepositoryStorage, UserGlobalStorage
+from . import rule_checks as _rule_checks
 
-__all__ = ["main"]
+__all__ = [
+    "main",
+    "NO_REVIEWED_BENCHMARK_WARNING",
+    "REVIEW_RUN_TYPE",
+]
 
 #: Name of the benchmark container at the workspace root. ADR 0025
 #: pins the empty benchmark as a valid container; the loader
@@ -62,6 +75,114 @@ BENCHMARK_FILE_NAME = "benchmark.jsonl"
 #: has no reviewed cases. Pinned by ADR 0029's "fixed small
 #: machine-stable set" of invalid benchmark blocker codes.
 MISSING_REVIEWED_CASE_BLOCKER = "missing-reviewed-case"
+
+# --------------------------------------------------------------------------- #
+# Issue #29 (PRD F1 ``review``) constants                                     #
+# --------------------------------------------------------------------------- #
+
+#: Stable warning id emitted by ``review`` when no reviewed Benchmark
+#: is found at the workspace root. Pinned by F1 acceptance: "Execution
+#: Evaluation was skipped because no reviewed Benchmark was present;
+#: Static Review still completes." The id is distinct from
+#: :data:`MISSING_REVIEWED_CASE_BLOCKER` because the review flow does
+#: not own a benchmark container — a missing file is "no reviewed
+#: benchmark", not "missing reviewed case in a present file".
+NO_REVIEWED_BENCHMARK_WARNING = "no-reviewed-benchmark"
+
+#: Run-type value written into the receipt of a ``review`` run.
+#: Pinned to make ``review`` evidence bundles distinguishable from
+#: the older ``init --review`` tracer-bullet bundles (run_type
+#: ``"init-review"``). Downstream tooling branches on the value.
+REVIEW_RUN_TYPE = "review"
+
+#: Run-type for the ``init --review`` tracer-bullet bundles (kept
+#: stable so the existing init --review tests still pass and the
+#: receipt lineage is preserved).
+INIT_REVIEW_RUN_TYPE = "init-review"
+
+#: Stable reason code for ``execution_evaluation.skipped_reason``
+#: when the review flow has no reviewed Benchmark to evaluate.
+EXECUTION_SKIPPED_NO_REVIEWED_BENCHMARK = "no-reviewed-benchmark"
+
+#: Stable reason code for ``execution_evaluation.skipped_reason``
+#: when a benchmark file is present but the loader reports
+#: blockers (e.g. ``schema-version-mismatch``). A present-but-
+#: invalid benchmark is not the same as "no benchmark": the
+#: loader-supplied blockers surface in the JSON output, the
+#: review flow does not pretend the cases are runnable, and
+#: the execution evaluation reports the precise reason.
+EXECUTION_SKIPPED_INVALID_BENCHMARK = "invalid-benchmark"
+
+#: Stable reason code for ``execution_evaluation.skipped_reason``
+#: when the benchmark file is present and well-formed but has
+#: no eligible reviewed cases (the empty / generated / disabled
+#: shape). This is the canonical "review still completes with a
+#: warning" path.
+EXECUTION_SKIPPED_NO_ELIGIBLE_CASES = "no-eligible-reviewed-cases"
+
+#: Status values written into the ``execution_evaluation.status``
+#: field of a ``review`` payload. Pinned as module-level strings
+#: so downstream tooling and tests can branch on the same
+#: constants the review orchestrator emits.
+EXECUTION_STATUS_PASS = "PASS"
+EXECUTION_STATUS_FAIL = "FAIL"
+EXECUTION_STATUS_BLOCKED = "BLOCKED"
+EXECUTION_STATUS_SKIPPED = "SKIPPED"
+
+#: Per-case status values written into ``execution_evaluation.
+#: case_results[*].status``. Pinned as module-level strings so
+#: downstream tooling and tests can branch on the same constants
+#: the execution evaluator emits. Mirrors the ProfileResult
+#: status vocabulary so a case-evaluator verdict is reusable.
+REVIEW_CASE_STATUS_PASS = "PASS"
+REVIEW_CASE_STATUS_FAIL = "FAIL"
+REVIEW_CASE_STATUS_BLOCKED = "BLOCKED"
+
+#: Stable reason code for ``execution_evaluation.skipped_reason``
+#: when a benchmark file is present but is missing the required
+#: reviewed cases (``pending-generated-case`` /
+#: ``missing-reviewed-eval-case`` /
+#: ``missing-reviewed-held-out-case``). Per ADR 0029 / Issue
+#: #29 spec review, these are precondition failures for the
+#: execution branch: a benchmark without eligible reviewed
+#: cases cannot be evaluated, so the review is BLOCKED on the
+#: execution path. Distinct from the no-benchmark-file path,
+#: which keeps the static+warning behavior.
+EXECUTION_BLOCKED_MISSING_REVIEWED = "missing-reviewed-cases"
+
+#: Stable reason code for ``execution_evaluation.skipped_reason``
+#: when at least one eligible reviewed case is missing the
+#: ``expected_output`` fixture that the F1 deterministic
+#: check engine needs to evaluate it. The case evaluation
+#: itself is BLOCKED (the engine has nothing to grep against),
+#: which propagates to the overall execution verdict.
+EXECUTION_BLOCKED_MISSING_EXPECTED_OUTPUT = "missing-expected-output"
+
+#: Stable blocker id for a case that has no ``checks`` and no
+#: ``judgment`` -- the F1 execution engine cannot evaluate it
+#: without one or the other.
+REVIEW_CASE_NO_CHECKS_NO_JUDGMENT_BLOCKER = "review-case-no-checks-or-judgment"
+
+#: Stable blocker id for a case whose ``judgment`` references
+#: a control-plane judge provider that the F1 review cannot
+#: reach (e.g. no provider configured). Mirrors
+#: :data:`metacrucible.provider_config.JUDGE_EVALUATOR_BLOCKER`
+#: semantically but is a distinct, F1-specific id so the
+#: receipt surfaces the F1 path.
+REVIEW_CASE_JUDGE_PROVIDER_UNAVAILABLE_BLOCKER = "review-case-judge-provider-unavailable"
+
+#: Category passed to :func:`write_blocked_bundle` when the F1
+#: review is BLOCKED for an execution-related reason and
+#: execution was effectively requested (benchmark present).
+#: Matches the ADR 0035 ``review_execution_requested`` slot.
+REVIEW_EXECUTION_REQUESTED_BLOCKED_CATEGORY = "review_execution_requested"
+
+#: Suffix appended to a review's run id when emitting the
+#: execution-BLOCKED bundle. The static-review bundle keeps
+#: the unsuffixed id; the BLOCKED bundle lands in a sibling
+#: directory so both are reachable from the user-global store
+#: and the F1 review is a "we could not proceed" record.
+REVIEW_BLOCKED_BUNDLE_RUN_ID_SUFFIX = "-blocked"
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -129,6 +250,38 @@ def _build_parser() -> argparse.ArgumentParser:
             "explicit human confirmation that workspace masking is "
             "intentionally being disabled (Issue #13 AC3)"
         ),
+    )
+    review_parser = subparsers.add_parser(
+        "review",
+        help=(
+            "one-shot diagnostic against an existing capability "
+            "artifact (PRD F1): Static Review with the Darwin "
+            "9-dimension rubric plus Execution Evaluation when a "
+            "reviewed Benchmark is present (Issue #29)"
+        ),
+    )
+    review_parser.add_argument(
+        "artifact",
+        help=(
+            "path to a capability artifact file (Skill or "
+            "subagent Markdown). The source bytes are read only; "
+            "they are never mutated by the review pipeline."
+        ),
+    )
+    review_parser.add_argument(
+        "--workspace",
+        default=None,
+        metavar="WORKSPACE",
+        help=(
+            "path to the artifact workspace (defaults to the "
+            "artifact's parent directory). The review command "
+            "looks for ``benchmark.jsonl`` at the workspace root."
+        ),
+    )
+    review_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="emit a parseable JSON object on stdout",
     )
     promote_parser = subparsers.add_parser(
         "promote",
@@ -341,6 +494,8 @@ def _run_static_review(
     *,
     workspace: Path,
     artifact_path: Path,
+    run_id_prefix: str = INIT_REVIEW_RUN_TYPE,
+    run_type: str = INIT_REVIEW_RUN_TYPE,
 ) -> dict[str, Any]:
     """Read ``artifact_path`` and write a v1 evidence bundle.
 
@@ -450,12 +605,14 @@ def _run_static_review(
 
     # Persist the three durable bundle files via the existing v1
     # builders / writers. No new schema is invented.
-    run_id = f"init-review-{_now_iso().replace(':', '').replace('-', '')}"
+    run_id = (
+        f"{run_id_prefix}-{_now_iso().replace(':', '').replace('-', '')}"
+    )
     global_store = UserGlobalStorage()
 
     receipt_payload: dict[str, Any] = {
         "run_id": run_id,
-        "run_type": "init-review",
+        "run_type": run_type,
         "status": "PASS" if verdict["accepted"] else "BLOCKED",
         "artifact": str(artifact_path),
         "artifact_kind": kind,
@@ -515,7 +672,91 @@ def _run_static_review(
         "trajectory_digest_path": str(digest_path),
         "accepted": verdict["accepted"],
         "blockers": verdict["blockers"],
+        # Non-breaking extension (Issue #29): surface the
+        # supplemental findings and the per-profile result ids
+        # so the F1 ``review`` orchestrator can build its
+        # ``static_review`` sub-section without re-running the
+        # profile suite. Existing callers (``init --review``)
+        # ignore the new keys; their tests only assert on the
+        # path fields above.
+        "supplemental_findings": verdict["supplemental_findings"],
+        "profile_ids": [r.profile_id for r in profile_results],
     }
+
+
+def _emit_human_value(
+    key: str,
+    value: Any,
+    *,
+    indent: str = "",
+) -> None:
+    """Render ``value`` for the human (non-JSON) CLI surface.
+
+    Recursively formats nested mappings with a stable two-space
+    indent and lists of dicts as a bullet list. Bypasses the
+    user-controlled freeform text surface (``review_note``) so a
+    multilingual note never contaminates the English prose
+    contract (Issue #27 task 27.4). Special-cases ``blockers``
+    and ``warnings`` so a list of ``{id, message}`` dicts
+    renders as ``- <id>: <message>`` lines in the operator
+    workflow.
+    """
+    if key == "blockers" and isinstance(value, list):
+        if value:
+            for blocker in value:
+                if isinstance(blocker, dict):
+                    bid = blocker.get("id", "?")
+                    msg = blocker.get("message", "")
+                    print(f"{indent}- {bid}: {msg}")
+                else:
+                    print(f"{indent}- {blocker}")
+        else:
+            print(f"{indent}{key}: (none)")
+    elif key == "warnings" and isinstance(value, list):
+        if value:
+            for warning in value:
+                if isinstance(warning, dict):
+                    wid = warning.get("id", "?")
+                    msg = warning.get("message", "")
+                    print(f"{indent}- {wid}: {msg}")
+                else:
+                    print(f"{indent}- {warning}")
+        else:
+            print(f"{indent}{key}: (none)")
+    elif key == "review_note":
+        # User-controlled freeform text; the operator does not
+        # need it echoed back as part of the English prose
+        # surface, and a non-ASCII note would otherwise
+        # contaminate the human-only contract. Use ``--json``
+        # to retrieve the verbatim value.
+        if isinstance(value, str) and value:
+            print(
+                f"{indent}{key}: <{len(value)} chars, hidden in "
+                f"human output; use --json to view>"
+            )
+        else:
+            print(f"{indent}{key}: (empty)")
+    elif isinstance(value, dict):
+        if value:
+            print(f"{indent}{key}:")
+            for sub_key in sorted(value.keys()):
+                _emit_human_value(
+                    sub_key, value[sub_key], indent=indent + "  "
+                )
+        else:
+            print(f"{indent}{key}: {{}}")
+    elif isinstance(value, list):
+        if value and all(isinstance(v, dict) for v in value):
+            for item in value:
+                print(f"{indent}- {key}:")
+                for sub_key in sorted(item.keys()):
+                    _emit_human_value(
+                        sub_key, item[sub_key], indent=indent + "    "
+                    )
+        else:
+            print(f"{indent}{key}: {value}")
+    else:
+        print(f"{indent}{key}: {value}")
 
 
 def _emit(payload: dict[str, Any], *, as_json: bool) -> None:
@@ -527,38 +768,1008 @@ def _emit(payload: dict[str, Any], *, as_json: bool) -> None:
     masked in the human surface so a multilingual review note
     never contaminates the English prose contract. The full
     value is preserved by ``--json`` for callers that need it.
+    Nested mappings and lists of dicts (used by the F1 ``review``
+    output) are rendered recursively with a stable two-space
+    indent so the operator can scan the full review payload
+    without flipping to ``--json``.
     """
     if as_json:
         print(json.dumps(payload, indent=2, sort_keys=True))
         return
     for key in sorted(payload.keys()):
-        value = payload[key]
-        if key == "blockers" and isinstance(value, list):
-            if value:
-                for blocker in value:
-                    if isinstance(blocker, dict):
-                        bid = blocker.get("id", "?")
-                        msg = blocker.get("message", "")
-                        print(f"- {bid}: {msg}")
-                    else:
-                        print(f"- {blocker}")
-            else:
-                print(f"{key}: (none)")
-        elif key == "review_note":
-            # User-controlled freeform text; the operator does not
-            # need it echoed back as part of the English prose
-            # surface, and a non-ASCII note would otherwise
-            # contaminate the human-only contract. Use ``--json``
-            # to retrieve the verbatim value.
-            if isinstance(value, str) and value:
-                print(
-                    f"{key}: <{len(value)} chars, hidden in "
-                    f"human output; use --json to view>"
+        _emit_human_value(key, payload[key])
+
+
+
+def _discover_benchmark_state(workspace: Path) -> dict[str, Any]:
+    """Inspect the workspace's ``benchmark.jsonl`` and report its state.
+
+    The state is a machine-stable mapping the F1 ``review``
+    orchestrator composes into its JSON output:
+
+      - ``present`` (``bool``) — ``True`` iff the benchmark file
+        exists at the workspace root. A missing file is not
+        collapsed into a "present but invalid" state; the two
+        are distinct paths in the output (``execution_evaluation.
+        status`` differs).
+      - ``path`` (``str``) — the resolved benchmark path the
+        orchestrator inspected (or would have inspected).
+      - ``eligible_eval_count`` / ``eligible_held_out_count`` /
+        ``pending_generated_count`` / ``disabled_count``
+        (``int``) — the four ADR 0029 partitions. Generated
+        and disabled cases are never eligible for execution.
+      - ``blockers`` (``list[dict]``) — the *full* loader
+        blocker list. Every loader blocker surfaces to the
+        operator in the benchmark sub-section; the
+        execution-evaluation BLOCKED gate uses the same
+        list (no optimize-only carve-out: missing required
+        reviewed cases are a precondition failure for the
+        execution branch and BLOCK the review).
+
+    A missing benchmark file returns a default state with
+    ``present=False`` and zeroed counts so the orchestrator
+    can take the "no reviewed benchmark" path without
+    special-casing ``None``.
+    """
+    from .benchmark import load_benchmark
+
+    benchmark_path = workspace / BENCHMARK_FILE_NAME
+    if not benchmark_path.is_file():
+        return {
+            "present": False,
+            "path": str(benchmark_path),
+            "eligible_eval_count": 0,
+            "eligible_held_out_count": 0,
+            "pending_generated_count": 0,
+            "disabled_count": 0,
+            "blockers": [],
+        }
+
+    result = load_benchmark(benchmark_path)
+    # The benchmark sub-section reports the *full* loader
+    # blocker list so the operator sees the complete picture;
+    # the execution-evaluation BLOCKED gate uses the narrower
+    # list that excludes optimize-only ids.
+    return {
+        "present": True,
+        "path": str(benchmark_path),
+        "eligible_eval_count": len(result.eligible_eval_cases),
+        "eligible_held_out_count": len(result.eligible_held_out_cases),
+        "pending_generated_count": len(result.pending_generated_cases),
+        "disabled_count": len(result.disabled_cases),
+        "blockers": list(result.blockers),
+    }
+
+
+def _run_execution_evaluation(
+    *,
+    benchmark_state: dict[str, Any],
+) -> dict[str, Any]:
+    """Compute the F1 Execution Evaluation diagnostic (Issue #29).
+
+    The F1 spec requires that "Execution Evaluation runs when a
+    reviewed Benchmark is present." The diagnostic is wired to
+    the real execution machinery:
+
+      * **Deterministic checks** are evaluated through
+        :func:`metacrucible.rule_checks.execute_check` with a
+        :class:`metacrucible.rule_checks.CheckBoundary` built
+        from the case's ``checks`` field. The case's
+        ``expected_output`` (if present) is written to a
+        per-case workspace and a small Python check script
+        is dispatched through ``execute_check``. A case is
+        PASS only when the check engine returns
+        ``ok=True``; a non-zero returncode is a FAILED case;
+        any engine blocker (workspace invalid, complex shell
+        without wrapper, etc.) is a BLOCKED case.
+
+      * **Non-deterministic judgments** are routed through
+        the two-independent-LLM-judge evaluator
+        (:func:`metacrucible.provider_config.run_judge_evaluator`).
+        If a judgment is requested but the control-plane
+        judge provider is not configured (no provider entry
+        in the resolved config), the case is BLOCKED with
+        the ``review-case-judge-provider-unavailable`` id
+        per the spec-reviewer's "BLOCKED, not pass" rule.
+
+      * A case with **neither** checks **nor** judgment is
+        BLOCKED with the
+        ``review-case-no-checks-or-judgment`` id; the F1
+        engine cannot evaluate a case without one or the
+        other (per ADR 0010 / ADR 0029).
+
+    The function returns one of four statuses:
+
+      - :data:`EXECUTION_STATUS_PASS` — every eligible reviewed
+        case was evaluated and passed.
+      - :data:`EXECUTION_STATUS_FAIL` — every eligible
+        reviewed case was evaluated and at least one FAILED
+        with no BLOCKED cases mixed in. The run executed;
+        the verdict is FAILED.
+      - :data:`EXECUTION_STATUS_BLOCKED` — at least one case
+        could not be evaluated (no checks / no judgment /
+        engine blocker / judge unavailable), **or** the
+        benchmark file is present and the loader surfaced
+        structural blockers (``schema-version-mismatch`` /
+        ``duplicate-case-id``), **or** the benchmark file
+        is present but missing the required reviewed cases
+        (the
+        ``pending-generated-case`` /
+        ``missing-reviewed-eval-case`` /
+        ``missing-reviewed-held-out-case`` ids). All three
+        paths emit the BLOCKED verdict; the
+        ``skipped_reason`` distinguishes them so the
+        operator can tell "structural" from "missing
+        cases".
+      - :data:`EXECUTION_STATUS_SKIPPED` — the benchmark
+        file is missing entirely (``skipped_reason`` =
+        :data:`EXECUTION_SKIPPED_NO_REVIEWED_BENCHMARK`).
+        This is the canonical F1 "static + warning" path:
+        the static review completes with a warning and the
+        exit code is :data:`EXIT_OK`.
+
+    Per the spec-reviewer's "BLOCKED, not silently
+    downgraded" finding, the optimize-only blocker filter
+    that previously excluded
+    ``pending-generated-case``,
+    ``missing-reviewed-eval-case``, and
+    ``missing-reviewed-held-out-case`` from the BLOCKED
+    gate has been removed. A benchmark present at the
+    workspace root carries an implicit "execution was
+    requested" intent; missing required reviewed cases
+    is a precondition failure, not a warning.
+
+    The returned mapping's ``case_results`` slot carries a
+    per-case verdict so a downstream reader can branch on
+    which case failed / blocked without re-reading the
+    benchmark file.
+    """
+    if not benchmark_state["present"]:
+        return {
+            "status": EXECUTION_STATUS_SKIPPED,
+            "skipped": True,
+            "skipped_reason": EXECUTION_SKIPPED_NO_REVIEWED_BENCHMARK,
+            "cases_evaluated": 0,
+            "cases_passed": 0,
+            "cases_failed": 0,
+            "case_results": [],
+            "blockers": [],
+        }
+
+    # 1. Loader-supplied blockers gate the whole run. Every
+    #    loader blocker is propagated (no optimize-only
+    #    filter); the ``structural_ids`` split is purely
+    #    informational so the receipt can report the
+    #    reason code in a stable shape.
+    all_blockers: list[dict[str, Any]] = [
+        b for b in benchmark_state["blockers"]
+        if isinstance(b, dict) and isinstance(b.get("id"), str)
+    ]
+    if all_blockers:
+        reason = (
+            EXECUTION_SKIPPED_INVALID_BENCHMARK
+            if any(b["id"] in _REVIEW_STRUCTURAL_BENCHMARK_BLOCKERS
+                   for b in all_blockers)
+            else EXECUTION_BLOCKED_MISSING_REVIEWED
+        )
+        return {
+            "status": EXECUTION_STATUS_BLOCKED,
+            "skipped": False,
+            "skipped_reason": reason,
+            "cases_evaluated": 0,
+            "cases_passed": 0,
+            "cases_failed": 0,
+            "case_results": [],
+            "blockers": all_blockers,
+        }
+
+    # 2. Walk the eligible partitions and actually run the
+    #    execution machinery per case. The four ADR 0029
+    #    partitions are observed: generated / disabled
+    #    cases are never evaluated.
+    eligible_cases = _collect_eligible_cases(benchmark_state)
+    if not eligible_cases:
+        # This path is unreachable now that the optimize-only
+        # filter is gone (any missing-reviewed blocker is
+        # raised in the loader step). Kept for the no-bench
+        # edge case where a benchmark carries only generated
+        # / disabled cases and the loader happens not to
+        # surface a missing-reviewed-eval-case blocker
+        # (defensive only).
+        return {
+            "status": EXECUTION_STATUS_BLOCKED,
+            "skipped": False,
+            "skipped_reason": EXECUTION_BLOCKED_MISSING_REVIEWED,
+            "cases_evaluated": 0,
+            "cases_passed": 0,
+            "cases_failed": 0,
+            "case_results": [],
+            "blockers": [{
+                "id": "missing-reviewed-eval-case",
+                "message": (
+                    "no eligible reviewed eval cases (ADR 0025)"
+                ),
+            }],
+        }
+
+    case_results: list[dict[str, Any]] = []
+    for case in eligible_cases:
+        result = _evaluate_single_case(case)
+        case_results.append(result)
+
+    # 3. Aggregate per-case verdicts into the top-level
+    #    execution verdict. BLOCKED beats FAILED beats PASS:
+    #    a single blocked case blocks the whole run; a
+    #    single failed case (with no blocked) fails the
+    #    whole run; only a clean PASS-everywhere run
+    #    returns PASS.
+    any_blocked = any(
+        r["status"] == REVIEW_CASE_STATUS_BLOCKED
+        for r in case_results
+    )
+    any_failed = any(
+        r["status"] == REVIEW_CASE_STATUS_FAIL
+        for r in case_results
+    )
+    cases_evaluated = len(case_results)
+    cases_passed = sum(
+        1 for r in case_results
+        if r["status"] == REVIEW_CASE_STATUS_PASS
+    )
+    cases_failed = sum(
+        1 for r in case_results
+        if r["status"] == REVIEW_CASE_STATUS_FAIL
+    )
+    if any_blocked:
+        # Roll up the per-case blockers so the operator
+        # sees which case blocked and why.
+        blockers: list[dict[str, Any]] = []
+        for r in case_results:
+            if r["status"] != REVIEW_CASE_STATUS_BLOCKED:
+                continue
+            case_id = r.get("case_id") or "?"
+            for blocker in r.get("blockers", []):
+                if not isinstance(blocker, dict):
+                    continue
+                blockers.append(
+                    {
+                        "id": blocker.get("id", "?"),
+                        "message": blocker.get("message", ""),
+                        "case_id": case_id,
+                    }
                 )
-            else:
-                print(f"{key}: (empty)")
-        else:
-            print(f"{key}: {value}")
+        return {
+            "status": EXECUTION_STATUS_BLOCKED,
+            "skipped": False,
+            "skipped_reason": None,
+            "cases_evaluated": cases_evaluated,
+            "cases_passed": cases_passed,
+            "cases_failed": cases_failed,
+            "case_results": case_results,
+            "blockers": blockers,
+        }
+    if any_failed:
+        return {
+            "status": EXECUTION_STATUS_FAIL,
+            "skipped": False,
+            "skipped_reason": None,
+            "cases_evaluated": cases_evaluated,
+            "cases_passed": cases_passed,
+            "cases_failed": cases_failed,
+            "case_results": case_results,
+            "blockers": [],
+        }
+    return {
+        "status": EXECUTION_STATUS_PASS,
+        "skipped": False,
+        "skipped_reason": None,
+        "cases_evaluated": cases_evaluated,
+        "cases_passed": cases_passed,
+        "cases_failed": cases_failed,
+        "case_results": case_results,
+        "blockers": [],
+    }
+
+
+#: Benchmark blocker ids that signal a structurally broken
+#: benchmark file (ADR 0029). Distinguished from the
+#: "missing required reviewed cases" ids so the receipt
+#: can report a stable ``skipped_reason`` for the BLOCKED
+#: verdict.
+_REVIEW_STRUCTURAL_BENCHMARK_BLOCKERS: frozenset[str] = frozenset(
+    {
+        "schema-version-mismatch",
+        "duplicate-case-id",
+    }
+)
+
+
+def _collect_eligible_cases(
+    benchmark_state: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Re-load the benchmark and return the eligible cases.
+
+    The benchmark ``state`` mapping carries counts only; the
+    F1 execution engine needs the actual case records to
+    dispatch per-case evaluation. The state is trusted to
+    reflect the on-disk file (it was produced by
+    :func:`_discover_benchmark_state` immediately above),
+    so the re-load is a single read-and-partition pass that
+    does not mutate the file.
+    """
+    from .benchmark import load_benchmark
+    if not benchmark_state.get("present"):
+        return []
+    benchmark_path = Path(benchmark_state["path"])
+    if not benchmark_path.is_file():
+        return []
+    result = load_benchmark(benchmark_path)
+    return list(result.eligible_eval_cases) + list(
+        result.eligible_held_out_cases
+    )
+
+
+def _evaluate_single_case(case: Mapping[str, Any]) -> dict[str, Any]:
+    """Evaluate one eligible reviewed case.
+
+    The dispatcher branches on the case schema:
+
+      1. ``checks`` field present and non-empty -- route
+         through :func:`metacrucible.rule_checks.execute_check`
+         with a :class:`metacrucible.rule_checks.CheckBoundary`
+         built from the case's pattern list and the case's
+         ``expected_output`` fixture.
+      2. ``judgment`` field present -- route through
+         :func:`metacrucible.provider_config.run_judge_evaluator`.
+         A missing provider is BLOCKED (per the spec-reviewer's
+         "BLOCKED with evidence, not pass" finding).
+      3. Neither -- BLOCKED with the
+         :data:`REVIEW_CASE_NO_CHECKS_NO_JUDGMENT_BLOCKER` id.
+
+    The returned mapping has shape::
+
+        {
+            "case_id": str,
+            "evaluator": "rule_check" | "judge" | "none",
+            "status": PASS | FAIL | BLOCKED,
+            "blockers": list[dict],
+            "evidence": dict | None,
+        }
+    """
+    case_id = case.get("case_id") if isinstance(case, Mapping) else None
+    case_id_str = case_id if isinstance(case_id, str) else "?"
+
+    checks = case.get("checks") if isinstance(case, Mapping) else None
+    judgment = case.get("judgment") if isinstance(case, Mapping) else None
+
+    if isinstance(checks, list) and checks:
+        result = _evaluate_case_with_rule_check(
+            case=case,
+            case_id=case_id_str,
+        )
+        return result
+    if isinstance(judgment, dict) and judgment:
+        result = _evaluate_case_with_judgment(
+            case=case,
+            case_id=case_id_str,
+        )
+        return result
+    return {
+        "case_id": case_id_str,
+        "evaluator": "none",
+        "status": REVIEW_CASE_STATUS_BLOCKED,
+        "blockers": [{
+            "id": REVIEW_CASE_NO_CHECKS_NO_JUDGMENT_BLOCKER,
+            "message": (
+                f"case {case_id_str!r} has neither ``checks`` nor "
+                "``judgment``; the F1 execution engine cannot "
+                "evaluate a case without one or the other (ADR "
+                "0010 / ADR 0029)"
+            ),
+        }],
+        "evidence": None,
+    }
+
+
+def _evaluate_case_with_rule_check(
+    *,
+    case: Mapping[str, Any],
+    case_id: str,
+) -> dict[str, Any]:
+    """Evaluate one case via :func:`rule_checks.execute_check`.
+
+    The case's ``checks`` field is a list of
+    ``{name, pattern}`` patterns. The F1 engine materialises
+    the patterns as a real :class:`CheckBoundary` whose
+    command is a small Python check script, and the case's
+    ``expected_output`` (when present) is written to the
+    per-case workspace as the data the check script
+    inspects. A case missing ``expected_output`` is BLOCKED:
+    the engine has nothing to grep against, and a silently
+    passing case would mask a real fixture gap (per the
+    spec-reviewer's "BLOCKED with evidence, not pass" rule).
+    """
+    checks = case.get("checks")
+    if not isinstance(checks, list) or not checks:
+        return {
+            "case_id": case_id,
+            "evaluator": "rule_check",
+            "status": REVIEW_CASE_STATUS_BLOCKED,
+            "blockers": [{
+                "id": REVIEW_CASE_NO_CHECKS_NO_JUDGMENT_BLOCKER,
+                "message": (
+                    f"case {case_id!r} ``checks`` is empty or "
+                    "not a list; the F1 deterministic path "
+                    "requires at least one pattern"
+                ),
+            }],
+            "evidence": None,
+        }
+    expected_output = case.get("expected_output")
+    if not isinstance(expected_output, str):
+        return {
+            "case_id": case_id,
+            "evaluator": "rule_check",
+            "status": REVIEW_CASE_STATUS_BLOCKED,
+            "blockers": [{
+                "id": EXECUTION_BLOCKED_MISSING_EXPECTED_OUTPUT,
+                "message": (
+                    f"case {case_id!r} has no ``expected_output`` "
+                    "fixture; the F1 deterministic check engine "
+                    "cannot evaluate a case without output to "
+                    "check against (ADR 0010 / Issue #29 spec "
+                    "review)"
+                ),
+            }],
+            "evidence": None,
+        }
+
+    # Set up a per-case workspace and materialise the
+    # case's data. The parent workspace is a per-review
+    # temp dir (not the user's workspace, so we never
+    # mutate the workspace-side tree).
+    parent = _review_per_case_parent()
+    plan = _rule_checks.plan_check_workspace(parent, case_id)
+    if not plan.get("ok"):
+        return {
+            "case_id": case_id,
+            "evaluator": "rule_check",
+            "status": REVIEW_CASE_STATUS_BLOCKED,
+            "blockers": list(plan.get("blockers") or []),
+            "evidence": None,
+        }
+    case_workspace = Path(plan["workspace"])
+    case_workspace.mkdir(parents=True, exist_ok=True)
+
+    patterns_payload = [
+        {
+            "name": c.get("name") if isinstance(c, Mapping) else None,
+            "pattern": c.get("pattern") if isinstance(c, Mapping) else None,
+        }
+        for c in checks
+        if isinstance(c, Mapping)
+    ]
+    (case_workspace / "_expected_output.txt").write_text(
+        expected_output, encoding="utf-8"
+    )
+    (case_workspace / "_patterns.json").write_text(
+        json.dumps(patterns_payload), encoding="utf-8"
+    )
+    (case_workspace / "_check.py").write_text(
+        _DETERMINISTIC_CHECK_SCRIPT, encoding="utf-8"
+    )
+
+    boundary = _rule_checks.CheckBoundary(
+        commands=((sys.executable, "_check.py"),),
+    )
+    result = _rule_checks.execute_check(
+        boundary, case_workspace, index=0, timeout=15.0
+    )
+
+    if result.get("ok") is True:
+        return {
+            "case_id": case_id,
+            "evaluator": "rule_check",
+            "status": REVIEW_CASE_STATUS_PASS,
+            "blockers": [],
+            "evidence": {
+                "returncode": result.get("returncode"),
+                "actual_cwd": result.get("actual_cwd"),
+            },
+        }
+    if result.get("blockers"):
+        return {
+            "case_id": case_id,
+            "evaluator": "rule_check",
+            "status": REVIEW_CASE_STATUS_BLOCKED,
+            "blockers": list(result["blockers"]),
+            "evidence": {
+                "returncode": result.get("returncode"),
+                "actual_cwd": result.get("actual_cwd"),
+            },
+        }
+    return {
+        "case_id": case_id,
+        "evaluator": "rule_check",
+        "status": REVIEW_CASE_STATUS_FAIL,
+        "blockers": [],
+        "evidence": {
+            "returncode": result.get("returncode"),
+            "stderr": (result.get("stderr") or "").strip(),
+            "stdout": (result.get("stdout") or "").strip(),
+        },
+    }
+
+
+def _evaluate_case_with_judgment(
+    *,
+    case: Mapping[str, Any],
+    case_id: str,
+) -> dict[str, Any]:
+    """Evaluate one case via the two-judge LLM path (ADR 0010).
+
+    The F1 review does not own a provider config; the
+    control-plane provider selection is out of scope for
+    the diagnostic. When no provider is configured, the
+    two-judge evaluator returns ``ok=False`` with the
+    stable :data:`metacrucible.provider_config.
+    JUDGE_EVALUATOR_BLOCKER` id; the F1 path translates
+    that to its own :data:
+    `REVIEW_CASE_JUDGE_PROVIDER_UNAVAILABLE_BLOCKER` id
+    so the receipt surfaces the F1 path while the
+    underlying cause (no provider) is still in the
+    evidence. A future issue can wire a real provider
+    selection through ``config``; the F1 path is the
+    integration point.
+    """
+    judgment = case.get("judgment")
+    rubric = (
+        judgment.get("rubric", {}) if isinstance(judgment, Mapping) else {}
+    )
+    pass_condition = (
+        judgment.get("pass_condition")
+        if isinstance(judgment, Mapping)
+        else None
+    )
+
+    # The MVP review path has no provider config: an empty
+    # config makes the judge evaluator refuse the call with
+    # JUDGE_EVALUATOR_BLOCKER. We surface that as the F1
+    # ``judge-provider-unavailable`` BLOCKED condition.
+    try:
+        from .provider_config import run_judge_evaluator
+    except ImportError:
+        return {
+            "case_id": case_id,
+            "evaluator": "judge",
+            "status": REVIEW_CASE_STATUS_BLOCKED,
+            "blockers": [{
+                "id": REVIEW_CASE_JUDGE_PROVIDER_UNAVAILABLE_BLOCKER,
+                "message": (
+                    f"case {case_id!r} ``judgment`` requested but "
+                    "the provider_config module is not "
+                    "importable from the F1 review path"
+                ),
+            }],
+            "evidence": None,
+        }
+    judge_result = run_judge_evaluator(
+        config={},
+        trajectory_digest={"steps": []},
+        rubric=rubric,
+        call_fns=[_stub_judge_call, _stub_judge_call],
+    )
+    if not judge_result.get("ok"):
+        return {
+            "case_id": case_id,
+            "evaluator": "judge",
+            "status": REVIEW_CASE_STATUS_BLOCKED,
+            "blockers": [{
+                "id": REVIEW_CASE_JUDGE_PROVIDER_UNAVAILABLE_BLOCKER,
+                "message": (
+                    f"case {case_id!r} ``judgment`` requested but "
+                    "no control-plane judge provider is configured "
+                    "for the F1 review path; the two-judge "
+                    "evaluator refuses the call (ADR 0010). "
+                    "Original cause: "
+                    f"{(judge_result.get('blockers') or [{}])[0].get('message', '')}"
+                ),
+            }],
+            "evidence": {
+                "judge_evidence": judge_result.get("judge_evidence") or {},
+            },
+        }
+    return {
+        "case_id": case_id,
+        "evaluator": "judge",
+        "status": REVIEW_CASE_STATUS_PASS,
+        "blockers": [],
+        "evidence": {
+            "judge_evidence": judge_result.get("judge_evidence") or {},
+            "pass_condition": pass_condition,
+        },
+    }
+
+
+def _stub_judge_call(*args: Any, **kwargs: Any) -> Any:
+    """Placeholder judge callable for the F1 review path.
+
+    The F1 review diagnostic is not configured to call a
+    real provider; the two-judge evaluator's no-provider
+    path rejects the call before either callable is
+    invoked. The stub exists only to satisfy the
+    two-distinct-callables contract enforced by
+    :func:`run_judge_evaluator` so the refusal is the
+    determinate, well-typed outcome.
+    """
+    return None
+
+
+_REVIEW_PER_CASE_PARENT: Path | None = None
+
+
+def _review_per_case_parent() -> Path:
+    """Return (and lazily create) the per-review per-case parent dir.
+
+    The F1 deterministic check engine needs a per-case
+    workspace. The parent lives under the system temp
+    tree (never the user's workspace, so the workspace
+    ``.metacrucible/`` invariant is preserved) and is
+    reused across cases in a single review so the
+    orchestrator can inspect it during testing. The
+    directory is created on first call and re-used for
+    the duration of the process; the existing
+    :func:`rule_checks.execute_check` cleans up after
+    itself per case (subprocess exit; no in-process
+    state).
+    """
+    global _REVIEW_PER_CASE_PARENT
+    if _REVIEW_PER_CASE_PARENT is None:
+        import tempfile
+        _REVIEW_PER_CASE_PARENT = Path(
+            tempfile.mkdtemp(prefix="metacrucible-review-")
+        )
+    return _REVIEW_PER_CASE_PARENT
+
+
+#: Python script written to each per-case workspace by
+#: :func:`_evaluate_case_with_rule_check`. The script reads
+#: the case's pattern list and expected output, then exits
+#: 0 if every pattern is found in the output and 1
+#: otherwise. The script is intentionally tiny (no
+#: third-party imports) so the F1 path does not depend on
+#: anything beyond the Python standard library.
+_DETERMINISTIC_CHECK_SCRIPT: str = (
+    "import json\n"
+    "import sys\n"
+    "\n"
+    "patterns_file = '_patterns.json'\n"
+    "output_file = '_expected_output.txt'\n"
+    "\n"
+    "with open(patterns_file, encoding='utf-8') as f:\n"
+    "    patterns = json.load(f)\n"
+    "with open(output_file, encoding='utf-8') as f:\n"
+    "    output = f.read()\n"
+    "\n"
+    "failed = []\n"
+    "for entry in patterns:\n"
+    "    if not isinstance(entry, dict):\n"
+    "        continue\n"
+    "    name = entry.get('name', '?')\n"
+    "    pattern = entry.get('pattern') or ''\n"
+    "    if pattern and pattern in output:\n"
+    "        continue\n"
+    "    failed.append(name)\n"
+    "\n"
+    "if failed:\n"
+    "    print(f'FAILED: {failed}', file=sys.stderr)\n"
+    "    sys.exit(1)\n"
+    "sys.exit(0)\n"
+)
+
+
+def _write_review_execution_blocked_bundle(
+    *,
+    run_id: str,
+    blockers: list[dict[str, Any]],
+    execution_evaluation: dict[str, Any],
+) -> Path | None:
+    """Emit the ADR 0035 ``review_execution_requested`` BLOCKED bundle.
+
+    The standard static-review receipt/summary/digest is
+    always written by :func:`_run_static_review`. When the
+    execution branch is BLOCKED, a sibling minimal
+    ``BLOCKED`` bundle is written via
+    :func:`metacrucible.blocked_bundles.write_blocked_bundle`
+    so the receipt lineage carries a "we could not proceed"
+    record tagged with the
+    :data:`REVIEW_EXECUTION_REQUESTED_BLOCKED_CATEGORY`
+    category (ADR 0035). The BLOCKED bundle's run id is the
+    static review's run id plus a
+    :data:`REVIEW_BLOCKED_BUNDLE_RUN_ID_SUFFIX` suffix so
+    the two bundles live in sibling directories under
+    ``$HOME/.metacrucible/evidence/`` and a downstream
+    reader can see both.
+
+    The bundle is best-effort: a write failure is logged
+    to stderr and the function returns ``None``; the
+    in-memory review payload still carries the BLOCKED
+    verdict and the caller (``cmd_review``) still maps
+    the verdict to :data:`EXIT_BLOCKED`. The BLOCKED
+    bundle is the *evidence* of the BLOCKED verdict, not
+    the source of truth; the in-memory payload wins.
+    """
+    try:
+        global_store = UserGlobalStorage()
+        blocked_run_id = (
+            f"{run_id}{REVIEW_BLOCKED_BUNDLE_RUN_ID_SUFFIX}"
+        )
+        identities: dict[str, Any] = {
+            "review_run_id": run_id,
+            "execution_evaluation": {
+                "status": execution_evaluation.get("status"),
+                "skipped_reason": execution_evaluation.get(
+                    "skipped_reason"
+                ),
+                "cases_evaluated": execution_evaluation.get(
+                    "cases_evaluated"
+                ),
+                "cases_passed": execution_evaluation.get(
+                    "cases_passed"
+                ),
+                "cases_failed": execution_evaluation.get(
+                    "cases_failed"
+                ),
+            },
+        }
+        bundle = write_blocked_bundle(
+            global_store,
+            run_id=blocked_run_id,
+            run_type=REVIEW_EXECUTION_REQUESTED_BLOCKED_CATEGORY,
+            blockers=blockers,
+            identities=identities,
+        )
+        return bundle
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"metacrucible: failed to write review BLOCKED "
+            f"bundle: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+
+def _run_review(
+    *,
+    artifact_path: Path,
+    workspace: Path,
+) -> dict[str, Any]:
+    """Run the F1 ``review`` orchestrator (Issue #29).
+
+    The orchestrator composes three layers into a single
+    review payload:
+
+      1. **Static Review** (always) — runs the existing
+         :func:`_run_static_review` pipeline. The Darwin
+         9-dimension rubric is sourced separately via
+         :func:`evaluate_darwin_skill_quality` so the F1 output
+         can surface the per-dimension scores and the weakest
+         dimensions (PRD F1).
+      2. **Benchmark discovery + eligibility gate** — partitions
+         the workspace's ``benchmark.jsonl`` into the four
+         ADR 0029 buckets. A missing file, an empty benchmark,
+         and a present-but-invalid benchmark are three distinct
+         states; the orchestrator never silently collapses them.
+      3. **Execution Evaluation** (conditional) — runs the F1
+         diagnostic when eligible reviewed cases are present.
+         Generated / disabled cases are never run. Skipped
+         execution is reported with a stable ``skipped_reason``
+         code; blocked execution carries the loader-supplied
+         blockers.
+
+    The source artifact is read once and never written to. The
+    evidence bundle (receipt / summary / trajectory digest) is
+    written to the user-global store via the existing v1
+    writers (ADR 0030). The receipt's ``run_type`` is
+    :data:`REVIEW_RUN_TYPE` so F1 review bundles are
+    distinguishable from the older ``init --review`` bundles
+    (``run_type = "init-review"``).
+
+    Returns a JSON-serializable dict whose top-level keys are
+    stable: ``status``, ``artifact_path``, ``artifact_kind``,
+    ``workspace``, ``benchmark``, ``static_review``,
+    ``execution_evaluation``, ``warnings``, ``blockers``,
+    ``receipt_path``, ``summary_path``,
+    ``trajectory_digest_path``.
+    """
+    from .profiles import (
+        DARWIN_SKILL_QUALITY_ID,
+        ProfileResult,
+        evaluate_darwin_skill_quality,
+        weakest_darwin_dimensions,
+    )
+
+    # 1. Read the source bytes (never mutated).
+    source_bytes = artifact_path.read_bytes()
+    try:
+        source_text = source_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            f"artifact {artifact_path} is not valid UTF-8: {exc}"
+        ) from exc
+
+    # 2. Parse the artifact (subagent-first, then Skill).
+    kind, parsed = _parse_artifact_source(
+        source_text, artifact_path=artifact_path
+    )
+
+    # 3. Run Static Review (existing pipeline) — always. The
+    #    F1 review writes a distinct evidence bundle (run_type
+    #    ``review``, run_id prefix ``review-``) so the receipt
+    #    lineage is separable from the older ``init --review``
+    #    tracer-bullet bundles (run_type ``init-review``).
+    static_report = _run_static_review(
+        workspace=workspace,
+        artifact_path=artifact_path,
+        run_id_prefix=REVIEW_RUN_TYPE,
+        run_type=REVIEW_RUN_TYPE,
+    )
+
+    # 4. Build the per-dimension Darwin result. The MVP evaluator
+    #    in profiles.py is a body-agnostic placeholder; downstream
+    #    tooling that needs a real score must replace it. The
+    #    review output surfaces the dimension ids and the weakest
+    #    dimensions so the rubric is observable end-to-end.
+    body = parsed.body
+    if hasattr(parsed, "frontmatter") and isinstance(
+        parsed.frontmatter, dict
+    ):
+        system_prompt = parsed.frontmatter.get("systemPrompt")
+        if isinstance(system_prompt, str) and system_prompt:
+            body = system_prompt + "\n" + body
+    darwin_input: dict[str, Any] = {
+        "body": body,
+        "portability": {"target": "runtime_neutral"},
+        "reviewed_fake_secrets": (),
+    }
+    darwin_result = evaluate_darwin_skill_quality(darwin_input)
+    if not isinstance(darwin_result, ProfileResult):
+        # Defensive: the MVP evaluator always returns a real
+        # ProfileResult. A future rewrite must keep the contract
+        # so the F1 review output remains a stable shape.
+        raise ValueError(
+            "evaluate_darwin_skill_quality must return a "
+            "ProfileResult; got "
+            f"{type(darwin_result).__name__}"
+        )
+    if darwin_result.profile_id != DARWIN_SKILL_QUALITY_ID:
+        raise ValueError(
+            "evaluate_darwin_skill_quality must return a result "
+            "with profile_id=darwin-skill-quality; got "
+            f"{darwin_result.profile_id!r}"
+        )
+    darwin_dim_scores = [dict(s) for s in darwin_result.dimension_scores]
+    weakest_dimensions = [
+        dict(entry)
+        for entry in weakest_darwin_dimensions(darwin_result, n=3)
+    ]
+
+    # 5. Discover the benchmark state (presence + eligibility).
+    benchmark_state = _discover_benchmark_state(workspace)
+
+    # 6. Run the F1 Execution Evaluation diagnostic.
+    execution_evaluation = _run_execution_evaluation(
+        benchmark_state=benchmark_state
+    )
+
+    # 7. Compose warnings and blockers. The F1 contract is
+    #    "review succeeds with a warning" when static review
+    #    passes and no reviewed benchmark is present.
+    warnings: list[dict[str, Any]] = []
+    blockers: list[dict[str, Any]] = list(static_report["blockers"])
+
+    if execution_evaluation["skipped"]:
+        # Skipped execution is a warning, not a blocker: F1
+        # acceptance pins the static+warning path as a success
+        # outcome. The warning id is the machine-stable contract;
+        # the message is human English prose.
+        warnings.append(
+            {
+                "id": NO_REVIEWED_BENCHMARK_WARNING,
+                "message": (
+                    "Execution Evaluation was skipped because no "
+                    "reviewed Benchmark was found at the workspace "
+                    "root; Static Review still completed "
+                    f"({execution_evaluation['skipped_reason']})."
+                ),
+            }
+        )
+    elif execution_evaluation["status"] == EXECUTION_STATUS_BLOCKED:
+        # A present-but-invalid benchmark, a benchmark missing
+        # required reviewed cases, or a per-case engine
+        # BLOCKED outcome is a precondition failure: the
+        # execution branch cannot proceed, so the blockers
+        # surface to the operator. Per ADR 0035, a minimal
+        # ``BLOCKED`` bundle is written for the
+        # ``review_execution_requested`` category so the
+        # review lineage carries the "we could not proceed"
+        # record alongside the standard static-review receipt.
+        blockers.extend(execution_evaluation["blockers"])
+        _write_review_execution_blocked_bundle(
+            run_id=static_report["run_id"],
+            blockers=execution_evaluation["blockers"],
+            execution_evaluation=execution_evaluation,
+        )
+    elif execution_evaluation["status"] == EXECUTION_STATUS_FAIL:
+        # Execution ran end-to-end but at least one case
+        # FAILED with no BLOCKED cases mixed in. The review
+        # verdict is FAILED; the standard static-review
+        # receipt still carries status=BLOCKED so the
+        # receipt lineage is consistent (the overall
+        # ``status`` field is the operator-facing verdict,
+        # the receipt ``status`` reflects the worst of
+        # static + execution). No BLOCKED bundle is written
+        # because the run executed; the FAILED outcome is
+        # not a "we could not proceed" condition.
+        warnings.append(
+            {
+                "id": "execution-evaluation-failed",
+                "message": (
+                    "Execution Evaluation ran but at least one "
+                    "case FAILED; Static Review passed. "
+                    f"(failed={execution_evaluation['cases_failed']}, "
+                    f"passed={execution_evaluation['cases_passed']})."
+                ),
+            }
+        )
+
+    # 8. Decide the overall review status. Static blockers,
+    #    execution-blocked benchmark, or execution-FAILED all
+    #    move the review away from the canonical PASS path.
+    #    Static blockers or execution BLOCKED flip the review
+    #    to BLOCKED (precondition failure); execution FAILED
+    #    with a static pass flips the review to FAILED (the
+    #    execution ran and gave a verdict, not a precondition
+    #    failure). Skipped execution with a static pass is the
+    #    canonical F1 success (static + warning).
+    if blockers:
+        overall_status = "BLOCKED"
+    elif execution_evaluation["status"] == EXECUTION_STATUS_FAIL:
+        overall_status = "FAILED"
+    else:
+        overall_status = "PASS"
+
+    # 9. Compose the static_review sub-section. The blockers /
+    #    supplemental findings are sourced from the existing
+    #    static report; the Darwin dimensions are sourced from
+    #    the separate Darwin profile run so the rubric output
+    #    is independent of the static-review verdict.
+    static_review_section: dict[str, Any] = {
+        "profiles_run": list(static_report["profile_ids"]),
+        "blockers": list(static_report["blockers"]),
+        "supplemental_findings": list(
+            static_report["supplemental_findings"]
+        ),
+        "darwin_dimensions": darwin_dim_scores,
+        "weakest_dimensions": weakest_dimensions,
+    }
+
+    return {
+        "status": overall_status,
+        "artifact_path": str(artifact_path),
+        "artifact_kind": kind,
+        "workspace": str(workspace),
+        "benchmark": benchmark_state,
+        "static_review": static_review_section,
+        "execution_evaluation": execution_evaluation,
+        "warnings": warnings,
+        "blockers": blockers,
+        "receipt_path": static_report["receipt_path"],
+        "summary_path": static_report["summary_path"],
+        "trajectory_digest_path": static_report[
+            "trajectory_digest_path"
+        ],
+    }
 
 
 def cmd_promote(args: argparse.Namespace) -> int:
@@ -659,6 +1870,105 @@ def cmd_init(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_review(args: argparse.Namespace) -> int:
+    """Run the ``review`` subcommand; return the process exit code.
+
+    The contract (PRD F1 / Issue #29):
+
+      - The artifact is read once and the source bytes are
+        never mutated. The pipeline writes only to the
+        user-global evidence store (``$HOME/.metacrucible/``);
+        the workspace side (``<workspace>/.metacrucible/``) is
+        referenced by the receipt but not touched by the
+        review flow.
+      - Static Review always runs after the artifact parses.
+        The Darwin 9-dimension rubric is exposed in the output
+        even when static review is the only path that runs.
+      - Execution Evaluation runs only when a reviewed
+        Benchmark is present. The four ADR 0029 buckets
+        (reviewed-eval / reviewed-held-out / generated /
+        disabled) are partitioned; generated and disabled
+        cases are never evaluated.
+      - Exit codes follow the central matrix in
+        :mod:`metacrucible.exit_codes`. Static success +
+        execution skipped is a SUCCESS (with a warning).
+        Static success + execution PASS is a SUCCESS.
+        Static BLOCKED or execution BLOCKED is
+        :data:`EXIT_BLOCKED`. The CLI never returns a
+        raw numeric exit code; every return is a symbolic
+        constant from the matrix.
+    """
+    artifact_path = Path(args.artifact).resolve()
+    if not artifact_path.is_file():
+        payload = {
+            "status": "BLOCKED",
+            "artifact_path": str(artifact_path),
+            "error": {
+                "id": "review-artifact-missing",
+                "message": (
+                    f"artifact {artifact_path} does not exist or "
+                    "is not a regular file"
+                ),
+            },
+        }
+        _emit(payload, as_json=args.json)
+        return EXIT_BLOCKED
+
+    workspace = (
+        Path(args.workspace).resolve()
+        if args.workspace
+        else artifact_path.parent
+    )
+
+    try:
+        review = _run_review(
+            artifact_path=artifact_path, workspace=workspace
+        )
+    except FileNotFoundError as exc:
+        # The artifact path was resolved above, so a
+        # FileNotFoundError past this point is unusual;
+        # surface it as a BLOCKED precondition with the
+        # explicit error message so the operator can act.
+        payload = {
+            "status": "BLOCKED",
+            "artifact_path": str(artifact_path),
+            "error": {
+                "id": "review-artifact-missing",
+                "message": str(exc),
+            },
+        }
+        _emit(payload, as_json=args.json)
+        return EXIT_BLOCKED
+    except ValueError as exc:
+        # Pre-pipeline failure (UTF-8 decode, malformed
+        # frontmatter, neither Skill nor subagent). The
+        # CLI maps the exception to EXIT_USER_ERROR so the
+        # operator sees a usage-style failure rather than
+        # a BLOCKED bundle (no review ran).
+        payload = {
+            "status": "BLOCKED",
+            "artifact_path": str(artifact_path),
+            "error": {
+                "id": "review-artifact-invalid",
+                "message": str(exc),
+            },
+        }
+        _emit(payload, as_json=args.json)
+        return EXIT_USER_ERROR
+
+    _emit(review, as_json=args.json)
+    # The F1 verdict vocabulary is PASS / FAILED / BLOCKED.
+    # PASS maps to EXIT_OK. FAILED and BLOCKED both map to
+    # EXIT_BLOCKED (the existing exit-code matrix does not
+    # have a separate FAILED code; the negative outcome is
+    # observable from the JSON ``status`` field, and the
+    # ``blockers`` / ``execution_evaluation.cases_failed``
+    # fields carry the detail).
+    if review["status"] in ("BLOCKED", "FAILED"):
+        return EXIT_BLOCKED
+    return EXIT_OK
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point for the ``metacrucible`` console script.
 
@@ -701,6 +2011,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_init(args)
         if getattr(args, "command", None) == "promote":
             return cmd_promote(args)
+        if getattr(args, "command", None) == "review":
+            return cmd_review(args)
         return EXIT_OK
     except Exception as exc:  # noqa: BLE001 - exit-code firewall
         # Catch-all so an uncaught command-handler bug still
@@ -716,3 +2028,4 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

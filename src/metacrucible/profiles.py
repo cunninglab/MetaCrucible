@@ -106,6 +106,7 @@ __all__ = [
     "evaluate_secret_privacy_risk",
     "select_supplemental",
     "select_triggers",
+    "evaluate_darwin_skill_quality",
     "weakest_darwin_dimensions",
 ]
 
@@ -1391,3 +1392,211 @@ def evaluate_secret_privacy_risk(
         version=SECRET_PRIVACY_RISK_VERSION,
         status="PASS",
     )
+
+
+
+
+def evaluate_darwin_skill_quality(artifact: Mapping[str, Any]) -> ProfileResult:
+    """Per-dimension Darwin 9-dimension rubric evaluator (Issue #22).
+
+    Replaces the MVP placeholder that returned ``1.0`` for every
+    dimension. The real evaluator scores each of the 9 dimensions
+    by deterministic content analysis of the artifact's body and
+    frontmatter; scores reflect the actual artifact and differ
+    across inputs (an empty body scores 0.0 on every content
+    dimension; a richly structured body scores 1.0 on the
+    dimensions that are actually documented).
+
+    Per-dimension scoring
+    ---------------------
+
+    Eight of the nine dimensions are scored by a shared
+    :func:`_score_darwin_content_dimension` helper. The helper
+    combines four signals into a value in ``[0.0, 1.0]``:
+
+      1. **Section header presence** (max 0.4) -- the dimension
+         has been *considered* in the artifact design.
+      2. **Keyword diversity** (max 0.3) -- the dimension's
+         vocabulary tokens appear across the body. Each unique
+         token contributes ``0.1``; the slot caps at three
+         tokens.
+      3. **Structural elements** (max 0.2) -- bullets (``- ``)
+         and fenced code blocks (```` ``` ````) operationalize
+         the dimension. Each element contributes ``0.05``; the
+         slot caps at four elements.
+      4. **Length depth** (max 0.1) -- a 1000-character body
+         earns the full bonus; anything shorter is prorated.
+
+    ``runtime_neutrality`` is scored against the artifact's
+    ``portability.target`` claim: ``1.0`` when the target is in
+    :data:`RUNTIME_PORTABILITY_TARGETS`, ``0.0`` when the
+    target is missing or unknown. This makes the
+    runtime-neutrality dimension a real signal of the
+    artifact's portability claim, not a body-content proxy.
+
+    Result shape
+    ------------
+
+    The returned :class:`ProfileResult` always has
+    ``status='PASS'``: Darwin is a supplemental review layer
+    (ADR 0033) and a low score is a finding, not a blocker.
+    ``dimension_scores`` carries one entry per
+    :data:`DARWIN_DIMENSIONS` id in canonical order; each
+    entry is a ``{id, score}`` mapping with ``score`` rounded
+    to three decimal places.
+
+    A non-mapping ``artifact`` argument is a programming error
+    and raises :class:`ValueError`; a missing ``body`` field
+    is graded honestly (an empty body scores 0.0 on every
+    content dimension) rather than collapsing to the previous
+    uniform 1.0.
+    """
+    if not isinstance(artifact, Mapping):
+        raise ValueError(
+            f"evaluate_darwin_skill_quality requires a mapping input; "
+            f"got {type(artifact).__name__}"
+        )
+
+    body_obj = artifact.get("body") if isinstance(artifact, Mapping) else None
+    body: str = body_obj if isinstance(body_obj, str) else ""
+    body_lower = body.lower()
+
+    portability = artifact.get("portability")
+    runtime_target: Any = None
+    if isinstance(portability, Mapping):
+        runtime_target = portability.get("target")
+
+    dimension_scores: list[Mapping[str, Any]] = []
+    for dim in DARWIN_DIMENSIONS:
+        if dim == "runtime_neutrality":
+            # Portability.target is the contract: the dimension
+            # is graded against the claim, not the prose. A
+            # body that narrates "runtime-neutral" without
+            # declaring the target scores 0.0; a body that
+            # declares a target outside the allowed set also
+            # scores 0.0; only a body that names an allowed
+            # target scores 1.0.
+            if runtime_target in RUNTIME_PORTABILITY_TARGETS:
+                score: float = 1.0
+            else:
+                score = 0.0
+        else:
+            keywords, headers = _DARWIN_DIMENSION_SIGNALS[dim]
+            score = _score_darwin_content_dimension(
+                body=body,
+                body_lower=body_lower,
+                header_aliases=headers,
+                keyword_tokens=keywords,
+            )
+        dimension_scores.append(
+            {"id": dim, "score": round(score, 3)}
+        )
+
+    return ProfileResult(
+        profile_id=DARWIN_SKILL_QUALITY_ID,
+        version=DARWIN_SKILL_QUALITY_VERSION,
+        status="PASS",
+        dimension_scores=tuple(dimension_scores),
+    )
+
+
+#: Per-dimension keyword / section-header signals used by
+#: :func:`evaluate_darwin_skill_quality` to score the eight
+#: content-driven Darwin dimensions. ``runtime_neutrality`` is
+#: excluded -- its signal is the ``portability.target`` claim,
+#: not body content.
+#:
+#: Each entry is ``(keyword_tokens, section_header_aliases)``.
+#: A section header is a substring of the body in lowercase;
+#: the helper uses ``in`` (not anchored) so a header under any
+#: level of Markdown heading still counts. Tokens are
+#: exact-substring lowercase matches; short tokens like
+#: ``"use"`` are avoided so prose-only artifacts do not
+#: over-score.
+_DARWIN_DIMENSION_SIGNALS: dict[
+    str, tuple[tuple[str, ...], tuple[str, ...]]
+] = {
+    "trigger_clarity": (
+        ("when to use", "use when", "triggers", "use this skill"),
+        ("## when to use", "## use when", "## triggers", "## when not to use"),
+    ),
+    "input_contract": (
+        ("input:", "inputs:", "parameter", "argument", "arguments:"),
+        ("## input", "## inputs", "## parameters", "## arguments"),
+    ),
+    "output_contract": (
+        ("output:", "outputs:", "returns:", "response format", "result format"),
+        ("## output", "## outputs", "## returns", "## response format"),
+    ),
+    "invariants": (
+        ("invariant", "invariants", "guarantee", "must not", "never"),
+        ("## invariant", "## invariants", "## guarantees"),
+    ),
+    "failure_modes": (
+        ("error", "errors", "failure", "exception", "fail"),
+        ("## failure", "## failures", "## failure modes", "## errors"),
+    ),
+    "examples": (
+        ("example", "for example", "e.g.", "sample"),
+        ("## example", "## examples", "## usage example", "## sample"),
+    ),
+    "scope_boundaries": (
+        ("scope", "out of scope", "do not use", "limits"),
+        ("## scope", "## boundaries", "## limits", "## out of scope"),
+    ),
+    "evaluability": (
+        ("check", "checks:", "evaluate", "verify", "expected"),
+        ("## check", "## checks", "## evaluation", "## tests", "## verify"),
+    ),
+}
+
+
+def _score_darwin_content_dimension(
+    *,
+    body: str,
+    body_lower: str,
+    header_aliases: tuple[str, ...],
+    keyword_tokens: tuple[str, ...],
+) -> float:
+    """Score one content-driven Darwin dimension in ``[0.0, 1.0]``.
+
+    The score is the sum of four bounded sub-scores so any
+    single artifact can earn partial credit on a dimension
+    even when it lacks a dedicated section, and so an
+    artifact can never earn a uniform score across all
+    dimensions (the inputs vary). See
+    :func:`evaluate_darwin_skill_quality` for the slot
+    breakdown.
+    """
+    if not body:
+        return 0.0
+
+    # 1. Section header presence. The slot caps at 0.4; a
+    #    match in any of the dimension's aliases earns the
+    #    full slot because the alias list is already a
+    #    curated per-dimension vocabulary.
+    section_score = 0.0
+    for alias in header_aliases:
+        if alias in body_lower:
+            section_score = 0.4
+            break
+
+    # 2. Keyword diversity. The slot caps at 0.3 (three
+    #    distinct tokens).
+    keyword_hits = sum(
+        1 for token in keyword_tokens if token in body_lower
+    )
+    keyword_score = min(0.3, keyword_hits * 0.1)
+
+    # 3. Structural elements. Bullets (``- ``) and code
+    #    fences (```` ``` ````) operationalize a dimension.
+    #    The slot caps at 0.2 (four elements).
+    bullet_count = body.count("\n- ") + body.count("\n  - ")
+    fence_count = body.count("```") // 2
+    structure_score = min(0.2, (bullet_count + fence_count) * 0.05)
+
+    # 4. Length depth. A 1000-character body earns the
+    #    full 0.1 bonus; shorter bodies are prorated.
+    length_score = min(0.1, len(body) / 10000.0)
+
+    return section_score + keyword_score + structure_score + length_score

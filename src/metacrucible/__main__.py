@@ -45,6 +45,8 @@ import datetime as _dt
 import json
 import sys
 import uuid
+import subprocess
+import hashlib
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -234,6 +236,67 @@ BOOTSTRAP_DRAFT_INPUT = (
 #: contract used by the ``optimize`` sentinel gate.
 BOOTSTRAP_PENDING_REVIEW_FIELD = "BOOTSTRAP_PENDING_REVIEW"
 
+# --------------------------------------------------------------------------- #
+# Issue #31 (PRD ``baseline create``) constants                              #
+# --------------------------------------------------------------------------- #
+
+#: Name of the baseline digest file written under
+#: ``<workspace>/.metacrucible/``. Pinned by the Issue #31 contract so
+#: downstream tooling can branch on the path without re-deriving it.
+BASELINE_FILE_NAME = "baseline.json"
+
+#: Schema version string stamped into ``baseline.json``. Pinned so a
+#: future v2 is a deliberate single-site update; the on-disk digest
+#: identifies a baseline as a specific contract version.
+BASELINE_SCHEMA_VERSION = "metacrucible.baseline.v1"
+
+#: Stable blocker id emitted by ``baseline create`` when the workspace
+#: path does not exist on disk. The ``init`` command creates the
+#: workspace; ``baseline create`` does not, so a missing workspace is
+#: a precondition failure with a stable id.
+BASELINE_WORKSPACE_MISSING_BLOCKER = "baseline-workspace-missing"
+
+#: Stable blocker id emitted by ``baseline create`` when
+#: ``<workspace>/.metacrucible/envelope.json`` is absent. The envelope
+#: is the artifact-identity record; without it the baseline has no
+#: artifact reference to hash.
+BASELINE_ENVELOPE_MISSING_BLOCKER = "baseline-envelope-missing"
+
+#: Stable blocker id emitted by ``baseline create`` when the
+#: ``benchmark.jsonl`` container is absent at the workspace root.
+#: The baseline hashes the canonical benchmark payload, so a missing
+#: file is a precondition failure with a stable id.
+BASELINE_BENCHMARK_MISSING_BLOCKER = "baseline-benchmark-missing"
+
+#: Stable blocker id emitted by ``baseline create`` when the
+#: envelope does not carry an ``artifact_path`` (or ``canonical_source``)
+#: field. The baseline must read the artifact source bytes to hash
+#: them; without an envelope-declared path the command refuses to
+#: scan / glob the filesystem (per OD1) and surfaces this stable id.
+BASELINE_ARTIFACT_UNRESOLVED_BLOCKER = "baseline-artifact-unresolved"
+
+#: Stable blocker id emitted by ``baseline create`` when the workspace
+#: is inside a git worktree and ``git status --porcelain`` reports dirty
+#: files that are not the tracked baseline inputs (the artifact,
+#: ``.metacrucible/envelope.json``, and ``benchmark.jsonl``). The
+#: caller can pass ``--allow-dirty-unrelated`` to record the dirty
+#: file list and proceed (Issue #31 dirty-file guard; subsumes the
+#: earlier Issue #37 standalone guard).
+BASELINE_UNRELATED_DIRTY_FILES_BLOCKER = "baseline-unrelated-dirty-files"
+
+#: Run-type value written into the BLOCKED evidence bundle by
+#: :func:`cmd_baseline_create`. Matches the ADR 0035 ``baseline_create``
+#: slot in :data:`metacrucible.blocked_bundles.REQUIRES_BLOCKED_BUNDLE_CATEGORIES`
+#: so the matrix already routes the BLOCKED bundle write through
+#: :func:`metacrucible.blocked_bundles.write_blocked_bundle`.
+BASELINE_BLOCKED_BUNDLE_RUN_TYPE = "baseline_create"
+
+#: Run-id prefix used when emitting the ``baseline_create`` BLOCKED
+#: evidence bundle. Mirrors the ``review-`` prefix the F1 review path
+#: uses; downstream tooling can branch on the prefix to distinguish
+#: baseline-create bundles from other BLOCKED categories.
+BASELINE_BLOCKED_BUNDLE_RUN_ID_PREFIX = "baseline-create"
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -411,6 +474,49 @@ def _build_parser() -> argparse.ArgumentParser:
         help="path to the artifact workspace",
     )
     optimize_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="emit a parseable JSON object on stdout",
+    )
+    # ``baseline`` subcommand (Issue #31). The nested ``create``
+    # action is the MVP contract; future actions (e.g. ``list`` /
+    # ``verify``) extend the same nested parser without breaking
+    # the ``baseline`` outer shape. ``dest="baseline_action"`` on
+    # the inner subparser so the dispatcher can branch on
+    # ``args.baseline_action`` without ambiguity.
+    baseline_parser = subparsers.add_parser(
+        "baseline",
+        help=(
+            "record or inspect digest baselines for an artifact "
+            "workspace (ADR 0035 / Issue #31)"
+        ),
+    )
+    baseline_subparsers = baseline_parser.add_subparsers(
+        dest="baseline_action"
+    )
+    baseline_create_parser = baseline_subparsers.add_parser(
+        "create",
+        help=(
+            "compute and write a digest baseline that pins the "
+            "artifact, envelope, benchmark, and evaluation harness "
+            "hashes for the workspace"
+        ),
+    )
+    baseline_create_parser.add_argument(
+        "workspace",
+        help="path to the artifact workspace",
+    )
+    baseline_create_parser.add_argument(
+        "--allow-dirty-unrelated",
+        action="store_true",
+        help=(
+            "record the dirty-file list and proceed even when the "
+            "git worktree carries dirty files unrelated to the "
+            "baseline inputs (artifact, envelope, benchmark); "
+            "default is to BLOCK on unrelated dirty files"
+        ),
+    )
+    baseline_create_parser.add_argument(
         "--json",
         action="store_true",
         help="emit a parseable JSON object on stdout",
@@ -2333,6 +2439,431 @@ def cmd_review(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _baseline_git_dirty_check(
+    workspace: Path, baseline_inputs: list[Path]
+) -> tuple[bool, list[str], bool]:
+    """Inspect the workspace's git state and classify dirty files.
+
+    Returns a triple ``(unrelated_dirty, dirty_paths, is_worktree)``:
+
+      - ``is_worktree`` is ``True`` iff ``git rev-parse
+        --is-inside-work-tree`` returns ``true`` for ``workspace``.
+        A non-worktree workspace (no git integration, or the
+        workspace lives outside any git toplevel) is not gated
+        by the dirty guard: the caller is expected to commit
+        before baselining but the command cannot enforce that
+        outside a worktree. A warning is surfaced via
+        ``is_worktree=False`` so the operator can see the skip.
+      - ``dirty_paths`` is the raw ``git status --porcelain``
+        output, normalized to repo-relative paths (no
+        renames/copies handling beyond the basic case).
+      - ``unrelated_dirty`` is ``True`` iff at least one
+        ``dirty_paths`` entry is not one of the ``baseline_inputs``
+        (resolved against ``workspace``). The filter is
+        permissive: a path matches an input when the resolved
+        absolute paths are equal.
+
+    The function never raises; subprocess errors and unreadable
+    output are downgraded to ``is_worktree=False`` so the caller
+    can branch on a tri-state without exception handling.
+    """
+    try:
+        probe = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(workspace),
+                "rev-parse",
+                "--is-inside-work-tree",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False, [], False
+    if probe.returncode != 0 or probe.stdout.strip() != "true":
+        return False, [], False
+
+    try:
+        status = subprocess.run(
+            ["git", "-C", str(workspace), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False, [], True
+    if status.returncode != 0:
+        return False, [], True
+
+    dirty: list[str] = []
+    for raw_line in status.stdout.splitlines():
+        if len(raw_line) < 4:
+            continue
+        # Porcelain v1: ``XY<space>PATH`` where XY is the index +
+        # worktree status code. Renames/copies carry
+        # ``ORIG -> PATH``; the second component is the
+        # post-rename path so we keep that.
+        path_str = raw_line[3:].strip()
+        if " -> " in path_str:
+            path_str = path_str.split(" -> ", 1)[1]
+        # Git may quote paths that contain special characters
+        # (``"foo bar"``); the basic workspace fixtures do not
+        # exercise that path so we only handle the unquoted
+        # case for the MVP. The downstream resolver still
+        # catches escape mismatches.
+        if path_str.startswith('"') and path_str.endswith('"'):
+            path_str = path_str[1:-1]
+        dirty.append(path_str)
+
+    input_abs = {
+        (workspace / rel).resolve() for rel in baseline_inputs
+    }
+    unrelated: list[str] = []
+    for entry in dirty:
+        candidate = (workspace / entry).resolve()
+        if candidate not in input_abs:
+            unrelated.append(entry)
+    return bool(unrelated), dirty, True
+
+
+def _write_baseline_blocked_bundle(
+    *, blockers: list[dict[str, Any]]
+) -> None:
+    """Emit the ADR 0035 ``baseline_create`` BLOCKED evidence bundle.
+
+    Best-effort: a write failure is logged to stderr and the
+    in-memory payload still carries the BLOCKED verdict, so the
+    caller (``cmd_baseline_create``) still returns the
+    :data:`EXIT_BLOCKED` exit code. The BLOCKED bundle is the
+    *evidence* of the BLOCKED verdict, not the source of
+    truth; the in-memory payload wins.
+    """
+    try:
+        global_store = UserGlobalStorage()
+        run_id = (
+            f"{BASELINE_BLOCKED_BUNDLE_RUN_ID_PREFIX}-"
+            f"{_now_iso().replace(':', '').replace('-', '')}"
+        )
+        write_blocked_bundle(
+            global_store,
+            run_id=run_id,
+            run_type=BASELINE_BLOCKED_BUNDLE_RUN_TYPE,
+            blockers=blockers,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"metacrucible: failed to write baseline BLOCKED "
+            f"bundle: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+
+
+def cmd_baseline(args: argparse.Namespace) -> int:
+    """Dispatch nested ``baseline`` actions.
+
+    The Issue #31 MVP exposes a single nested action (``create``).
+    An unknown / missing action is mapped to :data:`EXIT_USER_ERROR`
+    so the CLI never silently returns :data:`EXIT_OK` for an
+    unrecognised command (matches the contract pinned for the
+    other subcommands).
+    """
+    action = getattr(args, "baseline_action", None)
+    if action == "create":
+        return cmd_baseline_create(args)
+    payload = {
+        "command": "baseline",
+        "baseline_action": action,
+        "blockers": [
+            {
+                "id": "baseline-unknown-action",
+                "message": (
+                    f"``baseline`` requires a nested action; got "
+                    f"{action!r}. Supported action: ``create``."
+                ),
+            }
+        ],
+    }
+    _emit(payload, as_json=getattr(args, "json", False))
+    return EXIT_USER_ERROR
+
+
+def cmd_baseline_create(args: argparse.Namespace) -> int:
+    """Run the ``baseline create`` subcommand; return the exit code.
+
+    The contract (Issue #31):
+
+      - Resolves the workspace path and reads the three
+        baseline inputs (the artifact at the envelope-declared
+        path, :data:`metacrucible.storage.RepositoryStorage`
+        envelope, and the workspace ``benchmark.jsonl``). Each
+        is hashed; the resulting four-tuple (artifact, envelope,
+        benchmark, harness) plus the schema version is written
+        to ``<workspace>/.metacrucible/baseline.json`` so a
+        downstream reviewer can re-derive the inputs the
+        baseline pinned against.
+      - The artifact path is resolved from the envelope's
+        ``artifact_path`` (preferred) or ``canonical_source``
+        field. When neither is present, the command BLOCKS
+        with the stable ``baseline-artifact-unresolved`` id
+        rather than scanning / globbing the workspace (per
+        OD1). The envelope, benchmark, and workspace itself
+        must already exist (the baseline does not create
+        any of them); missing preconditions BLOCK with
+        their own stable ids.
+      - The harness SHA is the
+        :func:`compute_evaluation_harness_sha` digest over
+        :data:`BUILTIN_PROFILES`, the stable full-harness
+        snapshot (OD2). When no built-in profiles are
+        available the harness field is the empty string
+        so the baseline still pins the rest of the inputs
+        without inventing a digest.
+      - The dirty-file guard (subsumes Issue #37) reads
+        ``git status --porcelain`` against the workspace.
+        Baseline inputs (the artifact, envelope, benchmark)
+        are not considered ``unrelated`` so a freshly-modified
+        artifact at baselining time does not block; the
+        ``--allow-dirty-unrelated`` flag records the dirty
+        file list and proceeds, otherwise unrelated dirty
+        files BLOCK with the ``baseline-unrelated-dirty-files``
+        id. A workspace that is not a git worktree skips the
+        guard with a stderr warning so the operator can see
+        the silent-skip (per OD3).
+      - The command never mutates ``envelope.json``,
+        ``state.json``, ``history.jsonl``, the artifact, or
+        ``benchmark.jsonl``; the only write is
+        ``baseline.json`` itself. A second ``baseline create``
+        is allowed (overwrite) and bumps ``created_at``.
+      - On any BLOCKED outcome, a minimal ``BLOCKED`` evidence
+        bundle is written via
+        :func:`metacrucible.blocked_bundles.write_blocked_bundle`
+        with ``run_type="baseline_create"`` per ADR 0035 (the
+        matrix in :mod:`metacrucible.blocked_bundles` already
+        lists ``baseline_create`` as a required emitter).
+    """
+    from .profiles import BUILTIN_PROFILES, compute_evaluation_harness_sha
+    from .storage import compute_benchmark_digest
+
+    workspace = Path(args.workspace).resolve()
+    envelope_path = workspace / ".metacrucible" / "envelope.json"
+    benchmark_path = workspace / BENCHMARK_FILE_NAME
+    baseline_path = workspace / ".metacrucible" / BASELINE_FILE_NAME
+
+    blockers: list[dict[str, Any]] = []
+    artifact_path_value: str | None = None
+
+    # Precondition 1: workspace must be an existing directory.
+    # The ``init`` command creates the workspace; ``baseline
+    # create`` does not, so a missing workspace is a hard
+    # precondition failure.
+    if not workspace.is_dir():
+        blockers.append(
+            {
+                "id": BASELINE_WORKSPACE_MISSING_BLOCKER,
+                "message": (
+                    f"workspace {workspace} does not exist or is "
+                    f"not a directory; run ``metacrucible init "
+                    f"{workspace}`` first"
+                ),
+            }
+        )
+
+    # Precondition 2: ``.metacrucible/envelope.json`` must be
+    # present. The envelope is the artifact identity record
+    # and the source of the artifact path.
+    if not envelope_path.is_file():
+        blockers.append(
+            {
+                "id": BASELINE_ENVELOPE_MISSING_BLOCKER,
+                "message": (
+                    f"envelope {envelope_path} is missing; run "
+                    f"``metacrucible init {workspace}`` first"
+                ),
+            }
+        )
+
+    # Precondition 3: ``benchmark.jsonl`` must be present at
+    # the workspace root. The baseline hashes the canonical
+    # payload; a missing file is a precondition failure with
+    # a stable id so the operator knows exactly what is
+    # missing.
+    if not benchmark_path.is_file():
+        blockers.append(
+            {
+                "id": BASELINE_BENCHMARK_MISSING_BLOCKER,
+                "message": (
+                    f"benchmark file {benchmark_path} is missing; "
+                    f"run ``metacrucible init {workspace}`` first"
+                ),
+            }
+        )
+
+    # Precondition 4: the envelope must declare the artifact
+    # path (``artifact_path`` preferred; ``canonical_source``
+    # accepted as a synonym). We refuse to scan / glob the
+    # workspace (per OD1) so a missing declaration surfaces
+    # as ``baseline-artifact-unresolved`` rather than a
+    # silent guess.
+    if envelope_path.is_file():
+        try:
+            envelope_obj = json.loads(
+                envelope_path.read_text(encoding="utf-8")
+            )
+        except (json.JSONDecodeError, OSError):
+            envelope_obj = None
+        if isinstance(envelope_obj, dict):
+            raw_ap = envelope_obj.get("artifact_path")
+            raw_cs = envelope_obj.get("canonical_source")
+            if isinstance(raw_ap, str) and raw_ap:
+                artifact_path_value = raw_ap
+            elif isinstance(raw_cs, str) and raw_cs:
+                artifact_path_value = raw_cs
+    if (
+        not blockers
+        and artifact_path_value is None
+    ):
+        blockers.append(
+            {
+                "id": BASELINE_ARTIFACT_UNRESOLVED_BLOCKER,
+                "message": (
+                    f"envelope {envelope_path} does not declare an "
+                    f"``artifact_path`` (or ``canonical_source``) "
+                    f"field; the baseline refuses to scan / glob "
+                    f"the workspace"
+                ),
+            }
+        )
+
+    if blockers:
+        # Per ADR 0035 the ``baseline_create`` category must
+        # emit a BLOCKED evidence bundle so the receipt
+        # lineage carries the "we could not proceed" record
+        # alongside the in-memory payload. Best-effort: a
+        # write failure does not change the exit code.
+        _write_baseline_blocked_bundle(blockers=blockers)
+        payload = {
+            "status": "BLOCKED",
+            "workspace": str(workspace),
+            "baseline_path": str(baseline_path),
+            "blockers": blockers,
+        }
+        _emit(payload, as_json=args.json)
+        return EXIT_BLOCKED
+
+    artifact_path = Path(artifact_path_value).resolve()
+
+    # Dirty-file guard (subsumes Issue #37). The baseline
+    # inputs (artifact, envelope, baseline.json, benchmark) are
+    # not considered "unrelated" so a freshly-modified artifact
+    # at baselining time does not block; ``baseline.json`` is
+    # included so the overwrite path does not self-block (a
+    # previously-written uncommitted ``baseline.json`` is an
+    # expected dirty file when the operator re-runs the
+    # command). Everything else triggers BLOCK unless
+    # ``--allow-dirty-unrelated`` is set. A workspace outside
+    # a git worktree skips the guard with a stderr warning
+    # (per OD3): the command cannot enforce a commit-before-
+    # baseline policy outside git's purview.
+    baseline_input_paths: list[Path] = [
+        Path(artifact_path_value),
+        Path(".metacrucible/envelope.json"),
+        Path(f".metacrucible/{BASELINE_FILE_NAME}"),
+        Path(BENCHMARK_FILE_NAME),
+    ]
+    unrelated_dirty, dirty_files, is_worktree = _baseline_git_dirty_check(
+        workspace, baseline_input_paths
+    )
+    if not is_worktree:
+        # Workspace is not a git worktree; skip the dirty
+        # guard with a one-line English warning so the
+        # operator sees the silent-skip. We do not BLOCK.
+        print(
+            "metacrucible: warning: workspace is not a git "
+            "worktree; dirty-file guard skipped (Issue #31 "
+            "OD3)",
+            file=sys.stderr,
+        )
+    elif unrelated_dirty and not args.allow_dirty_unrelated:
+        blockers.append(
+            {
+                "id": BASELINE_UNRELATED_DIRTY_FILES_BLOCKER,
+                "message": (
+                    f"workspace has dirty files unrelated to the "
+                    f"baseline inputs (artifact, envelope, "
+                    f"benchmark); pass ``--allow-dirty-unrelated`` "
+                    f"to record the dirty file list and proceed. "
+                    f"dirty_files={dirty_files!r}"
+                ),
+            }
+        )
+        _write_baseline_blocked_bundle(blockers=blockers)
+        payload = {
+            "status": "BLOCKED",
+            "workspace": str(workspace),
+            "baseline_path": str(baseline_path),
+            "dirty_files_at_creation": dirty_files,
+            "allow_dirty_unrelated": bool(args.allow_dirty_unrelated),
+            "blockers": blockers,
+        }
+        _emit(payload, as_json=args.json)
+        return EXIT_BLOCKED
+
+    # Hash the four baseline inputs. ``artifact_hash`` and
+    # ``envelope_hash`` are SHA-256 of the raw file bytes;
+    # ``benchmark_hash`` is the canonical-JSON digest from
+    # :func:`metacrucible.storage.compute_benchmark_digest`
+    # (so a whitespace-stable benchmark produces the same
+    # digest across runs); ``harness_sha`` is the full-
+    # harness digest over :data:`BUILTIN_PROFILES` (per OD2)
+    # or the empty string when no profiles are available.
+    artifact_hash = hashlib.sha256(
+        artifact_path.read_bytes()
+    ).hexdigest()
+    envelope_hash = hashlib.sha256(
+        envelope_path.read_bytes()
+    ).hexdigest()
+    benchmark_records = _read_benchmark_records(benchmark_path)
+    benchmark_hash = compute_benchmark_digest(benchmark_records)
+    harness_sha = (
+        compute_evaluation_harness_sha(BUILTIN_PROFILES)
+        if BUILTIN_PROFILES
+        else ""
+    )
+
+    baseline_record: dict[str, Any] = {
+        "schema_version": BASELINE_SCHEMA_VERSION,
+        "created_at": _now_iso(),
+        "artifact_hash": artifact_hash,
+        "envelope_hash": envelope_hash,
+        "benchmark_hash": benchmark_hash,
+        "harness_sha": harness_sha,
+        "allow_dirty_unrelated": bool(args.allow_dirty_unrelated),
+        "dirty_files_at_creation": list(dirty_files),
+    }
+    baseline_path.write_text(
+        json.dumps(baseline_record, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    payload = {
+        "status": "OK",
+        "workspace": str(workspace),
+        "baseline_path": str(baseline_path),
+        "schema_version": BASELINE_SCHEMA_VERSION,
+        "created_at": baseline_record["created_at"],
+        "artifact_hash": artifact_hash,
+        "envelope_hash": envelope_hash,
+        "benchmark_hash": benchmark_hash,
+        "harness_sha": harness_sha,
+        "allow_dirty_unrelated": bool(args.allow_dirty_unrelated),
+        "dirty_files_at_creation": list(dirty_files),
+        "git_worktree": is_worktree,
+        "blockers": [],
+    }
+    _emit(payload, as_json=args.json)
+    return EXIT_OK
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point for the ``metacrucible`` console script.
 
@@ -2381,6 +2912,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_bootstrap(args)
         if getattr(args, "command", None) == "optimize":
             return cmd_optimize(args)
+        if getattr(args, "command", None) == "baseline":
+            return cmd_baseline(args)
         return EXIT_OK
     except Exception as exc:  # noqa: BLE001 - exit-code firewall
         # Catch-all so an uncaught command-handler bug still

@@ -297,6 +297,47 @@ BASELINE_BLOCKED_BUNDLE_RUN_TYPE = "baseline_create"
 #: baseline-create bundles from other BLOCKED categories.
 BASELINE_BLOCKED_BUNDLE_RUN_ID_PREFIX = "baseline-create"
 
+# --------------------------------------------------------------------------- #
+# Issue #32 (``evaluate`` subcommand) constants                              #
+# --------------------------------------------------------------------------- #
+
+#: Machine-stable split value accepted by the ``--split`` flag of
+#: ``metacrucible evaluate``; evaluates eligible reviewed eval AND
+#: held-out cases. The existing ADR 0025 / ADR 0029 split values
+#: (``SPLIT_EVAL`` / ``SPLIT_HELD_OUT``) are imported from
+#: :mod:`metacrucible.benchmark`; this constant is the new
+#: ``evaluate``-only choice.
+SPLIT_ALL = "all"
+
+#: Stable blocker id emitted by ``evaluate`` when the workspace has
+#: no ``benchmark.jsonl`` at the workspace root. Distinct from the
+#: review-only :data:`NO_REVIEWED_BENCHMARK_WARNING`: ``evaluate`` is
+#: a support command whose explicit purpose is evaluation, so a
+#: missing benchmark is a precondition failure (BLOCKED), not a
+#: static-review + warning outcome.
+EVALUATE_BENCHMARK_MISSING_BLOCKER = "evaluate-benchmark-missing"
+
+#: Stable blocker id emitted by ``evaluate`` when the selected
+#: ``--split`` partition is present in the benchmark but has zero
+#: eligible reviewed cases. The message carries the split name so
+#: the operator can tell ``eval`` / ``held_out`` / ``all`` apart
+#: when triaging the result.
+EVALUATE_NO_ELIGIBLE_CASES_BLOCKER = "evaluate-no-eligible-cases"
+
+#: Run-type value written into the BLOCKED evidence bundle by
+#: :func:`_write_evaluate_blocked_bundle`. Matches the ADR 0035
+#: ``evaluate`` slot in
+#: :data:`metacrucible.blocked_bundles.REQUIRES_BLOCKED_BUNDLE_CATEGORIES`
+#: so the matrix already routes the BLOCKED bundle write through
+#: :func:`metacrucible.blocked_bundles.write_blocked_bundle`.
+EVALUATE_BLOCKED_BUNDLE_RUN_TYPE = "evaluate"
+
+#: Run-id prefix used when emitting the ``evaluate`` BLOCKED
+#: evidence bundle. Mirrors the ``baseline-create`` prefix; downstream
+#: tooling can branch on the prefix to distinguish evaluate bundles
+#: from other BLOCKED categories.
+EVALUATE_BLOCKED_BUNDLE_RUN_ID_PREFIX = "evaluate"
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -517,6 +558,41 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     baseline_create_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="emit a parseable JSON object on stdout",
+    )
+    # ``evaluate`` subcommand (Issue #32). The split filter is
+    # pinned by ADR 0029 / ADR 0025: ``all`` runs every eligible
+    # reviewed case, ``eval`` runs only the eval partition, and
+    # ``held_out`` runs only the held-out partition. A missing
+    # benchmark is BLOCKED (precondition failure), not SKIPPED
+    # + warning like ``review`` -- ``evaluate`` is a support
+    # command whose explicit purpose is evaluation.
+    evaluate_parser = subparsers.add_parser(
+        "evaluate",
+        help=(
+            "evaluate the eligible reviewed cases in a benchmark "
+            "(ADR 0029 / Issue #32); supports --split all/eval/held_out"
+        ),
+    )
+    evaluate_parser.add_argument(
+        "workspace",
+        help="path to the artifact workspace",
+    )
+    evaluate_parser.add_argument(
+        "--split",
+        choices=[SPLIT_ALL, SPLIT_EVAL, SPLIT_HELD_OUT],
+        default=SPLIT_ALL,
+        help=(
+            "which reviewed cases to evaluate; "
+            f"{SPLIT_ALL!r} runs both eval and held_out, "
+            f"{SPLIT_EVAL!r} runs only eval, "
+            f"{SPLIT_HELD_OUT!r} runs only held_out "
+            f"(default: {SPLIT_ALL!r})"
+        ),
+    )
+    evaluate_parser.add_argument(
         "--json",
         action="store_true",
         help="emit a parseable JSON object on stdout",
@@ -2528,6 +2604,43 @@ def _baseline_git_dirty_check(
     return bool(unrelated), dirty, True
 
 
+def _write_evaluate_blocked_bundle(
+    *, blockers: list[dict[str, Any]]
+) -> None:
+    """Emit the ADR 0035 ``evaluate`` BLOCKED evidence bundle.
+
+    Best-effort: a write failure is logged to stderr and the
+    in-memory payload still carries the BLOCKED verdict, so the
+    caller (:func:`cmd_evaluate`) still returns the
+    :data:`EXIT_BLOCKED` exit code. The BLOCKED bundle is the
+    *evidence* of the BLOCKED verdict, not the source of
+    truth; the in-memory payload wins.
+
+    Mirrors :func:`_write_baseline_blocked_bundle` exactly so
+    the four BLOCKED-emitting commands (``baseline create``,
+    ``evaluate``, ``optimize``, ``synthesize evaluation
+    stage``) share a single, predictable write contract.
+    """
+    try:
+        global_store = UserGlobalStorage()
+        run_id = (
+            f"{EVALUATE_BLOCKED_BUNDLE_RUN_ID_PREFIX}-"
+            f"{_now_iso().replace(':', '').replace('-', '')}"
+        )
+        write_blocked_bundle(
+            global_store,
+            run_id=run_id,
+            run_type=EVALUATE_BLOCKED_BUNDLE_RUN_TYPE,
+            blockers=blockers,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"metacrucible: failed to write evaluate BLOCKED "
+            f"bundle: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+
+
 def _write_baseline_blocked_bundle(
     *, blockers: list[dict[str, Any]]
 ) -> None:
@@ -2864,6 +2977,288 @@ def cmd_baseline_create(args: argparse.Namespace) -> int:
     _emit(payload, as_json=args.json)
     return EXIT_OK
 
+def _aggregate_case_verdicts(
+    case_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Aggregate per-case verdicts into the top-level execution verdict.
+
+    Duplicates the ~15 lines of aggregation in
+    :func:`_run_execution_evaluation` (the F1 review's
+    execution branch) so the ``evaluate`` subcommand can
+    produce a stable per-split verdict without going through
+    the F1 review's static-review / execution evaluation
+    composition. BLOCKED > FAILED > PASS precedence is
+    preserved; per-case blockers are rolled up into the
+    BLOCKED status payload so the operator sees which case
+    blocked and why.
+    """
+    any_blocked = any(
+        r["status"] == REVIEW_CASE_STATUS_BLOCKED
+        for r in case_results
+    )
+    any_failed = any(
+        r["status"] == REVIEW_CASE_STATUS_FAIL
+        for r in case_results
+    )
+    cases_evaluated = len(case_results)
+    cases_passed = sum(
+        1 for r in case_results
+        if r["status"] == REVIEW_CASE_STATUS_PASS
+    )
+    cases_failed = sum(
+        1 for r in case_results
+        if r["status"] == REVIEW_CASE_STATUS_FAIL
+    )
+    if any_blocked:
+        # Roll up the per-case blockers so the operator
+        # sees which case blocked and why. Mirrors the
+        # rollup in :func:`_run_execution_evaluation`.
+        blockers: list[dict[str, Any]] = []
+        for r in case_results:
+            if r["status"] != REVIEW_CASE_STATUS_BLOCKED:
+                continue
+            case_id = r.get("case_id") or "?"
+            for blocker in r.get("blockers", []):
+                if not isinstance(blocker, dict):
+                    continue
+                blockers.append(
+                    {
+                        "id": blocker.get("id", "?"),
+                        "message": blocker.get("message", ""),
+                        "case_id": case_id,
+                    }
+                )
+        return {
+            "status": EXECUTION_STATUS_BLOCKED,
+            "cases_evaluated": cases_evaluated,
+            "cases_passed": cases_passed,
+            "cases_failed": cases_failed,
+            "blockers": blockers,
+        }
+    if any_failed:
+        return {
+            "status": EXECUTION_STATUS_FAIL,
+            "cases_evaluated": cases_evaluated,
+            "cases_passed": cases_passed,
+            "cases_failed": cases_failed,
+            "blockers": [],
+        }
+    return {
+        "status": EXECUTION_STATUS_PASS,
+        "cases_evaluated": cases_evaluated,
+        "cases_passed": cases_passed,
+        "cases_failed": cases_failed,
+        "blockers": [],
+    }
+
+
+def cmd_evaluate(args: argparse.Namespace) -> int:
+    """Run the ``evaluate`` subcommand; return the process exit code.
+
+    The contract (Issue #32 / ADR 0029):
+
+      - Resolves the workspace path and discovers the
+        benchmark state via :func:`_discover_benchmark_state`.
+        A missing ``benchmark.jsonl`` is BLOCKED (precondition
+        failure) with the :data:`EVALUATE_BENCHMARK_MISSING_BLOCKER`
+        id, not SKIPPED + warning like the F1 review flow;
+        ``evaluate`` is a support command whose explicit purpose
+        is evaluation, so a missing benchmark is a hard
+        precondition failure.
+      - Loads the benchmark through :func:`metacrucible.benchmark.load_benchmark`.
+        Loader-supplied blockers (schema mismatch, duplicate ids,
+        missing required reviewed cases, pending generated) are
+        propagated verbatim and the run BLOCKS. The ``evaluate``
+        category is in the ADR 0035 emitting matrix so the
+        BLOCKED bundle is written before returning.
+      - Filters the eligible cases by ``args.split``:
+        :data:`SPLIT_ALL` runs eval + held_out,
+        :data:`SPLIT_EVAL` runs only the eval partition, and
+        :data:`SPLIT_HELD_OUT` runs only the held-out partition.
+        Generated / disabled / non-matching-split cases are
+        never evaluated (ADR 0029 partitions are preserved).
+      - Evaluates each selected case via
+        :func:`_evaluate_single_case`; aggregates per-case
+        verdicts through :func:`_aggregate_case_verdicts` with
+        BLOCKED > FAILED > PASS precedence.
+      - On BLOCKED, writes the ADR 0035 ``evaluate`` evidence
+        bundle via :func:`_write_evaluate_blocked_bundle` so the
+        receipt lineage carries the "we could not proceed"
+        record alongside the in-memory payload. The bundle
+        write is best-effort (a failure logs to stderr; the
+        in-memory verdict still wins).
+      - On FAILED, the run executed and surfaced a real verdict;
+        the BLOCKED bundle is NOT written (the FAILED outcome
+        is not a "we could not proceed" condition).
+      - The command never mutates the workspace (no benchmark
+        / envelope / artifact / state writes). Evidence is
+        written only to the user-global store, mirroring
+        ``review``'s read-only contract.
+      - Exit codes follow the central matrix: PASS maps to
+        :data:`EXIT_OK`; FAILED and BLOCKED both map to
+        :data:`EXIT_BLOCKED` (the existing matrix has no
+        separate FAILED code; the negative outcome is
+        observable from the JSON ``status`` field, and the
+        ``blockers`` / ``cases_failed`` fields carry the
+        detail).
+    """
+    from .benchmark import load_benchmark
+
+    workspace = Path(args.workspace).resolve()
+    benchmark_state = _discover_benchmark_state(workspace)
+
+    # Precondition 1: missing benchmark is BLOCKED for
+    # ``evaluate``. Unlike ``review`` (which treats a missing
+    # benchmark as a static+warning path), ``evaluate`` is a
+    # support command whose explicit purpose is evaluation; a
+    # missing benchmark is a hard precondition failure.
+    if not benchmark_state["present"]:
+        blockers: list[dict[str, Any]] = [
+            {
+                "id": EVALUATE_BENCHMARK_MISSING_BLOCKER,
+                "message": (
+                    f"benchmark file {benchmark_state['path']} "
+                    f"does not exist; run ``metacrucible init "
+                    f"{workspace}`` first"
+                ),
+            }
+        ]
+        _write_evaluate_blocked_bundle(blockers=blockers)
+        payload: dict[str, Any] = {
+            "status": "BLOCKED",
+            "workspace": str(workspace),
+            "benchmark_path": str(benchmark_state["path"]),
+            "benchmark": dict(benchmark_state),
+            "split": args.split,
+            "cases_evaluated": 0,
+            "cases_passed": 0,
+            "cases_failed": 0,
+            "case_results": [],
+            "blockers": blockers,
+        }
+        _emit(payload, as_json=args.json)
+        return EXIT_BLOCKED
+
+    # Precondition 2: loader-supplied blockers gate the run.
+    # Every loader blocker is propagated; the ``evaluate``
+    # command never invents its own verdict when the loader
+    # already explained why the benchmark is not runnable.
+    load_result = load_benchmark(benchmark_state["path"])
+    loader_blockers: list[dict[str, Any]] = [
+        dict(b) for b in load_result.blockers
+        if isinstance(b, dict) and isinstance(b.get("id"), str)
+    ]
+    if loader_blockers:
+        _write_evaluate_blocked_bundle(blockers=loader_blockers)
+        payload = {
+            "status": "BLOCKED",
+            "workspace": str(workspace),
+            "benchmark_path": str(benchmark_state["path"]),
+            "benchmark": dict(benchmark_state),
+            "split": args.split,
+            "cases_evaluated": 0,
+            "cases_passed": 0,
+            "cases_failed": 0,
+            "case_results": [],
+            "blockers": loader_blockers,
+        }
+        _emit(payload, as_json=args.json)
+        return EXIT_BLOCKED
+
+    # Precondition 3: split filter. ``SPLIT_ALL`` evaluates
+    # eval + held_out (mirrors :func:`_run_execution_evaluation`);
+    # the per-split choices evaluate only the matching
+    # partition. The three branches are an explicit if/elif
+    # (not a dict dispatch) so the loader's eligible list is
+    # the single source of truth for what is eligible.
+    if args.split == SPLIT_ALL:
+        selected_cases: list[dict[str, Any]] = list(
+            load_result.eligible_eval_cases
+        ) + list(load_result.eligible_held_out_cases)
+    elif args.split == SPLIT_EVAL:
+        selected_cases = list(load_result.eligible_eval_cases)
+    elif args.split == SPLIT_HELD_OUT:
+        selected_cases = list(
+            load_result.eligible_held_out_cases
+        )
+    else:
+        # Argparse already constrains ``--split`` to the three
+        # pinned values; this branch is defensive only.
+        selected_cases = []
+
+    if not selected_cases:
+        blockers = [
+            {
+                "id": EVALUATE_NO_ELIGIBLE_CASES_BLOCKER,
+                "message": (
+                    f"no eligible reviewed cases in split "
+                    f"{args.split!r} (ADR 0029); the "
+                    f"benchmark has no cases for the "
+                    f"requested partition"
+                ),
+            }
+        ]
+        _write_evaluate_blocked_bundle(blockers=blockers)
+        payload = {
+            "status": "BLOCKED",
+            "workspace": str(workspace),
+            "benchmark_path": str(benchmark_state["path"]),
+            "benchmark": dict(benchmark_state),
+            "split": args.split,
+            "cases_evaluated": 0,
+            "cases_passed": 0,
+            "cases_failed": 0,
+            "case_results": [],
+            "blockers": blockers,
+        }
+        _emit(payload, as_json=args.json)
+        return EXIT_BLOCKED
+
+    # Per-case evaluation. The dispatcher is the existing
+    # :func:`_evaluate_single_case` so ``evaluate`` shares the
+    # deterministic check engine and the judgment path the F1
+    # review uses; the contract is the same set of per-case
+    # verdicts (``PASS`` / ``FAIL`` / ``BLOCKED``).
+    case_results = [
+        _evaluate_single_case(case) for case in selected_cases
+    ]
+
+    # Aggregate per-case verdicts. BLOCKED > FAILED > PASS.
+    aggregation = _aggregate_case_verdicts(case_results)
+
+    # On a BLOCKED aggregation, the per-case blockers are the
+    # "we could not proceed" record; the BLOCKED bundle is the
+    # evidence. On FAILED, the run executed end-to-end and the
+    # verdict is a real failure -- no BLOCKED bundle, mirroring
+    # the F1 review's contract.
+    if aggregation["status"] == EXECUTION_STATUS_BLOCKED:
+        _write_evaluate_blocked_bundle(
+            blockers=aggregation["blockers"]
+        )
+
+    payload = {
+        "status": aggregation["status"],
+        "workspace": str(workspace),
+        "benchmark_path": str(benchmark_state["path"]),
+        "benchmark": dict(benchmark_state),
+        "split": args.split,
+        "cases_evaluated": aggregation["cases_evaluated"],
+        "cases_passed": aggregation["cases_passed"],
+        "cases_failed": aggregation["cases_failed"],
+        "case_results": case_results,
+        "blockers": aggregation["blockers"],
+    }
+    _emit(payload, as_json=args.json)
+
+    # Exit code: PASS -> EXIT_OK; FAILED / BLOCKED -> EXIT_BLOCKED.
+    # The existing exit-code matrix has no separate FAILED code;
+    # the negative outcome is observable from the JSON ``status``
+    # field and the ``blockers`` / ``cases_failed`` fields.
+    if aggregation["status"] == EXECUTION_STATUS_PASS:
+        return EXIT_OK
+    return EXIT_BLOCKED
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point for the ``metacrucible`` console script.
 
@@ -2914,6 +3309,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_optimize(args)
         if getattr(args, "command", None) == "baseline":
             return cmd_baseline(args)
+        if getattr(args, "command", None) == "evaluate":
+            return cmd_evaluate(args)
         return EXIT_OK
     except Exception as exc:  # noqa: BLE001 - exit-code firewall
         # Catch-all so an uncaught command-handler bug still

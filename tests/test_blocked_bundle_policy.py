@@ -1007,3 +1007,28 @@ def test_helper_receipt_summary_trajectory_are_source_of_truth(
     ]
     assert "raw_events" not in trajectory
     assert "transcript" not in trajectory
+
+
+# --------------------------------------------------------------------------- #
+# ACG-6r / Issue #35: blocked_bundles.py is unchanged by this issue.       #
+# --------------------------------------------------------------------------- #
+
+def test_acg6r_does_not_edit_blocked_bundles() -> None:
+    """ACG-6r / Issue #35: blocked_bundles.py is bundle-emission
+    policy, NOT a blocker-id registry. Issue #35 must not
+    touch it. This test pins the file's bytes against HEAD.
+    """
+    import subprocess
+    blocked_path = "src/metacrucible/blocked_bundles.py"
+    head_proc = subprocess.run(
+        ["git", "show", f"HEAD:{blocked_path}"],
+        capture_output=True,
+        check=True,
+        cwd=".",
+    )
+    head_bytes = head_proc.stdout
+    current_bytes = Path(blocked_path).read_bytes()
+    assert current_bytes == head_bytes, (
+        f"blocked_bundles.py must not be modified by Issue #35; "
+        f"diff between HEAD and working tree detected"
+    )

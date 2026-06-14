@@ -2178,7 +2178,21 @@ def run_optimizer_pipeline(
                 baseline_held_out=baseline_held_out_results,
                 candidate_held_out=candidate_held_out_results,
             )
-            acceptance_decision = decision
+            # ACG-5r / Issue #35: always wrap the verdict in a
+            # nested structure so callers can read
+            # ``acceptance_decision["comparator"]`` and
+            # ``acceptance_decision["profiles"]`` regardless of
+            # accept/reject. The accept branch below overrides
+            # the profiles sub-dict with a real profile verdict.
+            acceptance_decision = {
+                "comparator": decision,
+                "profiles": {
+                    "accepted": True,
+                    "blockers": [],
+                    "supplemental_findings": [],
+                    "not_evaluated": True,
+                },
+            }
             if decision["accepted"]:
                 # ACG-5r / Issue #35: after the comparator accepts,
                 # run triggered static-review profiles against the
@@ -2199,10 +2213,7 @@ def run_optimizer_pipeline(
                     # Build the shared review_input from the
                     # post-apply candidate text plus the routing
                     # surface of the selected suggestions.
-                    review_body = _candidate_body_for_review(
-                        artifact_kind=context.artifact_kind,
-                        candidate_text=candidate_text,
-                    )
+                    review_body = candidate_text
                     review_input: dict[str, Any] = {
                         "body": review_body,
                         "routing_changes": [

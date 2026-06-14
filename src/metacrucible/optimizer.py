@@ -52,7 +52,11 @@ from .artifact import (
 )
 from .benchmark import BenchmarkResult, load_benchmark
 from .profiles import (
+    BUILTIN_PROFILES,
     ROUTING_SURFACE_CAP,
+    evaluate_acceptance,
+    evaluate_profile_specs,
+    select_triggers,
 )
 from .provider_config import (
     STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER,
@@ -1370,19 +1374,27 @@ def _eval_split_fail_or_blocked_count(
     return count
 
 
-def _new_fail_or_blocked_case_ids(
+def _held_out_pass_to_fail_case_ids(
     baseline: Sequence[Mapping[str, Any]],
     candidate: Sequence[Mapping[str, Any]],
 ) -> list[str]:
-    """Return held-out ``case_id``s that newly FAIL/BLOCKED in the candidate.
+    """Return held-out ``case_id``s with a binary ``PASS`` -> ``FAIL`` regression.
 
     ``baseline`` / ``candidate`` are the per-case verdicts of
     the held-out split for the baseline and candidate
     artifact. The function returns the sorted list of
-    case_ids whose status is ``FAIL`` or ``BLOCKED`` in the
-    candidate but not in the baseline (i.e. the candidate
-    introduced a new regression). An empty list is the
-    "zero new regression" condition required for acceptance.
+    ``case_id``s whose baseline status was exactly ``"PASS"``
+    and whose candidate status is exactly ``"FAIL"``. This is
+    the strict binary transition guard pinned by ACG-2r /
+    Issue #35: only an explicit per-case ``PASS`` -> ``FAIL``
+    flip in the held-out split is load-bearing as a
+    regression. ``BLOCKED`` -> ``FAIL``, ``PASS`` ->
+    ``BLOCKED``, and cases missing from one side are NOT
+    regressions (no transition occurred). Cases with a
+    non-string ``case_id`` or non-string ``status`` are
+    ignored so a missing stable ``case_id`` cannot create a
+    false positive. An empty list is the "zero held-out
+    regression" condition required for acceptance.
     """
     base_statuses: dict[str, str] = {}
     for r in baseline:
@@ -1400,11 +1412,65 @@ def _new_fail_or_blocked_case_ids(
         status = r.get("status")
         if not isinstance(cid, str) or not isinstance(status, str):
             continue
-        if status in ("FAIL", "BLOCKED") and base_statuses.get(cid) not in (
-            "FAIL", "BLOCKED"
-        ):
+        # Binary transition guard: only PASS -> FAIL flips
+        # count as a held-out regression. Any other state
+        # delta (BLOCKED -> FAIL, PASS -> BLOCKED,
+        # FAIL -> BLOCKED, missing baseline, missing
+        # candidate) is NOT a regression.
+        if status == "FAIL" and base_statuses.get(cid) == "PASS":
             out.add(cid)
     return sorted(out)
+
+
+def _eval_split_transitions(
+    baseline: Sequence[Mapping[str, Any]],
+    candidate: Sequence[Mapping[str, Any]],
+) -> tuple[list[str], list[str]]:
+    """Return ``(fail_to_pass_case_ids, pass_to_fail_case_ids)``.
+
+    Issue #35 / ADR 0012 require a per-case binary transition
+    comparator for the eval split: the candidate is accepted
+    only when at least one ``case_id`` flipped ``FAIL`` ->
+    ``PASS`` AND no ``case_id`` flipped ``PASS`` -> ``FAIL``.
+    This helper returns those two sorted lists.
+
+    The transition is per ``case_id``: a case is a
+    ``FAIL`` -> ``PASS`` transition iff the baseline status
+    for that ``case_id`` was exactly ``"FAIL"`` and the
+    candidate status for the same ``case_id`` is exactly
+    ``"PASS"``. ``BLOCKED`` -> ``PASS`` is NOT a
+    ``FAIL`` -> ``PASS`` transition (per Issue #35: only an
+    explicit per-case ``FAIL`` -> ``PASS`` counts as the
+    eval-gain signal). Cases present in only one split are
+    ignored; the comparator keys on pairs.
+    """
+    base_map: dict[str, str] = {}
+    for r in baseline:
+        if not isinstance(r, Mapping):
+            continue
+        cid = r.get("case_id")
+        status = r.get("status")
+        if isinstance(cid, str) and isinstance(status, str):
+            base_map[cid] = status
+    cand_map: dict[str, str] = {}
+    for r in candidate:
+        if not isinstance(r, Mapping):
+            continue
+        cid = r.get("case_id")
+        status = r.get("status")
+        if isinstance(cid, str) and isinstance(status, str):
+            cand_map[cid] = status
+    fail_to_pass: set[str] = set()
+    pass_to_fail: set[str] = set()
+    for cid, base_status in base_map.items():
+        cand_status = cand_map.get(cid)
+        if cand_status is None:
+            continue
+        if base_status == "FAIL" and cand_status == "PASS":
+            fail_to_pass.add(cid)
+        elif base_status == "PASS" and cand_status == "FAIL":
+            pass_to_fail.add(cid)
+    return sorted(fail_to_pass), sorted(pass_to_fail)
 
 
 def compare_eval_held_out(
@@ -1414,23 +1480,65 @@ def compare_eval_held_out(
     baseline_held_out: Sequence[Mapping[str, Any]],
     candidate_held_out: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Run the OPT-6 acceptance comparator.
+    """Run the OPT-6 acceptance comparator (Issue #35 / ADR 0012).
 
-    Returns a dict with the boolean ``accepted`` flag, the
-    baseline / candidate FAIL+BLOCKED counts, the list of
-    newly-failing held-out case ids, and a stable reason
-    string for the verdict (machine-readable: ``"accepted"``
-    / ``"eval_no_improvement"`` / ``"held_out_regression"``).
+    Acceptance criteria (per Issue #35 / ADR 0012):
+
+      - At least one explicit per-case ``FAIL`` -> ``PASS``
+        transition in the eval split (``BLOCKED`` -> ``PASS``
+        alone is NOT a valid eval-gain signal).
+      - Zero explicit per-case ``PASS`` -> ``FAIL`` transitions
+        in the eval split (a regressing ``case_id`` blocks the
+        candidate regardless of aggregate counts).
+      - Zero per-case ``PASS`` -> ``FAIL`` transitions in
+        the held-out split vs the baseline (held-out guard,
+        ACG-2r). A ``BLOCKED`` -> ``FAIL`` or missing-side
+        delta is NOT a regression. Cases without a stable
+        ``case_id`` are ignored (no false positives).
+
+    The function returns a dict with the boolean ``accepted``
+    flag, the baseline / candidate eval-split FAIL+BLOCKED
+    counts (kept for audit / backward compatibility), the list
+    of newly-failing held-out case ids, the sorted
+    ``eval_fail_to_pass_case_ids`` / ``eval_pass_to_fail_case_ids``
+    transition lists (machine-readable), and a stable reason
+    string for the verdict. The reason is one of:
+
+      - ``"accepted"`` — all three criteria pass.
+      - ``"eval_regression"`` — at least one per-case
+        ``PASS`` -> ``FAIL`` transition in the eval split.
+        This is the most specific rejection signal (a
+        regressing case blocks acceptance even when an
+        improvement is also present).
+      - ``"eval_no_improvement"`` — zero per-case
+        ``FAIL`` -> ``PASS`` transitions in the eval split
+        (including the ``BLOCKED`` -> ``PASS``-only case).
+      - ``"held_out_regression"`` — held-out guard tripped
+        (the candidate introduced a per-case ``PASS`` ->
+        ``FAIL`` transition vs the baseline).
     """
     base_eval_count = _eval_split_fail_or_blocked_count(baseline_eval)
     cand_eval_count = _eval_split_fail_or_blocked_count(candidate_eval)
-    new_held_out_ids = _new_fail_or_blocked_case_ids(
+    fail_to_pass_ids, pass_to_fail_ids = _eval_split_transitions(
+        baseline_eval, candidate_eval
+    )
+    new_held_out_ids = _held_out_pass_to_fail_case_ids(
         baseline_held_out, candidate_held_out
     )
-    eval_improved = cand_eval_count < base_eval_count
+    eval_improved = bool(fail_to_pass_ids)
+    eval_no_regression = not pass_to_fail_ids
     held_out_clean = not new_held_out_ids
-    accepted = bool(eval_improved) and bool(held_out_clean)
-    if not eval_improved:
+    accepted = bool(eval_improved) and bool(eval_no_regression) and bool(
+        held_out_clean
+    )
+    if pass_to_fail_ids:
+        # Per-case PASS->FAIL regression is the most specific
+        # reason: report it before the secondary
+        # no-improvement or held-out verdict so an operator
+        # can act on the regressing case_id without first
+        # scanning the held-out side.
+        reason = "eval_regression"
+    elif not eval_improved:
         reason = "eval_no_improvement"
     elif not held_out_clean:
         reason = "held_out_regression"
@@ -1442,6 +1550,9 @@ def compare_eval_held_out(
         "baseline_eval_fail_blocked_count": base_eval_count,
         "candidate_eval_fail_blocked_count": cand_eval_count,
         "new_held_out_fail_blocked_case_ids": new_held_out_ids,
+        "held_out_pass_to_fail_case_ids": new_held_out_ids,
+        "eval_fail_to_pass_case_ids": fail_to_pass_ids,
+        "eval_pass_to_fail_case_ids": pass_to_fail_ids,
     }
 
 
@@ -2069,6 +2180,112 @@ def run_optimizer_pipeline(
             )
             acceptance_decision = decision
             if decision["accepted"]:
+                # ACG-5r / Issue #35: after the comparator accepts,
+                # run triggered static-review profiles against the
+                # candidate artifact and aggregate through
+                # evaluate_acceptance. A triggered BLOCKING profile
+                # that FAILs / BLOCKs (e.g. secret-privacy-risk on a
+                # candidate body that carries AKIAIOSFODNN7EXAMPLE)
+                # must flip the run to BLOCKED, roll back the
+                # artifact, and append an optimize_blocked event so
+                # the audit lineage captures the profile-blocker
+                # cause rather than silently committing an unsafe
+                # candidate.
+                routing_touched = any(s.routing for s in selected)
+                triggered_specs = select_triggers(
+                    routing_touched=routing_touched,
+                )
+                if triggered_specs:
+                    # Build the shared review_input from the
+                    # post-apply candidate text plus the routing
+                    # surface of the selected suggestions.
+                    review_body = _candidate_body_for_review(
+                        artifact_kind=context.artifact_kind,
+                        candidate_text=candidate_text,
+                    )
+                    review_input: dict[str, Any] = {
+                        "body": review_body,
+                        "routing_changes": [
+                            {
+                                "field": s.routing_field,
+                                "new": s.replacement,
+                            }
+                            for s in selected
+                            if s.routing and s.routing_field
+                        ],
+                        "human_confirmed": bool(
+                            context.human_confirmed
+                        ),
+                        "portability": {"target": "runtime_neutral"},
+                        "reviewed_fake_secrets": (),
+                    }
+                    profile_results = evaluate_profile_specs(
+                        triggered_specs, review_input
+                    )
+                    profile_specs_map: dict[str, Any] = {
+                        spec.id: spec for spec in triggered_specs
+                    }
+                    profile_verdict = evaluate_acceptance(
+                        profile_results,
+                        profile_specs=profile_specs_map,
+                    )
+                else:
+                    profile_verdict = {
+                        "accepted": True,
+                        "blockers": [],
+                        "supplemental_findings": [],
+                    }
+                acceptance_decision = {
+                    "comparator": decision,
+                    "profiles": profile_verdict,
+                }
+                # Profile acceptance is the union of the
+                # comparator's verdict and the profile verdict:
+                # a non-accept on either side BLOCKs the run.
+                profile_accepted = bool(
+                    profile_verdict.get("accepted", True)
+                )
+                if not profile_accepted:
+                    profile_blockers: list[dict[str, str]] = list(
+                        profile_verdict.get("blockers", []) or []
+                    )
+                    if profile_blockers:
+                        blockers.extend(profile_blockers)
+                    else:
+                        blockers.append({
+                            "id": "static-review-profile-blocked",
+                            "message": (
+                                "triggered static-review profile "
+                                "returned non-PASS verdict; see "
+                                "acceptance_decision.profiles for "
+                                "per-profile details"
+                            ),
+                        })
+                    # Profile-side BLOCKED: roll back the
+                    # candidate write so the on-disk artifact is
+                    # the pre-run bytes, and break out of the
+                    # round loop with BLOCKED status.
+                    if rollback_paths:
+                        p, saved = rollback_paths.pop()
+                        _rollback_artifact_text(
+                            base_artifact_path=p, saved_text=saved
+                        )
+                    accepted_status = "BLOCKED"
+                    _append_history(
+                        repo,
+                        {
+                            "event": "optimize_blocked",
+                            "run_id": context.run_id,
+                            "round_id": round_id,
+                            "blockers": list(profile_blockers) or list(
+                                profile_verdict.get(
+                                    "blockers", []
+                                ) or []
+                            ),
+                            "timestamp": _now_iso(),
+                        },
+                    )
+                    break
                 accepted_status = "ACCEPTED"
                 best_revision = {
                     "run_id": context.run_id,

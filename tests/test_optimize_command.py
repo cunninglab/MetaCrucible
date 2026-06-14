@@ -1594,6 +1594,162 @@ def test_optimize_stale_base_hash_blocks_before_disk_write() -> None:
     )
 
 
+def test_optimize_stale_base_hash_blocks_in_selected_conflict_path() -> None:
+    """ACG-4r / Issue #35 AC4 selected-path regression: the
+    :func:`metacrucible.optimizer._run_conflict_checks`
+    aggregator must emit the canonical
+    :data:`STALE_BASE_HASH_BLOCKER` blocker id when a
+    *selected* :class:`EditSuggestion`'s ``base_hash`` no
+    longer matches the parser-owned
+    :data:`MutableRange.content_hash` of its target range.
+
+    The test pins the conflict-checks aggregator path
+    (selected-branch) without driving the full pipeline so
+    the regression check is independent of the upstream
+    suggestion-deduplication / rank-clip stages. A future
+    wave that reorders or replaces the aggregator must
+    keep :data:`STALE_BASE_HASH_BLOCKER` in the returned
+    blockers list for a stale-base selected suggestion so
+    downstream reports branching on the id keep working
+    unchanged.
+
+    The artifact on disk must remain untouched: the test
+    calls the aggregator directly, so no pipeline apply /
+    rollback path runs and the seeded bytes are preserved
+    (a real byte-for-byte preservation, not a no-op).
+    """
+    import hashlib
+
+    from metacrucible.optimizer import (
+        STALE_BASE_HASH_BLOCKER,
+        EditSuggestion,
+        _run_conflict_checks,
+        build_optimizer_context,
+    )
+
+    workspace = _tmp_workspace()
+    benchmark = workspace / BENCHMARK_FILE_NAME
+    artifact = _opt9_seed_artifact(workspace)
+    _opt9_seed_envelope(workspace, artifact)
+    _write_jsonl(
+        benchmark,
+        [
+            _metadata_record(),
+            _reviewed_case("eval-1", split="eval"),
+            _reviewed_case("held-1", split="held_out"),
+        ],
+    )
+
+    context = build_optimizer_context(
+        workspace=workspace,
+        benchmark_path=benchmark,
+        artifact_path=artifact,
+        max_rounds=1,
+        human_confirmed=False,
+    )
+    # Sanity: the canonical body hash from the parser-owned
+    # mutable range is what _run_conflict_checks will
+    # compare against via _check_stale_base_hash.
+    assert context.mutable_ranges, (
+        "test fixture invariant: build_optimizer_context "
+        "must expose at least one mutable range for the "
+        "OPT-9 Skill fixture; got mutable_ranges="
+        f"{list(context.mutable_ranges)!r}"
+    )
+    canonical_body_hash = context.mutable_ranges[0].content_hash
+
+    # A deliberately stale base_hash that mismatches the
+    # parser-owned content_hash so the aggregator must
+    # flag the suggestion. The hash is sha256 of a fixed
+    # 64-byte sentinel that is never the OPT-9 body.
+    stale_base_hash = hashlib.sha256(
+        b"definitely-not-the-OPT-9-body"
+    ).hexdigest()
+    assert stale_base_hash != canonical_body_hash, (
+        "test fixture invariant: the stale base_hash must "
+        "differ from the canonical body_hash; got "
+        f"stale={stale_base_hash!r} canonical="
+        f"{canonical_body_hash!r}"
+    )
+
+    stale_suggestion = EditSuggestion(
+        record_type="edit_suggestion",
+        suggestion_id="acg4r-selected-stale",
+        run_id=context.run_id,
+        round_id="round-acg4r-selected",
+        timestamp="2026-01-01T00:00:00Z",
+        range_id=0,
+        base_hash=stale_base_hash,
+        intent="acg4r_selected_path_regression",
+        replacement="",
+        rationale="",
+        routing=False,
+        human_confirmed=False,
+        routing_field="",
+    )
+
+    before_bytes = artifact.read_bytes()
+
+    # Drive the aggregator directly. _run_conflict_checks
+    # fans out to the five OPT-5 conflict checks
+    # (_check_stale_base_hash, _check_routing_violations,
+    # _check_range_overlap, _check_supported_ranges,
+    # _check_budget_violations) and returns the union of
+    # their blockers. The stale-base check is the only one
+    # expected to fire in this fixture (single non-routing
+    # suggestion on a supported range, under the per-round
+    # budget).
+    conflict_blockers = _run_conflict_checks(
+        [stale_suggestion], context
+    )
+
+    after_bytes = artifact.read_bytes()
+
+    # ACG-4r #1: the aggregator must surface the canonical
+    # STALE_BASE_HASH_BLOCKER id when the selected
+    # suggestion's base_hash has drifted.
+    stale_blockers = [
+        b for b in conflict_blockers
+        if isinstance(b, dict)
+        and b.get("id") == STALE_BASE_HASH_BLOCKER
+    ]
+    assert stale_blockers, (
+        f"_run_conflict_checks must emit the "
+        f"{STALE_BASE_HASH_BLOCKER!r} blocker id for a "
+        f"selected EditSuggestion whose base_hash drifted "
+        f"from the parser-owned content_hash; got "
+        f"conflict_blockers={conflict_blockers!r}"
+    )
+
+    # ACG-4r #2: the artifact on disk must be byte-for-byte
+    # unchanged. The aggregator runs in step 3e of the
+    # pipeline BEFORE apply; the test calls it directly
+    # so no apply / rollback path runs. The seeded bytes
+    # are preserved (a real byte-for-byte check, not a
+    # no-op).
+    assert after_bytes == before_bytes, (
+        f"calling _run_conflict_checks directly must NOT "
+        f"mutate the artifact; before={before_bytes!r} "
+        f"after={after_bytes!r}"
+    )
+
+    # Sanity: the returned blocker message must reference
+    # the suggestion_id and the drifted base_hash so a
+    # downstream report can attribute the block to the
+    # exact selection without re-reading the context.
+    stale_message = stale_blockers[0].get("message", "")
+    assert (
+        "acg4r-selected-stale" in stale_message
+    ), (
+        f"the stale-base blocker message must reference "
+        f"the suggestion_id; got message={stale_message!r}"
+    )
+    assert stale_base_hash in stale_message, (
+        f"the stale-base blocker message must reference "
+        f"the drifted base_hash; got message={stale_message!r}"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # BLK-2 — OPT-6 ACCEPTED-path regression test                                 #
 # --------------------------------------------------------------------------- #
@@ -1761,6 +1917,426 @@ def test_optimize_pipeline_accepted_path() -> None:
     ]
     assert accepted_events, (
         f"accepted run must append an optimize_accepted "
+        f"history event; got events="
+        f"{[r.get('event') for r in records]!r}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# ACG-3r / Issue #35: pipeline-level acceptance/rejection end-to-end        #
+# --------------------------------------------------------------------------- #
+
+def test_optimize_pipeline_rejects_eval_pass_to_fail_and_rolls_back() -> None:
+    """ACG-3r / Issue #35 AC2: a candidate whose eval-split
+    introduces a per-case ``PASS`` -> ``FAIL`` transition
+    must be REJECTED, the artifact rolled back to the
+    pre-run bytes, and the regressing ``case_id`` must
+    surface in ``acceptance_decision.eval_pass_to_fail_case_ids``
+    with ``reason == "eval_regression"``.
+
+    The comparator verdict is the most specific rejection
+    signal: a regressing ``case_id`` in the eval split
+    blocks the candidate even when the held-out side is
+    clean. The pipeline end-to-end must:
+      1. Apply the candidate (write to disk).
+      2. Evaluate the candidate (read from disk).
+      3. Call :func:`compare_eval_held_out` and obtain
+         ``reason == "eval_regression"``.
+      4. Roll back to the pre-run bytes (no commit).
+      5. Persist ``acceptance_decision`` with the new
+         ``eval_pass_to_fail_case_ids`` list.
+      6. Append an ``optimize_rejected`` history event.
+
+    Test mechanics:
+      - The seeded body contains
+        ``ACG3R_EVAL_PASS_TO_FAIL_SEED`` so baseline
+        ``eval-1`` returns ``PASS``.
+      - The candidate's replacement drops the marker, so
+        candidate ``eval-1`` returns ``FAIL`` (a per-case
+        ``PASS`` -> ``FAIL`` transition).
+      - ``held-1`` always returns ``PASS`` so the held-out
+        side stays clean (the rejection must be driven by
+        the eval side, not the held-out side).
+    """
+    import hashlib
+
+    from metacrucible.optimizer import run_optimizer_pipeline
+
+    workspace = _tmp_workspace()
+    benchmark = workspace / BENCHMARK_FILE_NAME
+    artifact = _opt9_skill_artifact_path(workspace)
+    # Seed: body carries the ACG-3r eval pass-to-fail marker
+    # so the baseline eval returns PASS for ``eval-1``. The
+    # candidate drops the marker so the candidate eval
+    # returns FAIL (a per-case PASS -> FAIL transition).
+    seed_marker_line = "ACG3R_EVAL_PASS_TO_FAIL_SEED\n"
+    seed_body = _opt9_body_text() + seed_marker_line
+    artifact.write_text(
+        "---\n"
+        "name: opt9-skill\n"
+        "description: ACG-3r eval pass-to-fail fixture\n"
+        "---\n" + seed_body,
+        encoding="utf-8",
+    )
+    _opt9_seed_envelope(workspace, artifact)
+    _write_jsonl(
+        benchmark,
+        [
+            _metadata_record(),
+            _reviewed_case("eval-1", split="eval"),
+            _reviewed_case("held-1", split="held_out"),
+        ],
+    )
+    # The body hash is what the parser-owned content_hash
+    # uses for ``range_id=0``; the call_fn must echo it
+    # back as ``base_hash`` so the suggestion is not
+    # rejected as stale-base.
+    seed_body_hash = hashlib.sha256(
+        seed_body.encode("utf-8")
+    ).hexdigest()
+    pre_run_bytes = artifact.read_bytes()
+
+    def _pass_to_fail_call_fn(
+        *, repair_context: Any = None
+    ) -> dict[str, Any]:
+        return {
+            "rationale": (
+                "ACG-3r eval pass-to-fail: candidate drops "
+                "the baseline-pass marker so eval-1 regresses"
+            ),
+            "suggested_edits": [
+                {
+                    "range_id": 0,
+                    "base_hash": seed_body_hash,
+                    "intent": "remove_pass_to_fail_marker",
+                    "replacement": _opt9_body_text(),
+                    "rationale": (
+                        "candidate body drops the seed "
+                        "marker"
+                    ),
+                    "routing": False,
+                }
+            ],
+        }
+
+    def _pass_to_fail_eval_call_fn(
+        case: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        case_id = case.get("case_id", "")
+        artifact_text = artifact.read_text(encoding="utf-8")
+        if case_id == "eval-1":
+            # PASS iff the seed marker is present; the
+            # candidate drops it so eval-1 regresses.
+            if "ACG3R_EVAL_PASS_TO_FAIL_SEED" in artifact_text:
+                return {"status": "PASS", "case_id": case_id}
+            return {"status": "FAIL", "case_id": case_id}
+        # Held-out case: always PASS (no held-out
+        # regression; the rejection must be driven by
+        # the eval-side PASS -> FAIL transition).
+        return {"status": "PASS", "case_id": case_id}
+
+    result = run_optimizer_pipeline(
+        workspace=workspace,
+        benchmark_path=benchmark,
+        artifact_path=artifact,
+        call_fn=_pass_to_fail_call_fn,
+        max_rounds=1,
+        human_confirmed=False,
+        eval_call_fn=_pass_to_fail_eval_call_fn,
+    )
+
+    # The pipeline must REJECT (eval-side regression is
+    # the most specific rejection signal).
+    assert result.status == "REJECTED", (
+        f"eval-split PASS->FAIL transition on eval-1 "
+        f"must REJECT the candidate; got "
+        f"status={result.status!r} "
+        f"acceptance_decision={result.acceptance_decision!r}"
+    )
+    # Acceptance decision must carry the new machine-
+    # readable transition fields (Issue #35 ACG-3r).
+    assert result.acceptance_decision.get("accepted") is False, (
+        f"acceptance_decision.accepted must be False on "
+        f"a rejected run; got "
+        f"{result.acceptance_decision.get('accepted')!r}"
+    )
+    assert (
+        result.acceptance_decision.get("reason")
+        == "eval_regression"
+    ), (
+        f"reason must be 'eval_regression' when the eval "
+        f"split has a per-case PASS->FAIL transition; got "
+        f"{result.acceptance_decision.get('reason')!r}"
+    )
+    p2f_ids = (
+        result.acceptance_decision.get(
+            "eval_pass_to_fail_case_ids"
+        ) or []
+    )
+    assert "eval-1" in p2f_ids, (
+        f"acceptance_decision.eval_pass_to_fail_case_ids "
+        f"must contain the regressing case_id 'eval-1'; "
+        f"got {p2f_ids!r}"
+    )
+    # Sanity: eval_fail_to_pass_case_ids is empty (the
+    # candidate regressed but did NOT also produce a
+    # compensating FAIL->PASS transition in this
+    # fixture).
+    f2p_ids = (
+        result.acceptance_decision.get(
+            "eval_fail_to_pass_case_ids"
+        ) or []
+    )
+    assert not f2p_ids, (
+        f"eval_fail_to_pass_case_ids must be empty when "
+        f"the candidate only regresses; got {f2p_ids!r}"
+    )
+    # Sanity: held_out_pass_to_fail_case_ids is empty
+    # (the held-out side is clean in this fixture).
+    ho_p2f_ids = (
+        result.acceptance_decision.get(
+            "held_out_pass_to_fail_case_ids"
+        ) or []
+    )
+    assert not ho_p2f_ids, (
+        f"held_out_pass_to_fail_case_ids must be empty "
+        f"when the held-out side is clean; got "
+        f"{ho_p2f_ids!r}"
+    )
+    # The artifact on disk must be the pre-run bytes
+    # (the rejected candidate was rolled back, not
+    # committed).
+    after_bytes = artifact.read_bytes()
+    assert after_bytes == pre_run_bytes, (
+        f"rejected candidate must roll back to pre-run "
+        f"bytes (the runner must restore the base bytes "
+        f"after the comparator returned "
+        f"'eval_regression'); "
+        f"pre={pre_run_bytes!r} after={after_bytes!r}"
+    )
+    # History must record the optimize_rejected event so
+    # a downstream audit can see the rejection lineage.
+    records = _opt9_read_history(workspace)
+    rejected_events = [
+        r for r in records
+        if isinstance(r, dict)
+        and r.get("event") == "optimize_rejected"
+    ]
+    assert rejected_events, (
+        f"rejected run must append an optimize_rejected "
+        f"history event; got events="
+        f"{[r.get('event') for r in records]!r}"
+    )
+
+def test_optimize_pipeline_rejects_held_out_pass_to_fail_and_rolls_back() -> None:
+    """ACG-3r / Issue #35 AC3: a candidate whose held-out
+    split introduces a per-case ``PASS`` -> ``FAIL``
+    transition must be REJECTED, the artifact rolled back
+    to the pre-run bytes, and the regressing ``case_id``
+    must surface in
+    ``acceptance_decision.held_out_pass_to_fail_case_ids``
+    with ``reason == "held_out_regression"`` even when the
+    eval split shows improvement.
+
+    The held-out guard is independent of the eval
+    comparator: a held-out regression blocks the candidate
+    even when the eval side has a clean
+    ``FAIL`` -> ``PASS`` improvement. The pipeline
+    end-to-end must:
+      1. Apply the candidate (write to disk).
+      2. Evaluate the candidate (read from disk).
+      3. Call :func:`compare_eval_held_out` and obtain
+         ``reason == "held_out_regression"`` (the eval
+         side improves, the held-out side regresses).
+      4. Roll back to the pre-run bytes (no commit).
+      5. Persist ``acceptance_decision`` with the new
+         ``held_out_pass_to_fail_case_ids`` list AND the
+         ``eval_fail_to_pass_case_ids`` list (both signals
+         surface independently).
+      6. Append an ``optimize_rejected`` history event.
+
+    Test mechanics:
+      - The seed body carries no markers. Baseline
+        ``eval-1`` returns ``FAIL`` (no eval-gain marker)
+        and baseline ``held-1`` returns ``PASS`` (no
+        held-out regress marker).
+      - The candidate body contains both
+        ``ACG3R_EVAL_FAIL_TO_PASS`` (so eval-1 flips
+        ``FAIL`` -> ``PASS``) and
+        ``ACG3R_HELD_OUT_REGRESS`` (so held-1 flips
+        ``PASS`` -> ``FAIL``).
+      - The eval split has both a ``FAIL`` -> ``PASS``
+        transition and zero ``PASS`` -> ``FAIL``
+        transitions, so ``reason`` is the held-out
+        verdict (per :func:`compare_eval_held_out`'s
+        reason ordering).
+    """
+    import hashlib
+
+    from metacrucible.optimizer import run_optimizer_pipeline
+
+    workspace = _tmp_workspace()
+    benchmark = workspace / BENCHMARK_FILE_NAME
+    artifact = _opt9_skill_artifact_path(workspace)
+    # Seed: empty body (no markers). Baseline eval-1
+    # returns FAIL (no eval-gain marker); baseline held-1
+    # returns PASS (no held-out regress marker).
+    seed_body = _opt9_body_text()
+    artifact.write_text(
+        "---\n"
+        "name: opt9-skill\n"
+        "description: ACG-3r held-out pass-to-fail fixture\n"
+        "---\n" + seed_body,
+        encoding="utf-8",
+    )
+    _opt9_seed_envelope(workspace, artifact)
+    _write_jsonl(
+        benchmark,
+        [
+            _metadata_record(),
+            _reviewed_case("eval-1", split="eval"),
+            _reviewed_case("held-1", split="held_out"),
+        ],
+    )
+    seed_body_hash = hashlib.sha256(
+        seed_body.encode("utf-8")
+    ).hexdigest()
+    pre_run_bytes = artifact.read_bytes()
+
+    eval_gain_marker = "ACG3R_EVAL_FAIL_TO_PASS"
+    held_out_regress_marker = "ACG3R_HELD_OUT_REGRESS"
+
+    def _held_out_call_fn(
+        *, repair_context: Any = None
+    ) -> dict[str, Any]:
+        return {
+            "rationale": (
+                "ACG-3r held-out regression: candidate adds "
+                "both eval-gain and held-out regress markers"
+            ),
+            "suggested_edits": [
+                {
+                    "range_id": 0,
+                    "base_hash": seed_body_hash,
+                    "intent": "introduce_held_out_regress",
+                    "replacement": (
+                        seed_body
+                        + eval_gain_marker + "\n"
+                        + held_out_regress_marker + "\n"
+                    ),
+                    "rationale": (
+                        "candidate introduces eval gain and "
+                        "held-out regression"
+                    ),
+                    "routing": False,
+                }
+            ],
+        }
+
+    def _held_out_eval_call_fn(
+        case: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        case_id = case.get("case_id", "")
+        artifact_text = artifact.read_text(encoding="utf-8")
+        if case_id == "eval-1":
+            # eval-1 FAIL -> PASS iff the eval-gain marker
+            # is present in the artifact.
+            if eval_gain_marker in artifact_text:
+                return {"status": "PASS", "case_id": case_id}
+            return {"status": "FAIL", "case_id": case_id}
+        if case_id == "held-1":
+            # held-1 PASS -> FAIL iff the held-out regress
+            # marker is present in the artifact.
+            if held_out_regress_marker in artifact_text:
+                return {"status": "FAIL", "case_id": case_id}
+            return {"status": "PASS", "case_id": case_id}
+        return {"status": "PASS", "case_id": case_id}
+
+    result = run_optimizer_pipeline(
+        workspace=workspace,
+        benchmark_path=benchmark,
+        artifact_path=artifact,
+        call_fn=_held_out_call_fn,
+        max_rounds=1,
+        human_confirmed=False,
+        eval_call_fn=_held_out_eval_call_fn,
+    )
+
+    # The pipeline must REJECT (held-out guard tripped).
+    assert result.status == "REJECTED", (
+        f"held-out PASS->FAIL transition on held-1 must "
+        f"REJECT the candidate even when the eval split "
+        f"improves; got status={result.status!r} "
+        f"acceptance_decision={result.acceptance_decision!r}"
+    )
+    # Reason must be held_out_regression (no eval-side
+    # regression; eval improved; the only remaining
+    # reason is held_out_regression per the comparator's
+    # reason ordering).
+    assert (
+        result.acceptance_decision.get("reason")
+        == "held_out_regression"
+    ), (
+        f"reason must be 'held_out_regression' when the "
+        f"eval split improves but the held-out split "
+        f"regresses; got "
+        f"{result.acceptance_decision.get('reason')!r}"
+    )
+    # The eval-side fail_to_pass signal must surface so
+    # the operator sees both signals independently.
+    f2p_ids = (
+        result.acceptance_decision.get(
+            "eval_fail_to_pass_case_ids"
+        ) or []
+    )
+    assert "eval-1" in f2p_ids, (
+        f"eval_fail_to_pass_case_ids must contain "
+        f"'eval-1' when the eval split improved; got "
+        f"{f2p_ids!r}"
+    )
+    # eval_pass_to_fail_case_ids must be empty (no
+    # eval-side regression occurred in this fixture).
+    p2f_ids = (
+        result.acceptance_decision.get(
+            "eval_pass_to_fail_case_ids"
+        ) or []
+    )
+    assert not p2f_ids, (
+        f"eval_pass_to_fail_case_ids must be empty when "
+        f"only the held-out split regressed; got "
+        f"{p2f_ids!r}"
+    )
+    # The held-out regression must surface in the
+    # transition list.
+    ho_p2f_ids = (
+        result.acceptance_decision.get(
+            "held_out_pass_to_fail_case_ids"
+        ) or []
+    )
+    assert "held-1" in ho_p2f_ids, (
+        f"held_out_pass_to_fail_case_ids must contain "
+        f"'held-1'; got {ho_p2f_ids!r}"
+    )
+    # Artifact must be rolled back to pre-run bytes (the
+    # runner restored the base bytes after the
+    # comparator returned 'held_out_regression').
+    after_bytes = artifact.read_bytes()
+    assert after_bytes == pre_run_bytes, (
+        f"rejected candidate must roll back to pre-run "
+        f"bytes (the runner must restore the base bytes "
+        f"after the comparator returned "
+        f"'held_out_regression'); "
+        f"pre={pre_run_bytes!r} after={after_bytes!r}"
+    )
+    # History must record the optimize_rejected event.
+    records = _opt9_read_history(workspace)
+    rejected_events = [
+        r for r in records
+        if isinstance(r, dict)
+        and r.get("event") == "optimize_rejected"
+    ]
+    assert rejected_events, (
+        f"rejected run must append an optimize_rejected "
         f"history event; got events="
         f"{[r.get('event') for r in records]!r}"
     )
@@ -2123,4 +2699,818 @@ def test_optimize_ac3_merge_same_range_fits_false_marks_plan_outside_mutable_ran
     assert merged.get("replacement") == "merged replacement", (
         f"AC3 LLM-merge unit: replacement must be the merged "
         f"text from the call_fn; got merged={merged!r}"
+    )
+
+
+
+# --------------------------------------------------------------------------- #
+# ACG-1r / Issue #35: binary transition comparator for eval split             #
+# --------------------------------------------------------------------------- #
+
+
+def test_compare_eval_held_out_accepts_fail_to_pass_without_regressions() -> None:
+    """ACG-1r / Issue #35 AC1: ``case_id=A`` flipping
+    ``FAIL`` -> ``PASS`` in the eval split is sufficient
+    for acceptance when the held-out split is clean.
+
+    The comparator must accept a candidate whose eval split
+    has at least one explicit per-case ``FAIL`` -> ``PASS``
+    transition and zero per-case ``PASS`` -> ``FAIL``
+    transitions, AND whose held-out split introduces no new
+    regressions. The new machine-readable transition lists
+    must be populated so a downstream audit can confirm the
+    exact ``case_id`` that flipped.
+    """
+    from metacrucible.optimizer import compare_eval_held_out
+
+    decision = compare_eval_held_out(
+        baseline_eval=[
+            {"case_id": "A", "status": "FAIL"},
+            {"case_id": "B", "status": "PASS"},
+        ],
+        candidate_eval=[
+            {"case_id": "A", "status": "PASS"},
+            {"case_id": "B", "status": "PASS"},
+        ],
+        baseline_held_out=[
+            {"case_id": "H1", "status": "PASS"},
+        ],
+        candidate_held_out=[
+            {"case_id": "H1", "status": "PASS"},
+        ],
+    )
+    assert decision["accepted"] is True, (
+        f"FAIL->PASS on A with clean held-out must accept; "
+        f"got decision={decision!r}"
+    )
+    assert decision["reason"] == "accepted", (
+        f"machine-readable reason must be 'accepted'; "
+        f"got reason={decision['reason']!r}"
+    )
+    assert decision["eval_fail_to_pass_case_ids"] == ["A"], (
+        f"eval_fail_to_pass_case_ids must list the FAIL->PASS "
+        f"case_id 'A'; got "
+        f"{decision['eval_fail_to_pass_case_ids']!r}"
+    )
+    assert decision["eval_pass_to_fail_case_ids"] == [], (
+        f"eval_pass_to_fail_case_ids must be empty when no "
+        f"PASS->FAIL transition occurs; got "
+        f"{decision['eval_pass_to_fail_case_ids']!r}"
+    )
+    # Backward-compat: count fields remain in the return.
+    assert decision["baseline_eval_fail_blocked_count"] == 1
+    assert decision["candidate_eval_fail_blocked_count"] == 0
+    assert decision["new_held_out_fail_blocked_case_ids"] == []
+
+
+def test_compare_eval_held_out_rejects_eval_pass_to_fail() -> None:
+    """ACG-1r / Issue #35 AC2: a ``PASS`` -> ``FAIL``
+    regression on any ``case_id`` blocks the candidate
+    regardless of aggregate count, and the regressing
+    ``case_id`` must surface in
+    ``eval_pass_to_fail_case_ids``.
+
+    The aggregate ``FAIL+BLOCKED`` count may improve (one
+    per-case ``FAIL`` -> ``PASS`` transition is also
+    present), but the per-case ``PASS`` -> ``FAIL``
+    transition on ``case_id=B`` is the most specific
+    rejection signal and blocks the candidate outright.
+    The reason must report ``"eval_regression"`` so an
+    operator can branch on the id and inspect the regressing
+    case immediately.
+    """
+    from metacrucible.optimizer import compare_eval_held_out
+
+    decision = compare_eval_held_out(
+        baseline_eval=[
+            {"case_id": "A", "status": "FAIL"},
+            {"case_id": "B", "status": "PASS"},
+        ],
+        candidate_eval=[
+            # Aggregate count improves (one FAIL flips to PASS)
+            # but B regresses.
+            {"case_id": "A", "status": "PASS"},
+            {"case_id": "B", "status": "FAIL"},
+        ],
+        baseline_held_out=[
+            {"case_id": "H1", "status": "PASS"},
+        ],
+        candidate_held_out=[
+            {"case_id": "H1", "status": "PASS"},
+        ],
+    )
+    assert decision["accepted"] is False, (
+        f"PASS->FAIL on B must reject the candidate even "
+        f"when aggregate count improves; got "
+        f"decision={decision!r}"
+    )
+    assert decision["reason"] == "eval_regression", (
+        f"PASS->FAIL must surface as the most specific "
+        f"rejection reason; got reason={decision['reason']!r}"
+    )
+    assert "B" in decision["eval_pass_to_fail_case_ids"], (
+        f"the regressing case_id 'B' must surface in "
+        f"eval_pass_to_fail_case_ids; got "
+        f"{decision['eval_pass_to_fail_case_ids']!r}"
+    )
+    assert decision["eval_fail_to_pass_case_ids"] == ["A"], (
+        f"the FAIL->PASS transition on A must still be "
+        f"reported in eval_fail_to_pass_case_ids (the lists "
+        f"are independent signals); got "
+        f"{decision['eval_fail_to_pass_case_ids']!r}"
+    )
+
+
+def test_compare_eval_held_out_rejects_count_only_improvement_without_fail_to_pass() -> None:
+    """ACG-1r / Issue #35 AC4: an aggregate FAIL+BLOCKED
+    count improvement that is NOT backed by a per-case
+    ``FAIL`` -> ``PASS`` transition is rejected.
+
+    The aggregate count drops from 3 to 2 (one FAIL flips
+    to BLOCKED, one BLOCKED flips to PASS), but no per-case
+    ``FAIL`` -> ``PASS`` transition occurs. Per Issue #35,
+    the only valid eval-gain signal is an explicit per-case
+    ``FAIL`` -> ``PASS``; ``FAIL`` -> ``BLOCKED`` and
+    ``BLOCKED`` -> ``PASS`` are NOT load-bearing. The
+    candidate is rejected with ``"eval_no_improvement"``
+    so the operator sees the no-FAIL->PASS gap directly.
+    """
+    from metacrucible.optimizer import compare_eval_held_out
+
+    decision = compare_eval_held_out(
+        baseline_eval=[
+            {"case_id": "A", "status": "FAIL"},
+            {"case_id": "B", "status": "FAIL"},
+            {"case_id": "C", "status": "BLOCKED"},
+            {"case_id": "D", "status": "PASS"},
+        ],
+        candidate_eval=[
+            # A: FAIL -> BLOCKED (not a FAIL -> PASS)
+            {"case_id": "A", "status": "BLOCKED"},
+            # B: FAIL -> FAIL (no change)
+            {"case_id": "B", "status": "FAIL"},
+            # C: BLOCKED -> PASS (NOT a FAIL -> PASS)
+            {"case_id": "C", "status": "PASS"},
+            {"case_id": "D", "status": "PASS"},
+        ],
+        baseline_held_out=[
+            {"case_id": "H1", "status": "PASS"},
+        ],
+        candidate_held_out=[
+            {"case_id": "H1", "status": "PASS"},
+        ],
+    )
+    assert decision["accepted"] is False, (
+        f"count-only improvement without a per-case "
+        f"FAIL->PASS transition must reject; got "
+        f"decision={decision!r}"
+    )
+    assert decision["reason"] == "eval_no_improvement", (
+        f"count-only improvement must surface as "
+        f"'eval_no_improvement' (no FAIL->PASS transition); "
+        f"got reason={decision['reason']!r}"
+    )
+    assert decision["eval_fail_to_pass_case_ids"] == [], (
+        f"eval_fail_to_pass_case_ids must be empty when no "
+        f"per-case FAIL->PASS transition occurs; got "
+        f"{decision['eval_fail_to_pass_case_ids']!r}"
+    )
+    assert decision["eval_pass_to_fail_case_ids"] == [], (
+        f"eval_pass_to_fail_case_ids must be empty when no "
+        f"per-case PASS->FAIL transition occurs; got "
+        f"{decision['eval_pass_to_fail_case_ids']!r}"
+    )
+    # Aggregate count DID improve (3 -> 2); the rejection
+    # is on the per-case transition criterion, not the
+    # aggregate. Pin both numbers so a future regression
+    # that flips the criterion is detected.
+    assert decision["baseline_eval_fail_blocked_count"] == 3
+    assert decision["candidate_eval_fail_blocked_count"] == 2
+
+
+def test_compare_eval_held_out_rejects_blocked_to_pass_without_fail_to_pass() -> None:
+    """ACG-1r / Issue #35 AC3: ``BLOCKED`` -> ``PASS`` alone
+    (no per-case ``FAIL`` -> ``PASS``) does NOT satisfy
+    Issue #35 eval gain.
+
+    Per ADR 0012, the only valid eval-gain signal is an
+    explicit per-case ``FAIL`` -> ``PASS`` transition. A
+    case whose baseline status is ``BLOCKED`` flipping to
+    ``PASS`` is NOT a ``FAIL`` -> ``PASS`` transition (the
+    baseline status is not ``FAIL``). The candidate is
+    rejected with ``"eval_no_improvement"`` so the
+    comparator's reason stays stable across
+    no-FAIL->PASS inputs.
+    """
+    from metacrucible.optimizer import compare_eval_held_out
+
+    decision = compare_eval_held_out(
+        baseline_eval=[
+            {"case_id": "A", "status": "BLOCKED"},
+            {"case_id": "B", "status": "PASS"},
+        ],
+        candidate_eval=[
+            # BLOCKED -> PASS is NOT a FAIL -> PASS.
+            {"case_id": "A", "status": "PASS"},
+            {"case_id": "B", "status": "PASS"},
+        ],
+        baseline_held_out=[
+            {"case_id": "H1", "status": "PASS"},
+        ],
+        candidate_held_out=[
+            {"case_id": "H1", "status": "PASS"},
+        ],
+    )
+    assert decision["accepted"] is False, (
+        f"BLOCKED->PASS alone must reject (no FAIL->PASS "
+        f"transition); got decision={decision!r}"
+    )
+    assert decision["reason"] == "eval_no_improvement", (
+        f"BLOCKED->PASS alone must surface as "
+        f"'eval_no_improvement' (no FAIL->PASS transition); "
+        f"got reason={decision['reason']!r}"
+    )
+    assert decision["eval_fail_to_pass_case_ids"] == [], (
+        f"BLOCKED->PASS must NOT count as a "
+        f"FAIL->PASS transition; got "
+        f"eval_fail_to_pass_case_ids="
+        f"{decision['eval_fail_to_pass_case_ids']!r}"
+    )
+    assert decision["eval_pass_to_fail_case_ids"] == [], (
+        f"no PASS->FAIL transition occurs in this "
+        f"fixture; got eval_pass_to_fail_case_ids="
+        f"{decision['eval_pass_to_fail_case_ids']!r}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# ACG-2r / Issue #35: binary transition guard for held-out split             #
+# --------------------------------------------------------------------------- #
+
+def test_compare_eval_held_out_rejects_held_out_pass_to_fail() -> None:
+    """ACG-2r / Issue #35 AC1: a held-out per-case ``PASS``
+    -> ``FAIL`` transition blocks the candidate regardless
+    of the eval-split outcome.
+
+    ACG-1r pinned the eval comparator semantics. ACG-2r
+    pins the held-out side: the candidate is accepted only
+    when NO held-out ``case_id`` flipped ``PASS`` ->
+    ``FAIL``. In this fixture the eval split has a
+    qualifying ``FAIL`` -> ``PASS`` transition (``case_id=A``
+    flips) AND a separate compensating ``PASS`` -> ``FAIL``
+    transition (``case_id=B`` flips); ACG-1r already rejects
+    on the eval side (``"eval_regression"``). The held-out
+    side ALSO trips the new guard on ``case_id=H1`` (which
+    flipped ``PASS`` -> ``FAIL``). Per the reason ordering
+    pinned in ``compare_eval_held_out``, ``eval_regression``
+    is the most specific rejection signal, so it takes
+    priority over the held-out verdict; the held-out
+    regression list must still surface in
+    ``held_out_pass_to_fail_case_ids`` so an operator can
+    audit both signals independently.
+
+    Acceptance:
+      - ``accepted is False``.
+      - ``reason == "eval_regression"`` (eval side still
+        the most specific).
+      - ``held_out_pass_to_fail_case_ids == ["H1"]``.
+      - ``new_held_out_fail_blocked_case_ids == ["H1"]``
+        (kept in lock-step with the new field for backward
+        compatibility).
+    """
+    from metacrucible.optimizer import compare_eval_held_out
+
+    decision = compare_eval_held_out(
+        baseline_eval=[
+            {"case_id": "A", "status": "FAIL"},
+            {"case_id": "B", "status": "PASS"},
+        ],
+        candidate_eval=[
+            {"case_id": "A", "status": "PASS"},
+            {"case_id": "B", "status": "FAIL"},
+        ],
+        baseline_held_out=[
+            {"case_id": "H1", "status": "PASS"},
+        ],
+        candidate_held_out=[
+            {"case_id": "H1", "status": "FAIL"},
+        ],
+    )
+    assert decision["accepted"] is False, (
+        f"held-out PASS->FAIL on H1 must reject the "
+        f"candidate even when eval has FAIL->PASS on A; "
+        f"got decision={decision!r}"
+    )
+    assert decision["reason"] == "eval_regression", (
+        f"eval_regression is the most specific reason and "
+        f"takes priority over held_out_regression; got "
+        f"reason={decision['reason']!r}"
+    )
+    assert decision["held_out_pass_to_fail_case_ids"] == [
+        "H1"
+    ], (
+        f"held_out_pass_to_fail_case_ids must surface "
+        f"H1 (the regressing case); got "
+        f"{decision['held_out_pass_to_fail_case_ids']!r}"
+    )
+    assert "H1" in decision[
+        "new_held_out_fail_blocked_case_ids"
+    ], (
+        f"new_held_out_fail_blocked_case_ids (kept for "
+        f"backward compat) must also include H1; got "
+        f"{decision['new_held_out_fail_blocked_case_ids']!r}"
+    )
+    assert decision["eval_fail_to_pass_case_ids"] == ["A"], (
+        f"FAIL->PASS on A must still surface in "
+        f"eval_fail_to_pass_case_ids; got "
+        f"{decision['eval_fail_to_pass_case_ids']!r}"
+    )
+    assert decision["eval_pass_to_fail_case_ids"] == ["B"], (
+        f"PASS->FAIL on B must still surface in "
+        f"eval_pass_to_fail_case_ids; got "
+        f"{decision['eval_pass_to_fail_case_ids']!r}"
+    )
+
+
+def test_compare_eval_held_out_ignores_held_out_without_case_id() -> None:
+    """ACG-2r / Issue #35 AC3: held-out rows missing a
+    stable ``case_id`` do NOT create a false positive
+    regression.
+
+    The comparator keys on a stable per-case ``case_id``.
+    A held-out row whose ``case_id`` is missing (or not a
+    string) cannot be matched across baseline / candidate,
+    so it cannot surface as a per-case ``PASS`` -> ``FAIL``
+    regression even when its ``status`` flipped from
+    ``PASS`` to ``FAIL``. ACG-2r pins this no-false-positive
+    guarantee. In this fixture:
+
+      - The eval split has a qualifying ``FAIL`` -> ``PASS``
+        transition on ``case_id=A`` (the eval-side
+        gain).
+      - The held-out ``case_id=H1`` stays ``PASS``
+        (clean).
+      - An extra held-out row with NO ``case_id`` flips
+        ``PASS`` -> ``FAIL`` (e.g. an unkeyed anomaly
+        report). It must be ignored.
+      - A second extra held-out row with a NON-STRING
+        ``case_id`` (int) also flips ``PASS`` -> ``FAIL``.
+        It must be ignored.
+
+    Acceptance:
+      - ``accepted is True``.
+      - ``reason == "accepted"``.
+      - ``held_out_pass_to_fail_case_ids == []`` (the
+        unkeyed rows are excluded).
+      - ``new_held_out_fail_blocked_case_ids == []``
+        (lock-step).
+    """
+    from metacrucible.optimizer import compare_eval_held_out
+
+    decision = compare_eval_held_out(
+        baseline_eval=[
+            {"case_id": "A", "status": "FAIL"},
+            {"case_id": "B", "status": "PASS"},
+        ],
+        candidate_eval=[
+            {"case_id": "A", "status": "PASS"},
+            {"case_id": "B", "status": "PASS"},
+        ],
+        baseline_held_out=[
+            {"case_id": "H1", "status": "PASS"},
+            # No case_id -> ignored by the comparator
+            # (cannot be matched to a candidate row).
+            {"status": "PASS"},
+            # Non-string case_id -> ignored.
+            {"case_id": 42, "status": "PASS"},
+        ],
+        candidate_held_out=[
+            {"case_id": "H1", "status": "PASS"},
+            # The matching unkeyed row flips to FAIL but
+            # has no case_id, so it must NOT trip the
+            # held-out guard.
+            {"status": "FAIL"},
+            # The matching int-keyed row also flips to
+            # FAIL but its case_id is not a string, so it
+            # must NOT trip the held-out guard.
+            {"case_id": 99, "status": "FAIL"},
+        ],
+    )
+    assert decision["accepted"] is True, (
+        f"unkeyed held-out rows must NOT trip the "
+        f"ACG-2r binary transition guard; got "
+        f"decision={decision!r}"
+    )
+    assert decision["reason"] == "accepted", (
+        f"machine-readable reason must be 'accepted' when "
+        f"the only held-out flips are on unkeyed rows; "
+        f"got reason={decision['reason']!r}"
+    )
+    assert decision[
+        "held_out_pass_to_fail_case_ids"
+    ] == [], (
+        f"held_out_pass_to_fail_case_ids must be empty "
+        f"when the only PASS->FAIL flips are on rows "
+        f"without a stable string case_id; got "
+        f"{decision['held_out_pass_to_fail_case_ids']!r}"
+    )
+    assert decision[
+        "new_held_out_fail_blocked_case_ids"
+    ] == [], (
+        f"new_held_out_fail_blocked_case_ids must be "
+        f"empty in lock-step with the new field; got "
+        f"{decision['new_held_out_fail_blocked_case_ids']!r}"
+    )
+    assert decision["eval_fail_to_pass_case_ids"] == [
+        "A"
+    ], (
+        f"eval_fail_to_pass_case_ids must surface A; "
+        f"got {decision['eval_fail_to_pass_case_ids']!r}"
+    )
+    assert decision["eval_pass_to_fail_case_ids"] == [], (
+        f"no eval-side PASS->FAIL transition occurs; "
+        f"got {decision['eval_pass_to_fail_case_ids']!r}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# ACG-5r / Issue #35: triggered static-review profile acceptance              #
+# --------------------------------------------------------------------------- #
+
+def test_optimize_pipeline_blocks_on_triggered_secret_privacy_profile() -> None:
+    """ACG-5r / Issue #35 AC3: a candidate whose body accidentally
+    carries the built-in AKIAIOSFODNN7EXAMPLE secret pattern must
+    flip the run to BLOCKED via the triggered
+    ``secret-privacy-risk`` profile, even after the comparator
+    accepts. The artifact must be rolled back, blockers must
+    surface, and the history lineage must record an
+    ``optimize_blocked`` event.
+
+    Mechanics:
+      - Baseline ``eval-1`` returns FAIL (no marker).
+      - Held-out ``held-1`` always returns PASS (clean held-out).
+      - Candidate body contains BOTH the accept marker (so the
+        comparator returns ``reason="accepted"``) AND the secret
+        pattern ``AKIAIOSFODNN7EXAMPLE`` (so the secret-privacy
+        profile BLOCKs the run).
+      - The comparator accepts first; then the
+        ``evaluate_profile_specs`` + ``evaluate_acceptance``
+        step trips the secret-privacy BLOCKED verdict; the
+        runner rolls back the candidate and emits an
+        ``optimize_blocked`` event.
+
+    Acceptance:
+      * ``result.status == "BLOCKED"`` (not ACCEPTED).
+      * ``result.best_revision is None`` (no commit on BLOCKED).
+      * At least one blocker with ``"secret"`` in the id (the
+        secret-privacy rule emits a stable blocker id).
+      * The on-disk artifact equals the pre-run bytes
+        (rolled back).
+      * The history lineage carries an ``optimize_blocked``
+        event (so the audit can see the profile-blocker cause).
+      * ``result.acceptance_decision["profiles"]`` exists and
+        reports ``accepted=False`` with at least one blocker
+        (the per-profile verdict round-trips into the run-level
+        verdict).
+    """
+    import hashlib
+
+    from metacrucible.optimizer import run_optimizer_pipeline
+
+    workspace = _tmp_workspace()
+    benchmark = workspace / BENCHMARK_FILE_NAME
+    artifact = _opt9_skill_artifact_path(workspace)
+    # Seed: clean body so baseline eval returns FAIL for eval-1.
+    seed_body = _opt9_body_text()
+    artifact.write_text(
+        "---\n"
+        "name: opt9-skill\n"
+        "description: ACG-5r secret-privacy fixture\n"
+        "---\n" + seed_body,
+        encoding="utf-8",
+    )
+    _opt9_seed_envelope(workspace, artifact)
+    _write_jsonl(
+        benchmark,
+        [
+            _metadata_record(),
+            _reviewed_case("eval-1", split="eval"),
+            _reviewed_case("held-1", split="held_out"),
+        ],
+    )
+    seed_body_hash = hashlib.sha256(
+        seed_body.encode("utf-8")
+    ).hexdigest()
+    pre_run_bytes = artifact.read_bytes()
+    accept_marker = "ACG5R_SECRET_TRIGGER_MARKER"
+    secret_pattern = "AKIAIOSFODNN7EXAMPLE"
+    # The candidate body satisfies the comparator (contains
+    # the accept marker) AND carries the secret pattern that
+    # the secret-privacy profile blocks on.
+    candidate_body = (
+        _opt9_body_text()
+        + "\n"
+        + accept_marker
+        + "\n"
+        + secret_pattern
+        + "\n"
+    )
+
+    def _secret_call_fn(*, repair_context: Any = None) -> dict[str, Any]:
+        return {
+            "rationale": (
+                "ACG-5r secret-privacy fixture: candidate adds "
+                "the accept marker and accidentally embeds "
+                "AKIAIOSFODNN7EXAMPLE so the secret-privacy "
+                "profile blocks the run"
+            ),
+            "suggested_edits": [
+                {
+                    "range_id": 0,
+                    "base_hash": seed_body_hash,
+                    "intent": "add_accept_marker_and_secret",
+                    "replacement": candidate_body,
+                    "rationale": (
+                        "candidate body carries both the accept "
+                        "marker and a leaked AWS access key id"
+                    ),
+                    "routing": False,
+                }
+            ],
+        }
+
+    def _secret_eval_call_fn(
+        case: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        case_id = case.get("case_id", "")
+        artifact_text = artifact.read_text(encoding="utf-8")
+        if case_id == "eval-1":
+            if accept_marker in artifact_text:
+                return {"status": "PASS", "case_id": case_id}
+            return {"status": "FAIL", "case_id": case_id}
+        return {"status": "PASS", "case_id": case_id}
+
+    result = run_optimizer_pipeline(
+        workspace=workspace,
+        benchmark_path=benchmark,
+        artifact_path=artifact,
+        call_fn=_secret_call_fn,
+        max_rounds=1,
+        human_confirmed=False,
+        eval_call_fn=_secret_eval_call_fn,
+    )
+
+    # The run must be BLOCKED (profile side blocked; comparator
+    # side accepted).
+    assert result.status == "BLOCKED", (
+        f"secret-privacy BLOCKED on the post-comparator step "
+        f"must flip the run to BLOCKED (not ACCEPTED); got "
+        f"status={result.status!r} "
+        f"acceptance_decision={result.acceptance_decision!r}"
+    )
+    # No best_revision on BLOCKED.
+    assert result.best_revision is None, (
+        f"BLOCKED run must not populate best_revision; got "
+        f"{result.best_revision!r}"
+    )
+    # The on-disk artifact must be the pre-run bytes (rolled
+    # back). The rollback path is the load-bearing evidence that
+    # the runner took the BLOCKED branch and did not commit the
+    # unsafe candidate.
+    after_bytes = artifact.read_bytes()
+    assert after_bytes == pre_run_bytes, (
+        f"profile-BLOCKED candidate must roll back to pre-run "
+        f"bytes; pre={pre_run_bytes!r} after={after_bytes!r}"
+    )
+    # Blockers must carry the secret-privacy blocker id so a
+    # downstream audit can branch on the stable id.
+    assert any(
+        isinstance(b, Mapping)
+        and isinstance(b.get("id"), str)
+        and "secret" in b["id"]
+        for b in result.blockers
+    ), (
+        f"secret-privacy blocker must surface on result.blockers; "
+        f"got blockers={result.blockers!r}"
+    )
+    # The acceptance_decision must include the per-profile
+    # verdict so the audit can see the profile-blocker cause
+    # without re-running the profile suite.
+    assert isinstance(result.acceptance_decision, Mapping), (
+        f"acceptance_decision must remain a mapping after "
+        f"ACG-5r; got {type(result.acceptance_decision).__name__}"
+    )
+    profiles_verdict = result.acceptance_decision.get("profiles")
+    assert isinstance(profiles_verdict, Mapping), (
+        f"acceptance_decision.profiles must surface the "
+        f"per-profile verdict; got {profiles_verdict!r}"
+    )
+    assert profiles_verdict.get("accepted") is False, (
+        f"acceptance_decision.profiles.accepted must be False "
+        f"when the secret-privacy profile BLOCKED; got "
+        f"{profiles_verdict!r}"
+    )
+    assert profiles_verdict.get("blockers"), (
+        f"acceptance_decision.profiles.blockers must list the "
+        f"profile-side blockers; got {profiles_verdict!r}"
+    )
+    # History must carry an optimize_blocked event so the
+    # downstream audit can see the profile-blocker cause.
+    records = _opt9_read_history(workspace)
+    blocked_events = [
+        r for r in records
+        if isinstance(r, dict)
+        and r.get("event") == "optimize_blocked"
+    ]
+    assert blocked_events, (
+        f"profile-BLOCKED run must append an optimize_blocked "
+        f"history event; got events="
+        f"{[r.get('event') for r in records]!r}"
+    )
+    # The blocked event must carry the profile-side blockers
+    # so a downstream tool can branch on them without
+    # re-reading the artifact.
+    last_blocked = blocked_events[-1]
+    assert isinstance(last_blocked.get("blockers"), list), (
+        f"optimize_blocked event must carry a blockers list; "
+        f"got {last_blocked!r}"
+    )
+
+
+def test_optimize_pipeline_runs_routing_profile_when_selected_routing_touched() -> None:
+    """ACG-5r / Issue #35 AC4: when a selected suggestion carries
+    ``routing=True``, the ``routing-surface-safety`` profile MUST
+    be triggered and run; a clean one-change human-confirmed
+    routing edit yields PASS and the run reaches ACCEPTED.
+
+    Mechanics:
+      - Selected suggestion has ``routing=True`` on the
+        ``description`` field with a one-character textual edit
+        that does NOT touch the body content (the edit is the
+        routing-surface field itself; the body stays clean so
+        secret-privacy passes trivially).
+      - ``context.human_confirmed=True`` so both the OPT-4 HITL
+        gate and the routing-safety evaluator pass.
+      - Baseline ``eval-1`` returns FAIL; candidate ``eval-1``
+        returns PASS (so the comparator accepts).
+      - Held-out ``held-1`` always returns PASS (clean held-out).
+
+    Acceptance:
+      * ``result.status == "ACCEPTED"`` (clean routing profile).
+      * ``result.best_revision`` is populated (the accepted
+        candidate committed).
+      * The on-disk artifact equals the candidate text (no
+        rollback).
+      * ``acceptance_decision["profiles"]`` is present and
+        reports ``accepted=True`` with no blockers.
+      * The history lineage carries an ``optimize_accepted``
+        event (the run reached the committed-candidate
+        branch).
+    """
+    import hashlib
+
+    from metacrucible.optimizer import run_optimizer_pipeline
+
+    workspace = _tmp_workspace()
+    benchmark = workspace / BENCHMARK_FILE_NAME
+    artifact = _opt9_skill_artifact_path(workspace)
+    # Seed: clean body. The candidate replaces the
+    # frontmatter ``description`` value with a clean new value
+    # so the routing-surface edit is well-formed (one routing
+    # change, human_confirmed=True). The body itself stays the
+    # same so secret-privacy and Darwin pass trivially.
+    seed_body = _opt9_body_text()
+    artifact.write_text(
+        "---\n"
+        "name: opt9-skill\n"
+        "description: ACG-5r routing-touched fixture\n"
+        "---\n" + seed_body,
+        encoding="utf-8",
+    )
+    _opt9_seed_envelope(workspace, artifact)
+    _write_jsonl(
+        benchmark,
+        [
+            _metadata_record(),
+            _reviewed_case("eval-1", split="eval"),
+            _reviewed_case("held-1", split="held_out"),
+        ],
+    )
+    seed_body_hash = hashlib.sha256(
+        seed_body.encode("utf-8")
+    ).hexdigest()
+    # The candidate replaces the frontmatter ``description``
+    # value while keeping the body byte-identical. The
+    # routing-surface edit is a textual frontmatter rewrite;
+    # the body is the only mutable range the optimizer targets,
+    # so the suggestion's replacement carries the new full
+    # artifact text (frontmatter + same body).
+    new_description = "ACG-5r routing-touched fixture (rewritten)"
+    candidate_text = (
+        "---\n"
+        "name: opt9-skill\n"
+        f"description: {new_description}\n"
+        "---\n" + seed_body
+    )
+
+    def _routing_call_fn(
+        *, repair_context: Any = None
+    ) -> dict[str, Any]:
+        return {
+            "rationale": (
+                "ACG-5r routing-touched fixture: candidate "
+                "rewrites the description routing-surface "
+                "field with a clean human-confirmed value; "
+                "secret-privacy stays clean; comparator "
+                "accepts; routing-surface-safety passes"
+            ),
+            "suggested_edits": [
+                {
+                    "range_id": 0,
+                    "base_hash": seed_body_hash,
+                    "intent": "rewrite_description_routing_field",
+                    "replacement": candidate_text,
+                    "rationale": (
+                        "candidate rewrites the description "
+                        "frontmatter value; the body is "
+                        "byte-identical to the seed"
+                    ),
+                    "routing": True,
+                    "routing_field": "description",
+                    "human_confirmed": True,
+                }
+            ],
+        }
+
+    def _routing_eval_call_fn(
+        case: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        case_id = case.get("case_id", "")
+        artifact_text = artifact.read_text(encoding="utf-8")
+        if case_id == "eval-1":
+            if new_description in artifact_text:
+                return {"status": "PASS", "case_id": case_id}
+            return {"status": "FAIL", "case_id": case_id}
+        return {"status": "PASS", "case_id": case_id}
+
+    result = run_optimizer_pipeline(
+        workspace=workspace,
+        benchmark_path=benchmark,
+        artifact_path=artifact,
+        call_fn=_routing_call_fn,
+        max_rounds=1,
+        human_confirmed=True,
+        eval_call_fn=_routing_eval_call_fn,
+    )
+
+    # Clean routing profile + clean secret-privacy profile must
+    # preserve the ACCEPTED path.
+    assert result.status == "ACCEPTED", (
+        f"clean one-change human-confirmed routing edit must "
+        f"preserve the ACCEPTED status (ACG-5r AC4); got "
+        f"status={result.status!r} "
+        f"acceptance_decision={result.acceptance_decision!r}"
+    )
+    assert result.best_revision is not None, (
+        f"accepted run must populate best_revision; got "
+        f"{result.best_revision!r}"
+    )
+    # On-disk artifact equals the candidate text (committed,
+    # not rolled back).
+    assert artifact.read_text(encoding="utf-8") == candidate_text, (
+        f"accepted candidate must commit to disk; "
+        f"expected={candidate_text!r} "
+        f"got={artifact.read_text(encoding='utf-8')!r}"
+    )
+    # The per-profile verdict must report accepted=True with no
+    # blockers so the audit can see the routing profile passed.
+    assert isinstance(result.acceptance_decision, Mapping), (
+        f"acceptance_decision must remain a mapping after "
+        f"ACG-5r; got {type(result.acceptance_decision).__name__}"
+    )
+    profiles_verdict = result.acceptance_decision.get("profiles")
+    assert isinstance(profiles_verdict, Mapping), (
+        f"acceptance_decision.profiles must surface the "
+        f"per-profile verdict; got {profiles_verdict!r}"
+    )
+    assert profiles_verdict.get("accepted") is True, (
+        f"clean routing-safety + secret-privacy must yield "
+        f"accepted=True; got {profiles_verdict!r}"
+    )
+    assert not profiles_verdict.get("blockers"), (
+        f"clean profiles verdict must carry no blockers; got "
+        f"{profiles_verdict.get('blockers')!r}"
+    )
+    # History must carry an optimize_accepted event (the run
+    # reached the committed-candidate branch).
+    records = _opt9_read_history(workspace)
+    accepted_events = [
+        r for r in records
+        if isinstance(r, dict)
+        and r.get("event") == "optimize_accepted"
+    ]
+    assert accepted_events, (
+        f"accepted run must append an optimize_accepted "
+        f"history event; got events="
+        f"{[r.get('event') for r in records]!r}"
     )

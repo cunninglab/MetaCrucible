@@ -107,6 +107,7 @@ __all__ = [
     "select_supplemental",
     "select_triggers",
     "evaluate_darwin_skill_quality",
+    "evaluate_profile_specs",
     "weakest_darwin_dimensions",
 ]
 
@@ -625,6 +626,74 @@ def evaluate_acceptance(
         "supplemental_findings": supplemental_findings,
     }
 
+
+# --------------------------------------------------------------------------- #
+# evaluate_profile_specs — builtin dispatch (Issue #35 / ACG-5r)             #
+# --------------------------------------------------------------------------- #
+
+def evaluate_profile_specs(
+    profile_specs: Sequence[ProfileSpec],
+    review_input: Mapping[str, Any],
+) -> tuple[ProfileResult, ...]:
+    """Dispatch every ``profile_spec`` to its built-in evaluator.
+
+    The dispatcher maps each built-in profile id to its existing
+    evaluator and invokes it with the right input shape:
+
+      * ``secret-privacy-risk`` -> ``evaluate_secret_privacy_risk``
+      * ``routing-surface-safety`` -> ``evaluate_routing_surface_safety``
+      * ``runtime-neutrality`` -> ``evaluate_runtime_neutrality``
+      * ``darwin-skill-quality`` -> ``evaluate_darwin_skill_quality``
+
+    ``review_input`` is the shared review shape; each evaluator
+    reads the keys it needs:
+
+      * ``secret-privacy-risk`` and ``darwin-skill-quality`` read
+        ``review_input["body"]`` (the candidate artifact body).
+      * ``runtime-neutrality`` reads
+        ``review_input["portability"]["target"]``.
+      * ``routing-surface-safety`` reads
+        ``review_input["routing_changes"]`` (a sequence) and
+        ``review_input["human_confirmed"]`` (bool). The dispatcher
+        projects those two keys into the proposal shape the
+        routing-surface-safety evaluator expects.
+
+    Iteration order matches the input order so the resulting
+    ``tuple[ProfileResult, ...]`` is byte-stable across calls.
+    Unknown ids raise :class:`ValueError` so a misconfigured
+    profile set cannot silently downgrade acceptance — a buggy
+    caller must trip a hard error, not produce a phantom PASS.
+    """
+    results: list[ProfileResult] = []
+    for spec in profile_specs:
+        if spec.id == SECRET_PRIVACY_RISK_ID:
+            results.append(evaluate_secret_privacy_risk(review_input))
+        elif spec.id == ROUTING_SURFACE_SAFETY_ID:
+            raw_changes = review_input.get("routing_changes", ())
+            if isinstance(raw_changes, (list, tuple, frozenset, set)):
+                routing_changes: tuple[Any, ...] = tuple(raw_changes)
+            else:
+                routing_changes = ()
+            routing_proposal: dict[str, Any] = {
+                "routing_changes": list(routing_changes),
+                "human_confirmed": bool(
+                    review_input.get("human_confirmed", False)
+                ),
+            }
+            results.append(
+                evaluate_routing_surface_safety(routing_proposal)
+            )
+        elif spec.id == RUNTIME_NEUTRALITY_ID:
+            results.append(evaluate_runtime_neutrality(review_input))
+        elif spec.id == DARWIN_SKILL_QUALITY_ID:
+            results.append(evaluate_darwin_skill_quality(review_input))
+        else:
+            raise ValueError(
+                f"evaluate_profile_specs has no built-in evaluator "
+                f"for profile id {spec.id!r}; supported built-in ids "
+                f"are {sorted(BUILTIN_PROFILE_IDS)!r}"
+            )
+    return tuple(results)
 
 # --------------------------------------------------------------------------- #
 # weakest_darwin_dimensions (Issue #22)                                        #

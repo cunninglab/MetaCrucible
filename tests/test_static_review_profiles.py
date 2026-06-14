@@ -2269,3 +2269,150 @@ def test_evaluate_secret_privacy_risk_blocks_on_non_string_fixture_sha(
         f"and BLOCK (Issue #25 AC3); got status={result.status!r} "
         f"blockers={result.blockers!r}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# ACG-5r / Issue #35: evaluate_profile_specs builtin dispatch                  #
+# --------------------------------------------------------------------------- #
+
+def test_evaluate_profile_specs_dispatches_builtin_profiles(
+    profiles: Any,
+) -> None:
+    """Issue #35 ACG-5r AC1: ``evaluate_profile_specs`` must dispatch
+    every built-in profile id to its existing evaluator and return
+    one :class:`ProfileResult` per spec, in iteration order.
+
+    The dispatcher is the new reusable surface; it routes:
+
+      * ``secret-privacy-risk`` -> secret-privacy evaluator,
+      * ``routing-surface-safety`` -> routing-safety evaluator,
+      * ``runtime-neutrality`` -> runtime-neutrality evaluator,
+      * ``darwin-skill-quality`` -> Darwin evaluator.
+
+    The test feeds a single ``review_input`` mapping and the four
+    built-in specs in canonical order. The assertions are:
+
+      * The result count matches the input count.
+      * Each result's ``profile_id`` matches the spec it was
+        dispatched from (no id collisions).
+      * Each result's ``version`` matches the spec's ``version``
+        (no version drift across the dispatch boundary).
+      * The result order matches the input order (canonical /
+        deterministic iteration).
+      * The secret-privacy evaluator ran on the body (a clean
+        body returns PASS; a body carrying
+        ``AKIAIOSFODNN7EXAMPLE`` returns BLOCKED).
+      * The routing-safety evaluator ran on the routing-proposal
+        shape (a one-change human-confirmed proposal returns PASS).
+      * An unknown id raises ``ValueError`` so a misconfigured
+        profile set cannot silently downgrade acceptance.
+    """
+    spec_index = {s.id: s for s in profiles.BUILTIN_PROFILES}
+    triggered_specs = (
+        spec_index["secret-privacy-risk"],
+        spec_index["routing-surface-safety"],
+        spec_index["runtime-neutrality"],
+        spec_index["darwin-skill-quality"],
+    )
+
+    # Clean body for secret-privacy + Darwin; one human-confirmed
+    # routing change for routing-safety; portable target for
+    # runtime-neutrality.
+    review_input: dict[str, Any] = {
+        "body": (
+            "# body\n"
+            "The body is the only mutable range.\n"
+        ),
+        "routing_changes": [
+            {"field": "description", "new": "updated"},
+        ],
+        "human_confirmed": True,
+        "portability": {"target": "runtime_neutral"},
+        "reviewed_fake_secrets": (),
+    }
+    results = profiles.evaluate_profile_specs(
+        triggered_specs, review_input
+    )
+    assert isinstance(results, tuple), (
+        f"evaluate_profile_specs must return a tuple; got "
+        f"{type(results).__name__}"
+    )
+    assert len(results) == len(triggered_specs), (
+        f"evaluate_profile_specs must return one result per spec; "
+        f"got len(results)={len(results)} for "
+        f"len(specs)={len(triggered_specs)}"
+    )
+    expected_ids = [s.id for s in triggered_specs]
+    actual_ids = [r.profile_id for r in results]
+    assert actual_ids == expected_ids, (
+        f"evaluate_profile_specs must preserve input order and "
+        f"return each result with its spec's profile_id; got "
+        f"actual_ids={actual_ids!r} expected_ids={expected_ids!r}"
+    )
+    for spec, result in zip(triggered_specs, results):
+        assert result.version == spec.version, (
+            f"dispatched result.version must match spec.version "
+            f"(no version drift across the dispatcher); spec={spec!r} "
+            f"result={result!r}"
+        )
+
+    # The secret-privacy evaluator ran on the body: a clean body
+    # returns PASS with no blockers. (If the dispatcher had
+    # silently routed secret-privacy to a different evaluator,
+    # this would not hold.)
+    secret_result = results[0]
+    assert secret_result.profile_id == "secret-privacy-risk"
+    assert secret_result.status == "PASS", (
+        f"clean body must yield secret-privacy PASS; got "
+        f"{secret_result!r}"
+    )
+    assert not secret_result.blockers, (
+        f"clean body must yield zero secret-privacy blockers; "
+        f"got {secret_result.blockers!r}"
+    )
+
+    # The routing-safety evaluator ran on the routing-proposal
+    # shape: a one-change human-confirmed proposal returns PASS.
+    routing_result = results[1]
+    assert routing_result.profile_id == "routing-surface-safety"
+    assert routing_result.status == "PASS", (
+        f"one-change human-confirmed routing proposal must yield "
+        f"routing-safety PASS; got {routing_result!r}"
+    )
+
+    # An unknown id must raise ValueError so a misconfigured
+    # profile set cannot silently downgrade acceptance.
+    unknown_spec = profiles.ProfileSpec(
+        id="not-a-builtin",
+        version="v1",
+        blocking=True,
+        built_in=False,
+        content_hash="0" * 64,
+    )
+    with pytest.raises(ValueError):
+        profiles.evaluate_profile_specs(
+            (unknown_spec,), review_input
+        )
+
+    # The dispatcher must also route to the BLOCKED verdict when
+    # the secret-privacy body carries a known secret — this is
+    # the load-bearing path the optimizer relies on to BLOCK a
+    # candidate that accidentally embeds AKIAIOSFODNN7EXAMPLE.
+    secret_review_input: dict[str, Any] = {
+        "body": "leaked AKIAIOSFODNN7EXAMPLE\n",
+        "portability": {"target": "runtime_neutral"},
+        "reviewed_fake_secrets": (),
+    }
+    secret_only_results = profiles.evaluate_profile_specs(
+        (spec_index["secret-privacy-risk"],), secret_review_input
+    )
+    assert len(secret_only_results) == 1
+    blocked_secret = secret_only_results[0]
+    assert blocked_secret.status == "BLOCKED", (
+        f"body carrying AKIAIOSFODNN7EXAMPLE must yield "
+        f"secret-privacy BLOCKED; got {blocked_secret!r}"
+    )
+    assert blocked_secret.blockers, (
+        f"BLOCKED secret-privacy result must carry at least one "
+        f"blocker; got {blocked_secret!r}"
+    )

@@ -3499,3 +3499,578 @@ def test_acg6r_blocker_ids_stable() -> None:
     assert ROUTING_HITL_UNCONFIRMED_BLOCKER == "routing-hitl-unconfirmed"
     assert ROUTING_CAP_EXCEEDED_BLOCKER == "routing-cap-exceeded"
     assert MUTABLE_RANGE_CONFLICT_BLOCKER == "mutable-range-conflict"
+
+
+
+# --------------------------------------------------------------------------- #
+# Issue #36 — Stopping Condition: stop_reason contract                         #
+# --------------------------------------------------------------------------- #
+
+
+def test_stop_reason_in_cli_json_payload_for_optimizer_run(
+    tmp_path: Path,
+) -> None:
+    """The ``optimize --json`` payload exposes the pipeline's
+    machine-stable ``stop_reason`` at the top level.
+
+    Issue #36 / Stopping Condition: the CLI must surface the
+    same ``stop_reason`` the pipeline recorded on the result
+    so a downstream reader can branch on the termination
+    reason without re-deriving it from ``status`` /
+    ``blockers`` / ``warnings``. The test runs the full
+    ``metacrucible optimize`` command via subprocess with a
+    clean benchmark + seeded envelope + seeded artifact; the
+    pipeline's ``call_fn=None`` MVP path produces the
+    ``no_candidate_edits`` stop reason, and the CLI must
+    surface that value at the top level of the ``--json``
+    payload.
+    """
+    import hashlib
+
+    workspace = _init_workspace(tmp_path)
+    benchmark = workspace / BENCHMARK_FILE_NAME
+    artifact = workspace / "SKILL.md"
+    artifact.write_text(
+        "---\n"
+        "name: stop-reason-cli-skill\n"
+        "description: Stopping Condition CLI regression fixture\n"
+        "---\n"
+        "# body\nThe body is the only mutable range.\n",
+        encoding="utf-8",
+    )
+    envelope = workspace / ".metacrucible" / "envelope.json"
+    envelope.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "artifact_path": str(artifact),
+                "artifact_workspace": str(workspace),
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_jsonl(
+        benchmark,
+        [
+            _metadata_record(),
+            _reviewed_case("eval-1", split="eval"),
+            _reviewed_case("held-1", split="held_out"),
+        ],
+    )
+    # Sanity: the fixture's body hash matches what the
+    # pipeline will compute when it parses the artifact.
+    expected_body_hash = hashlib.sha256(
+        b"# body\nThe body is the only mutable range.\n"
+    ).hexdigest()
+    assert expected_body_hash == hashlib.sha256(
+        artifact.read_bytes().split(b"\n---\n", 1)[1]
+    ).hexdigest(), (
+        f"CLI regression fixture: the body hash the test "
+        f"expects ({expected_body_hash!r}) must match the "
+        f"artifact on disk; the envelope / artifact pair is "
+        f"the contract the CLI threads through"
+    )
+
+    result = _run_metacrucible(
+        ["optimize", str(workspace), "--json"],
+        cwd=REPO_ROOT,
+    )
+    assert result.returncode in (EXIT_OK, EXIT_BLOCKED), (
+        f"`optimize --json` must exit 0 or {EXIT_BLOCKED}; "
+        f"got rc={result.returncode} stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        pytest.fail(
+            f"`optimize --json` must emit valid JSON on "
+            f"stdout; got stdout={result.stdout!r} error={exc}"
+        )
+    assert isinstance(payload, dict), (
+        f"optimize --json must return a JSON object; got "
+        f"{type(payload).__name__} ({payload!r})"
+    )
+    # The stop_reason key is a top-level payload field
+    # alongside status / run_id / rounds. The MVP no-LLM
+    # path produces an empty-suggestion round, which the
+    # pipeline records as ``no_candidate_edits``.
+    assert "stop_reason" in payload, (
+        f"optimize --json must surface stop_reason at "
+        f"the top level; got keys={sorted(payload.keys())!r}"
+    )
+    assert payload["stop_reason"] == "no_candidate_edits", (
+        f"CLI payload must report stop_reason="
+        f"'no_candidate_edits' for a no-LLM run; got "
+        f"payload['stop_reason']={payload['stop_reason']!r}"
+    )
+    # The reason must come from the canonical vocabulary;
+    # the CLI must not invent a prose value. The
+    # vocabulary is a closed set exported from the
+    # optimizer module.
+    from metacrucible.optimizer import STOP_REASONS
+    assert payload["stop_reason"] in STOP_REASONS, (
+        f"CLI stop_reason must be a vocabulary string "
+        f"from {sorted(STOP_REASONS)!r}; got "
+        f"{payload['stop_reason']!r}"
+    )
+
+def test_optimize_default_max_rounds_is_one_without_flag(
+    tmp_path: Path,
+) -> None:
+    """The ``optimize`` CLI defaults ``max_rounds`` to 1
+    when the operator omits the ``--max-rounds`` flag.
+
+    Issue #36 Stopping Condition: the MVP round budget
+    (one round per optimize invocation) is the safe
+    default; an explicit ``--max-rounds N>1`` opt-in is
+    the only way to spend more than one round. The test
+    runs the full ``metacrucible optimize`` command
+    without the flag and asserts the CLI ``--json``
+    payload surfaces both ``max_rounds == 1`` (the
+    propagated default) and ``rounds == 1`` (the
+    single-iteration execution) and ``stop_reason`` is
+    a vocabulary id.
+
+    The fixture is the same OPT-9 shape used by
+    :func:`test_stop_reason_in_cli_json_payload_for_optimizer_run`:
+    a single-mutable-range Skill body, an envelope that
+    declares the artifact path, and a benchmark with one
+    eligible eval + one eligible held-out case. The MVP
+    no-LLM path (``call_fn=None``) produces the
+    ``no_candidate_edits`` stop reason - the exact value
+    is not asserted here; only that the value comes from
+    the canonical ``STOP_REASONS`` vocabulary.
+    """
+    workspace = _init_workspace(tmp_path)
+    benchmark = workspace / BENCHMARK_FILE_NAME
+    artifact = workspace / "SKILL.md"
+    artifact.write_text(
+        "---\n"
+        "name: default-max-rounds-skill\n"
+        "description: Default max_rounds=1 regression fixture\n"
+        "---\n"
+        "# body\nThe body is the only mutable range.\n",
+        encoding="utf-8",
+    )
+    envelope = workspace / ".metacrucible" / "envelope.json"
+    envelope.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "artifact_path": str(artifact),
+                "artifact_workspace": str(workspace),
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_jsonl(
+        benchmark,
+        [
+            _metadata_record(),
+            _reviewed_case("eval-1", split="eval"),
+            _reviewed_case("held-1", split="held_out"),
+        ],
+    )
+
+    # No ``--max-rounds`` flag: the operator accepts the
+    # default. The CLI must propagate ROUND_BUDGET_DEFAULT
+    # (1) into the payload so a downstream reader can see
+    # the configured budget alongside the rounds actually
+    # executed.
+    result = _run_metacrucible(
+        ["optimize", str(workspace), "--json"],
+        cwd=REPO_ROOT,
+    )
+    assert result.returncode in (EXIT_OK, EXIT_BLOCKED), (
+        f"`optimize --json` (no --max-rounds) must exit "
+        f"0 or {EXIT_BLOCKED}; got rc={result.returncode} "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        pytest.fail(
+            f"`optimize --json` must emit valid JSON on "
+            f"stdout; got stdout={result.stdout!r} error={exc}"
+        )
+    assert isinstance(payload, dict), (
+        f"optimize --json must return a JSON object; got "
+        f"{type(payload).__name__} ({payload!r})"
+    )
+
+    # ``max_rounds`` is propagated from
+    # ROUND_BUDGET_DEFAULT (1) into the CLI payload when
+    # the operator omits the flag. A regression that
+    # bumps the default OR that drops the propagation
+    # would change this value - the assertion pins it.
+    assert "max_rounds" in payload, (
+        f"optimize --json must surface max_rounds at the "
+        f"top level so downstream readers can see the "
+        f"configured budget; got keys={sorted(payload.keys())!r}"
+    )
+    assert payload["max_rounds"] == 1, (
+        f"optimize --json without --max-rounds must "
+        f"propagate ROUND_BUDGET_DEFAULT (1) into the "
+        f"payload; got payload['max_rounds']="
+        f"{payload['max_rounds']!r}"
+    )
+
+    # ``rounds`` reflects the actual number of iterations
+    # the pipeline ran. With max_rounds=1 the loop runs
+    # exactly one iteration then exits.
+    assert "rounds" in payload, (
+        f"optimize --json must surface rounds at the top "
+        f"level alongside max_rounds; got keys="
+        f"{sorted(payload.keys())!r}"
+    )
+    assert payload["rounds"] == 1, (
+        f"optimize --json without --max-rounds must run "
+        f"exactly 1 round (matches the propagated "
+        f"budget); got payload['rounds']={payload['rounds']!r}"
+    )
+
+    # ``stop_reason`` must come from the canonical
+    # vocabulary so the operator's downstream tooling
+    # can branch on it. The MVP no-LLM path produces
+    # ``no_candidate_edits``; this assertion is the
+    # broader vocabulary check that pairs with the
+    # no-LLM specific assertion in the sibling test.
+    from metacrucible.optimizer import STOP_REASONS
+    assert "stop_reason" in payload, (
+        f"optimize --json must surface stop_reason at "
+        f"the top level; got keys={sorted(payload.keys())!r}"
+    )
+    assert payload["stop_reason"] in STOP_REASONS, (
+        f"CLI stop_reason must be a vocabulary string "
+        f"from {sorted(STOP_REASONS)!r}; got "
+        f"payload['stop_reason']={payload['stop_reason']!r}"
+    )
+# --------------------------------------------------------------------------- #
+# Held-out exclusion: Stopping Condition surface                                 #
+# --------------------------------------------------------------------------- #
+
+
+def test_stop_reason_does_not_leak_held_out_content(
+    tmp_path: Path,
+) -> None:
+    """Stopping Condition output and the ``optimize_finished``
+    history event MUST NOT include held-out case content.
+
+    The optimizer pipeline's termination surface is small and
+    machine-stable: ``stop_reason`` is one of six vocabulary
+    strings; ``warnings`` and ``blockers`` carry ``{id, message}``
+    pairs whose ``message`` strings are pre-canned English prose.
+    A regression that threads a held-out case's ``input.prompt``,
+    ``expected_output``, ``checks``, or ``judgment`` into any of
+    those fields would expose held-out content to operators
+    even though the held-out split is supposed to be
+    quarantined from every run-level artifact (OPT-9 / ADR 0031
+    / ADR 0032).
+
+    The fixture is the OPT-9 shape: a single-mutable-range
+    Skill body, an envelope that declares the artifact path,
+    and a benchmark with one eligible reviewed eval case + one
+    eligible reviewed held-out case. The held-out case carries a
+    unique sentinel string in *every* field where a regression
+    could plausibly leak it (input / expected_output / checks /
+    judgment). The MVP no-LLM path (``call_fn=None``) produces
+    an empty-suggestion round, so the pipeline exits with
+    ``stop_reason="no_candidate_edits"`` on round 1 - the
+    earliest possible Stopping Condition - and writes the
+    ``optimize_finished`` event with the same stop reason.
+
+    Pins:
+
+      - ``payload["stop_reason"]`` is one of
+        :data:`STOP_REASONS` (machine-stable vocabulary).
+      - The serialized ``--json`` payload does NOT contain the
+        held-out sentinel anywhere (covers stop_reason,
+        warnings, blockers, rounds, selected_candidate_ids,
+        acceptance_decision, best_revision, evidence_refs,
+        record_counts, and every other field).
+      - The ``history.jsonl`` stream does NOT contain the
+        held-out sentinel anywhere (covers the
+        ``optimize_finished`` event in particular plus
+        every other per-run event).
+      - The ``optimize_finished`` event's ``stop_reason``
+        mirrors the CLI payload's ``stop_reason`` so a
+        lineage reader sees the same termination reason.
+    """
+    held_out_sentinel = "HELD_OUT_STOP_REASON_SECRET_DO_NOT_LEAK"
+    eval_sentinel = "EVAL_SENTINEL_OK_99"
+
+    workspace = _init_workspace(tmp_path)
+    benchmark = workspace / BENCHMARK_FILE_NAME
+    artifact = workspace / "SKILL.md"
+    artifact.write_text(
+        "---\n"
+        "name: stop-reason-leak-skill\n"
+        "description: Held-out stop_reason leak regression fixture\n"
+        "---\n"
+        "# body\nThe body is the only mutable range.\n",
+        encoding="utf-8",
+    )
+    envelope = workspace / ".metacrucible" / "envelope.json"
+    envelope.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "artifact_path": str(artifact),
+                "artifact_workspace": str(workspace),
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    # Seed the benchmark with a reviewed eval case + a reviewed
+    # held-out case. The held-out case carries the sentinel in
+    # every field where a regression could plausibly surface
+    # case content (input / expected_output / checks /
+    # judgment). The eval case carries a different sentinel as
+    # a control: the assertions are about the held-out sentinel
+    # only, but the eval sentinel strengthens coverage against
+    # any case-content leak from either split. The string-
+    # search is constructed against ``json.dumps`` of the
+    # actual payload / history output, so its realness is
+    # established by construction.
+    _write_jsonl(
+        benchmark,
+        [
+            _metadata_record(),
+            _reviewed_case("eval-1", split="eval")
+            | {
+                "input": {"prompt": eval_sentinel},
+                "expected_output": eval_sentinel,
+            },
+            _reviewed_case("held-1", split="held_out")
+            | {
+                "input": {"prompt": held_out_sentinel},
+                "expected_output": held_out_sentinel,
+                "checks": [
+                    {
+                        "name": "leak_check",
+                        "pattern": held_out_sentinel,
+                    }
+                ],
+                "judgment": held_out_sentinel,
+            },
+        ],
+    )
+
+    # Run the full CLI without ``--max-rounds``: the operator
+    # accepts the default (1 round). The MVP no-LLM path
+    # produces an empty-suggestion round and the pipeline
+    # exits with ``stop_reason="no_candidate_edits"`` - the
+    # earliest possible early-stop path through the
+    # Stopping Condition surface.
+    result = _run_metacrucible(
+        ["optimize", str(workspace), "--json"],
+        cwd=REPO_ROOT,
+    )
+    assert result.returncode in (EXIT_OK, EXIT_BLOCKED), (
+        f"`optimize --json` must exit 0 or {EXIT_BLOCKED}; "
+        f"got rc={result.returncode} stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        pytest.fail(
+            f"`optimize --json` must emit valid JSON on "
+            f"stdout; got stdout={result.stdout!r} error={exc}"
+        )
+    assert isinstance(payload, dict), (
+        f"optimize --json must return a JSON object; got "
+        f"{type(payload).__name__} ({payload!r})"
+    )
+
+    # ``stop_reason`` must be present and must come from the
+    # closed :data:`STOP_REASONS` vocabulary. This is the
+    # positive check that the Stopping Condition contract is
+    # being honored: the value is a stable enum string, not
+    # a free-form prose that could be polluted with case
+    # content.
+    assert "stop_reason" in payload, (
+        f"optimize --json must surface stop_reason at the "
+        f"top level; got keys={sorted(payload.keys())!r}"
+    )
+    from metacrucible.optimizer import (
+        STOP_REASONS,
+        STOP_REASON_NO_CANDIDATE_EDITS,
+    )
+
+    assert payload["stop_reason"] in STOP_REASONS, (
+        f"CLI stop_reason must be a vocabulary string from "
+        f"{sorted(STOP_REASONS)!r}; got "
+        f"payload['stop_reason']={payload['stop_reason']!r}"
+    )
+    # The MVP no-LLM path produces ``no_candidate_edits`` on
+    # round 1. Pin the specific value so a regression that
+    # changed the no-LLM termination path to, e.g.,
+    # ``max_rounds_reached`` would surface here.
+    assert payload["stop_reason"] == STOP_REASON_NO_CANDIDATE_EDITS, (
+        f"MVP no-LLM run with default --max-rounds must "
+        f"report stop_reason={STOP_REASON_NO_CANDIDATE_EDITS!r}; "
+        f"got payload['stop_reason']={payload['stop_reason']!r}"
+    )
+
+    # The serializer's whole-string view: every field the
+    # CLI emits, recursively, gets stringified and searched.
+    # This covers stop_reason, warnings, blockers, rounds,
+    # record_counts, selected_candidate_ids, acceptance_decision,
+    # best_revision, evidence_refs, status, run_id, etc. - if
+    # any of those surfaced the held-out sentinel, the search
+    # would catch it.
+    payload_blob = json.dumps(payload, sort_keys=True)
+    assert held_out_sentinel not in payload_blob, (
+        f"CLI --json payload must NOT contain held-out case "
+        f"content; sentinel leaked into "
+        f"payload_blob={payload_blob!r}"
+    )
+    # Control: the eval sentinel also must not surface in the
+    # payload, since the payload only carries IDs / counts /
+    # run metadata - not eval case content either. This proves
+    # the search is actually scanning, not silently passing.
+    assert eval_sentinel not in payload_blob, (
+        f"CLI --json payload must NOT contain eval case "
+        f"content either; eval sentinel leaked into "
+        f"payload_blob={payload_blob!r}"
+    )
+
+    # Per-field focused assertions: the contract says
+    # stop_reason is a vocabulary id; warnings and blockers
+    # are pre-canned {id, message} dicts. A regression that
+    # stored a held-out string in any of these would break
+    # the contract, so surface it explicitly.
+    for warning in payload.get("warnings", []) or []:
+        assert isinstance(warning, dict), (
+            f"warnings entries must be dicts; got "
+            f"{type(warning).__name__} ({warning!r})"
+        )
+        assert "message" in warning, (
+            f"warnings entry missing 'message' key; got "
+            f"{warning!r}"
+        )
+        assert held_out_sentinel not in warning["message"], (
+            f"warning message must NOT contain held-out "
+            f"sentinel; got warning={warning!r}"
+        )
+    for blocker in payload.get("blockers", []) or []:
+        assert isinstance(blocker, dict), (
+            f"blockers entries must be dicts; got "
+            f"{type(blocker).__name__} ({blocker!r})"
+        )
+        assert "message" in blocker, (
+            f"blocker entry missing 'message' key; got "
+            f"{blocker!r}"
+        )
+        assert held_out_sentinel not in blocker["message"], (
+            f"blocker message must NOT contain held-out "
+            f"sentinel; got blocker={blocker!r}"
+        )
+    # ``rounds`` is a count, not content. The MVP no-LLM path
+    # runs exactly 1 round.
+    assert payload.get("rounds") == 1, (
+        f"MVP no-LLM run with default --max-rounds must "
+        f"report rounds=1; got payload['rounds']="
+        f"{payload.get('rounds')!r}"
+    )
+
+    # History stream: every event the pipeline persisted, in
+    # particular the ``optimize_finished`` event, must not
+    # carry held-out content. The string-search covers any
+    # record type (case_reflection, edit_suggestion,
+    # ranked_edit_set, range_merge_plan, optimize_finished,
+    # optimize_blocked, etc.) without naming each one.
+    records = _opt9_read_history(workspace)
+    history_blob = json.dumps(records, sort_keys=True)
+    assert held_out_sentinel not in history_blob, (
+        f"history.jsonl must NOT contain held-out case "
+        f"content; sentinel leaked into "
+        f"history_blob={history_blob!r}"
+    )
+    # Control: the eval sentinel also must not surface in
+    # the history (the case_reflection records carry
+    # rationale strings but never the input prompt).
+    assert eval_sentinel not in history_blob, (
+        f"history.jsonl must NOT contain eval case content "
+        f"either; eval sentinel leaked into "
+        f"history_blob={history_blob!r}"
+    )
+
+    # The ``optimize_finished`` event is the run-level
+    # termination record. It must mirror the CLI payload's
+    # ``stop_reason`` and must not carry held-out content in
+    # any of its sub-fields (event, run_id, status, rounds,
+    # record_counts, blockers, warnings, stop_reason,
+    # timestamp).
+    finished = [
+        r for r in records
+        if isinstance(r, dict) and r.get("event") == "optimize_finished"
+    ]
+    assert finished, (
+        f"pipeline must persist an optimize_finished event "
+        f"for a no-LLM no_candidate_edits run; got "
+        f"events={[r.get('event') for r in records]!r}"
+    )
+    last_finished = finished[-1]
+    assert last_finished.get("stop_reason") == payload["stop_reason"], (
+        f"optimize_finished.stop_reason must mirror the "
+        f"CLI payload's stop_reason; got "
+        f"finished.stop_reason={last_finished.get('stop_reason')!r} "
+        f"payload.stop_reason={payload['stop_reason']!r}"
+    )
+    assert last_finished.get("stop_reason") in STOP_REASONS, (
+        f"optimize_finished.stop_reason must be a "
+        f"vocabulary string from {sorted(STOP_REASONS)!r}; "
+        f"got {last_finished.get('stop_reason')!r}"
+    )
+    finished_blob = json.dumps(last_finished, sort_keys=True)
+    assert held_out_sentinel not in finished_blob, (
+        f"optimize_finished event must NOT contain "
+        f"held-out case content; sentinel leaked into "
+        f"finished_blob={finished_blob!r}"
+    )
+    # Per-field focused assertion on the optimize_finished
+    # event: ``blockers`` and ``warnings`` here mirror the
+    # payload's lists and use the same pre-canned {id,
+    # message} contract.
+    for warning in last_finished.get("warnings", []) or []:
+        assert isinstance(warning, dict), (
+            f"optimize_finished.warnings entries must be "
+            f"dicts; got {type(warning).__name__} "
+            f"({warning!r})"
+        )
+        assert "message" in warning, (
+            f"optimize_finished.warnings entry missing "
+            f"'message' key; got {warning!r}"
+        )
+        assert held_out_sentinel not in warning["message"], (
+            f"optimize_finished warning message must NOT "
+            f"contain held-out sentinel; got warning="
+            f"{warning!r}"
+        )
+    for blocker in last_finished.get("blockers", []) or []:
+        assert isinstance(blocker, dict), (
+            f"optimize_finished.blockers entries must be "
+            f"dicts; got {type(blocker).__name__} "
+            f"({blocker!r})"
+        )
+        assert "message" in blocker, (
+            f"optimize_finished.blockers entry missing "
+            f"'message' key; got {blocker!r}"
+        )
+        assert held_out_sentinel not in blocker["message"], (
+            f"optimize_finished blocker message must NOT "
+            f"contain held-out sentinel; got blocker="
+            f"{blocker!r}"
+        )

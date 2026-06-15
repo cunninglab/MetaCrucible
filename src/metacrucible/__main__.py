@@ -2560,6 +2560,7 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         "selected_candidate_ids": list(
             pipeline_result.selected_candidate_ids
         ),
+        "stop_reason": pipeline_result.stop_reason,
     }
     _emit(payload, as_json=as_json)
 

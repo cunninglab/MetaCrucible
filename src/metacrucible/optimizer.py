@@ -82,6 +82,13 @@ __all__ = [
     "SCHEMA_VALIDATION_BLOCKED",
     "STALE_BASE_HASH_BLOCKER",
     "MUTABLE_RANGE_CONFLICT_BLOCKER",
+    "STOP_REASONS",
+    "STOP_REASON_ACCEPTED",
+    "STOP_REASON_MAX_ROUNDS_REACHED",
+    "STOP_REASON_NO_CANDIDATE_EDITS",
+    "STOP_REASON_NO_CANDIDATE_SELECTED",
+    "STOP_REASON_PRECONDITION_BLOCKED",
+    "STOP_REASON_ROUND_BLOCKED",
     "apply_patch_revision",
     "build_optimizer_context",
     "compare_eval_held_out",
@@ -157,6 +164,30 @@ THEME_SUMMARY_BUDGET: int = 5
 #: the re-injected guidance small so a future round's provider
 #: payload stays bounded.
 THEME_SUMMARY_MAX_CHARS: int = 280
+
+#: Machine-stable stop reasons the pipeline may emit on
+#: :class:`OptimizerPipelineResult.stop_reason` and on the
+#: ``optimize_finished`` / ``optimize_blocked`` history events.
+#: The strings are the contract; downstream tools branch on
+#: them. Do not change the spelling of any existing id; add
+#: a new constant if a new stop path is introduced.
+STOP_REASON_MAX_ROUNDS_REACHED: str = "max_rounds_reached"
+STOP_REASON_ACCEPTED: str = "accepted"
+STOP_REASON_NO_CANDIDATE_EDITS: str = "no_candidate_edits"
+STOP_REASON_NO_CANDIDATE_SELECTED: str = "no_candidate_selected"
+STOP_REASON_ROUND_BLOCKED: str = "round_blocked"
+STOP_REASON_PRECONDITION_BLOCKED: str = "precondition_blocked"
+
+#: All stop reasons the pipeline may emit. Useful for tests
+#: that want to assert exhaustiveness over the vocabulary.
+STOP_REASONS: frozenset[str] = frozenset({
+    STOP_REASON_MAX_ROUNDS_REACHED,
+    STOP_REASON_ACCEPTED,
+    STOP_REASON_NO_CANDIDATE_EDITS,
+    STOP_REASON_NO_CANDIDATE_SELECTED,
+    STOP_REASON_ROUND_BLOCKED,
+    STOP_REASON_PRECONDITION_BLOCKED,
+})
 
 
 # --------------------------------------------------------------------------- #
@@ -535,6 +566,13 @@ class OptimizerPipelineResult:
     best_revision: dict[str, Any] | None
     acceptance_decision: dict[str, Any]
     selected_candidate_ids: list[str]
+    #: Machine-stable termination reason (one of
+    #: :data:`STOP_REASONS`). Set on every
+    #: :class:`OptimizerPipelineResult` regardless of
+    #: whether the run completed, was rejected, or was
+    #: blocked. The CLI composes this into the ``--json``
+    #: payload at the top level.
+    stop_reason: str
 
 
 # --------------------------------------------------------------------------- #
@@ -1748,6 +1786,7 @@ def run_optimizer_pipeline(
             best_revision=None,
             acceptance_decision=acceptance_decision,
             selected_candidate_ids=[],
+            stop_reason=STOP_REASON_PRECONDITION_BLOCKED,
         )
 
     # 3. Per-case reflections (OPT-3) over failed / weak
@@ -1784,6 +1823,16 @@ def run_optimizer_pipeline(
     bounded_rejected_themes: list[dict[str, str]] = []
 
     rounds_attempted = 0
+    # ``stop_reason`` is the machine-stable termination
+    # reason the pipeline writes onto
+    # :class:`OptimizerPipelineResult` and onto the
+    # ``optimize_finished`` history event. It is set
+    # locally inside the round loop on every break path
+    # and at the end of the function. The default is
+    # ``max_rounds_reached`` so a clean exhaustion of
+    # ``range(1, context.max_rounds + 1)`` records that
+    # reason; explicit break paths overwrite it.
+    stop_reason: str = STOP_REASON_MAX_ROUNDS_REACHED
     try:
         for round_idx in range(1, context.max_rounds + 1):
             rounds_attempted = round_idx
@@ -2003,6 +2052,7 @@ def run_optimizer_pipeline(
                         "edit suggestions; stopping"
                     ),
                 })
+                stop_reason = STOP_REASON_NO_CANDIDATE_EDITS
                 break
             # Rank: deterministic — the LLM-provided
             # order is the priority order. The MVP does
@@ -2092,6 +2142,7 @@ def run_optimizer_pipeline(
                         "suggestion; stopping"
                     ),
                 })
+                stop_reason = STOP_REASON_NO_CANDIDATE_SELECTED
                 break
 
             # 3e. Conflict checks (OPT-5) BEFORE mutation.
@@ -2326,6 +2377,7 @@ def run_optimizer_pipeline(
                         "timestamp": _now_iso(),
                     },
                 )
+                stop_reason = STOP_REASON_ACCEPTED
                 break
             else:
                 # Reject the candidate: restore the base
@@ -2362,11 +2414,16 @@ def run_optimizer_pipeline(
             )
         accepted_status = "BLOCKED"
         blockers.extend(rb.blockers)
+        stop_reason = STOP_REASON_ROUND_BLOCKED
         # NB-6: annotate the round-blocked event in the
         # history lineage so a downstream audit can detect
         # which round tripped the gate (the run-level
         # BLOCKED status is composed at the evidence layer;
-        # this marker carries the per-round cause).
+        # this marker carries the per-round cause). The
+        # ``stop_reason`` is duplicated onto the history
+        # payload so a downstream lineage reader can branch
+        # on the machine-stable reason without cross-
+        # referencing the evidence bundle.
         _append_history(
             repo,
             {
@@ -2454,6 +2511,7 @@ def run_optimizer_pipeline(
             "record_counts": dict(record_counts),
             "blockers": blockers,
             "warnings": warnings,
+            "stop_reason": stop_reason,
             "timestamp": _now_iso(),
         },
     )
@@ -2469,6 +2527,7 @@ def run_optimizer_pipeline(
         best_revision=best_revision,
         acceptance_decision=acceptance_decision,
         selected_candidate_ids=selected_candidate_ids,
+        stop_reason=stop_reason,
     )
 
 

@@ -3499,3 +3499,121 @@ def test_acg6r_blocker_ids_stable() -> None:
     assert ROUTING_HITL_UNCONFIRMED_BLOCKER == "routing-hitl-unconfirmed"
     assert ROUTING_CAP_EXCEEDED_BLOCKER == "routing-cap-exceeded"
     assert MUTABLE_RANGE_CONFLICT_BLOCKER == "mutable-range-conflict"
+
+
+
+# --------------------------------------------------------------------------- #
+# Issue #36 — Stopping Condition: stop_reason contract                         #
+# --------------------------------------------------------------------------- #
+
+
+def test_stop_reason_in_cli_json_payload_for_optimizer_run(
+    tmp_path: Path,
+) -> None:
+    """The ``optimize --json`` payload exposes the pipeline's
+    machine-stable ``stop_reason`` at the top level.
+
+    Issue #36 / Stopping Condition: the CLI must surface the
+    same ``stop_reason`` the pipeline recorded on the result
+    so a downstream reader can branch on the termination
+    reason without re-deriving it from ``status`` /
+    ``blockers`` / ``warnings``. The test runs the full
+    ``metacrucible optimize`` command via subprocess with a
+    clean benchmark + seeded envelope + seeded artifact; the
+    pipeline's ``call_fn=None`` MVP path produces the
+    ``no_candidate_edits`` stop reason, and the CLI must
+    surface that value at the top level of the ``--json``
+    payload.
+    """
+    import hashlib
+
+    workspace = _init_workspace(tmp_path)
+    benchmark = workspace / BENCHMARK_FILE_NAME
+    artifact = workspace / "SKILL.md"
+    artifact.write_text(
+        "---\n"
+        "name: stop-reason-cli-skill\n"
+        "description: Stopping Condition CLI regression fixture\n"
+        "---\n"
+        "# body\nThe body is the only mutable range.\n",
+        encoding="utf-8",
+    )
+    envelope = workspace / ".metacrucible" / "envelope.json"
+    envelope.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "artifact_path": str(artifact),
+                "artifact_workspace": str(workspace),
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_jsonl(
+        benchmark,
+        [
+            _metadata_record(),
+            _reviewed_case("eval-1", split="eval"),
+            _reviewed_case("held-1", split="held_out"),
+        ],
+    )
+    # Sanity: the fixture's body hash matches what the
+    # pipeline will compute when it parses the artifact.
+    expected_body_hash = hashlib.sha256(
+        b"# body\nThe body is the only mutable range.\n"
+    ).hexdigest()
+    assert expected_body_hash == hashlib.sha256(
+        artifact.read_bytes().split(b"\n---\n", 1)[1]
+    ).hexdigest(), (
+        f"CLI regression fixture: the body hash the test "
+        f"expects ({expected_body_hash!r}) must match the "
+        f"artifact on disk; the envelope / artifact pair is "
+        f"the contract the CLI threads through"
+    )
+
+    result = _run_metacrucible(
+        ["optimize", str(workspace), "--json"],
+        cwd=REPO_ROOT,
+    )
+    assert result.returncode in (EXIT_OK, EXIT_BLOCKED), (
+        f"`optimize --json` must exit 0 or {EXIT_BLOCKED}; "
+        f"got rc={result.returncode} stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        pytest.fail(
+            f"`optimize --json` must emit valid JSON on "
+            f"stdout; got stdout={result.stdout!r} error={exc}"
+        )
+    assert isinstance(payload, dict), (
+        f"optimize --json must return a JSON object; got "
+        f"{type(payload).__name__} ({payload!r})"
+    )
+    # The stop_reason key is a top-level payload field
+    # alongside status / run_id / rounds. The MVP no-LLM
+    # path produces an empty-suggestion round, which the
+    # pipeline records as ``no_candidate_edits``.
+    assert "stop_reason" in payload, (
+        f"optimize --json must surface stop_reason at "
+        f"the top level; got keys={sorted(payload.keys())!r}"
+    )
+    assert payload["stop_reason"] == "no_candidate_edits", (
+        f"CLI payload must report stop_reason="
+        f"'no_candidate_edits' for a no-LLM run; got "
+        f"payload['stop_reason']={payload['stop_reason']!r}"
+    )
+    # The reason must come from the canonical vocabulary;
+    # the CLI must not invent a prose value. The
+    # vocabulary is a closed set exported from the
+    # optimizer module.
+    from metacrucible.optimizer import STOP_REASONS
+    assert payload["stop_reason"] in STOP_REASONS, (
+        f"CLI stop_reason must be a vocabulary string "
+        f"from {sorted(STOP_REASONS)!r}; got "
+        f"{payload['stop_reason']!r}"
+    )

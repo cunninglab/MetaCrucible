@@ -10,10 +10,16 @@ optimizer pipeline and the ``optimize`` CLI:
     ``stop_reason`` at the top level so downstream tools
     can branch on it without re-deriving the verdict from
     ``status`` / ``blockers`` / ``warnings``.
-  - The ``optimize_finished`` and ``optimize_blocked``
-    history events carry the same ``stop_reason`` so a
-    lineage reader can branch on the per-event reason
-    without cross-referencing the evidence bundle.
+  - The ``optimize_finished`` history event carries the
+    same ``stop_reason`` so a lineage reader can branch on
+    the per-event reason without cross-referencing the
+    evidence bundle. The ``optimize_blocked`` history
+    events do NOT carry ``stop_reason`` (the canonical
+    reason lives on the result and the
+    ``optimize_finished`` event only; blocked events stay
+    stop_reason-free to keep the three blocked-event
+    payloads uniform with the pre-existing lineage
+    contract).
 
 Each test exercises exactly one Stopping Condition path:
 
@@ -468,6 +474,147 @@ def test_stop_reason_round_blocked_on_empty_replacement(
         f"result; got "
         f"stop_reason={finished[-1].get('stop_reason')!r}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Negative regression: ``optimize_blocked`` events do NOT carry ``stop_reason``#
+# --------------------------------------------------------------------------- #
+
+
+def test_optimize_blocked_events_do_not_carry_stop_reason(
+    tmp_path: Path,
+) -> None:
+    """Every ``optimize_blocked`` lineage event must be
+    emitted without a ``stop_reason`` field.
+
+    The blocked-lineage contract is uniform across all
+    three blocked paths (precondition, profile-gate,
+    round-blocked): each ``optimize_blocked`` history
+    event records the per-event cause (``round_id``,
+    ``blockers``, ``timestamp``) and leaves the
+    canonical machine-stable ``stop_reason`` to the
+    pipeline result and the ``optimize_finished`` event
+    only. A regression that re-adds ``stop_reason`` to
+    any blocked event (or that starts omitting it from
+    the finished event) breaks the lineage contract and
+    must surface here.
+
+    The test exercises two of the three blocked paths
+    deterministically — ``precondition_blocked`` (no
+    reviewed cases) and ``round_blocked`` (empty
+    replacement) — and asserts the field is absent on
+    every ``optimize_blocked`` event in the history
+    stream. The profile-gate path is harder to trigger
+    deterministically and shares the same emission
+    site as the precondition path, so the two-path
+    guard is sufficient to pin the contract.
+    """
+    import hashlib
+
+    # --- precondition_blocked path ------------------------------- #
+    pre_ws = _init_workspace(tmp_path / "pre")
+    pre_benchmark, pre_artifact = _seed_fixture(
+        pre_ws, include_reviewed_cases=False
+    )
+    pre_result = run_optimizer_pipeline(
+        workspace=pre_ws,
+        benchmark_path=pre_benchmark,
+        artifact_path=pre_artifact,
+        call_fn=None,
+        max_rounds=1,
+        human_confirmed=False,
+    )
+    assert pre_result.status == "BLOCKED", (
+        f"precondition fixture must terminate BLOCKED; "
+        f"got status={pre_result.status!r}"
+    )
+    pre_history = _read_history(pre_ws)
+    pre_blocked = [
+        r for r in pre_history
+        if isinstance(r, dict) and r.get("event") == "optimize_blocked"
+    ]
+    assert pre_blocked, (
+        f"precondition-blocked run must persist an "
+        f"optimize_blocked event; got events="
+        f"{[r.get('event') for r in pre_history]!r}"
+    )
+    for i, ev in enumerate(pre_blocked):
+        assert "stop_reason" not in ev, (
+            f"optimize_blocked event #{i} on the "
+            f"precondition path must NOT carry a "
+            f"stop_reason field; got event={ev!r}"
+        )
+
+    # --- round_blocked path -------------------------------------- #
+    round_ws = _init_workspace(tmp_path / "round")
+    round_benchmark, round_artifact = _seed_fixture(round_ws)
+    body_hash = hashlib.sha256(_BODY_TEXT.encode("utf-8")).hexdigest()
+
+    def _empty_replacement_call_fn(
+        *, repair_context: Any = None
+    ) -> dict[str, Any]:
+        """Return one non-routing edit with an empty
+        body so the merge plan flips
+        ``merge_outside_mutable_range=True`` and the
+        round raises ``_RoundBlocked``.
+        """
+        return {
+            "rationale": "negative-guard fixture",
+            "suggested_edits": [
+                {
+                    "range_id": 0,
+                    "base_hash": body_hash,
+                    "intent": "negative_guard_empty_replacement",
+                    "replacement": "",
+                    "rationale": "empty replacement trips the round",
+                    "routing": False,
+                }
+            ],
+        }
+
+    round_result = run_optimizer_pipeline(
+        workspace=round_ws,
+        benchmark_path=round_benchmark,
+        artifact_path=round_artifact,
+        call_fn=_empty_replacement_call_fn,
+        max_rounds=1,
+        human_confirmed=False,
+    )
+    assert round_result.status == "BLOCKED", (
+        f"round_blocked fixture must terminate BLOCKED; "
+        f"got status={round_result.status!r}"
+    )
+    round_history = _read_history(round_ws)
+    round_blocked = [
+        r for r in round_history
+        if isinstance(r, dict) and r.get("event") == "optimize_blocked"
+    ]
+    assert round_blocked, (
+        f"round-blocked run must persist an "
+        f"optimize_blocked event; got events="
+        f"{[r.get('event') for r in round_history]!r}"
+    )
+    for i, ev in enumerate(round_blocked):
+        assert "stop_reason" not in ev, (
+            f"optimize_blocked event #{i} on the "
+            f"round_blocked path must NOT carry a "
+            f"stop_reason field; got event={ev!r}"
+        )
+
+    # --- cross-path uniformity check ----------------------------- #
+    # Both blocked paths must agree that ``stop_reason``
+    # is absent. The field shape is not required to be
+    # identical: the precondition path short-circuits
+    # before the round loop and therefore has no
+    # ``round_id``, while the round_blocked path carries
+    # one. The contract is uniform absence of
+    # ``stop_reason``, not uniform field shape.
+    for i, ev in enumerate(pre_blocked + round_blocked):
+        assert "stop_reason" not in ev, (
+            f"optimize_blocked event #{i} must NOT "
+            f"carry a stop_reason field across either "
+            f"blocked path; got event={ev!r}"
+        )
 
 
 # --------------------------------------------------------------------------- #

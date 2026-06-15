@@ -3763,11 +3763,11 @@ def test_stop_reason_does_not_leak_held_out_content(
     """Stopping Condition output and the ``optimize_finished``
     history event MUST NOT include held-out case content.
 
-    The optimizer pipeline''s termination surface is small and
+    The optimizer pipeline's termination surface is small and
     machine-stable: ``stop_reason`` is one of six vocabulary
     strings; ``warnings`` and ``blockers`` carry ``{id, message}``
     pairs whose ``message`` strings are pre-canned English prose.
-    A regression that threads a held-out case''s ``input.prompt``,
+    A regression that threads a held-out case's ``input.prompt``,
     ``expected_output``, ``checks``, or ``judgment`` into any of
     those fields would expose held-out content to operators
     even though the held-out split is supposed to be
@@ -3799,8 +3799,8 @@ def test_stop_reason_does_not_leak_held_out_content(
         held-out sentinel anywhere (covers the
         ``optimize_finished`` event in particular plus
         every other per-run event).
-      - The ``optimize_finished`` event''s ``stop_reason``
-        mirrors the CLI payload''s ``stop_reason`` so a
+      - The ``optimize_finished`` event's ``stop_reason``
+        mirrors the CLI payload's ``stop_reason`` so a
         lineage reader sees the same termination reason.
     """
     held_out_sentinel = "HELD_OUT_STOP_REASON_SECRET_DO_NOT_LEAK"
@@ -3837,9 +3837,11 @@ def test_stop_reason_does_not_leak_held_out_content(
     # case content (input / expected_output / checks /
     # judgment). The eval case carries a different sentinel as
     # a control: the assertions are about the held-out sentinel
-    # only, but the eval sentinel proves the search rule is in
-    # fact scanning the payload and history, not silently
-    # passing.
+    # only, but the eval sentinel strengthens coverage against
+    # any case-content leak from either split. The string-
+    # search is constructed against ``json.dumps`` of the
+    # actual payload / history output, so its realness is
+    # established by construction.
     _write_jsonl(
         benchmark,
         [
@@ -3921,7 +3923,7 @@ def test_stop_reason_does_not_leak_held_out_content(
         f"got payload['stop_reason']={payload['stop_reason']!r}"
     )
 
-    # The serializer''s whole-string view: every field the
+    # The serializer's whole-string view: every field the
     # CLI emits, recursively, gets stringified and searched.
     # This covers stop_reason, warnings, blockers, rounds,
     # record_counts, selected_candidate_ids, acceptance_decision,
@@ -4006,7 +4008,7 @@ def test_stop_reason_does_not_leak_held_out_content(
     )
 
     # The ``optimize_finished`` event is the run-level
-    # termination record. It must mirror the CLI payload''s
+    # termination record. It must mirror the CLI payload's
     # ``stop_reason`` and must not carry held-out content in
     # any of its sub-fields (event, run_id, status, rounds,
     # record_counts, blockers, warnings, stop_reason,
@@ -4023,7 +4025,7 @@ def test_stop_reason_does_not_leak_held_out_content(
     last_finished = finished[-1]
     assert last_finished.get("stop_reason") == payload["stop_reason"], (
         f"optimize_finished.stop_reason must mirror the "
-        f"CLI payload''s stop_reason; got "
+        f"CLI payload's stop_reason; got "
         f"finished.stop_reason={last_finished.get('stop_reason')!r} "
         f"payload.stop_reason={payload['stop_reason']!r}"
     )
@@ -4040,7 +4042,7 @@ def test_stop_reason_does_not_leak_held_out_content(
     )
     # Per-field focused assertion on the optimize_finished
     # event: ``blockers`` and ``warnings`` here mirror the
-    # payload''s lists and use the same pre-canned {id,
+    # payload's lists and use the same pre-canned {id,
     # message} contract.
     for warning in last_finished.get("warnings", []) or []:
         assert isinstance(warning, dict), (

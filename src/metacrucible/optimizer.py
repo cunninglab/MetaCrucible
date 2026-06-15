@@ -167,10 +167,10 @@ THEME_SUMMARY_MAX_CHARS: int = 280
 
 #: Machine-stable stop reasons the pipeline may emit on
 #: :class:`OptimizerPipelineResult.stop_reason` and on the
-#: ``optimize_finished`` / ``optimize_blocked`` history events.
-#: The strings are the contract; downstream tools branch on
-#: them. Do not change the spelling of any existing id; add
-#: a new constant if a new stop path is introduced.
+#: ``optimize_finished`` history event. The strings are the
+#: contract; downstream tools branch on them. Do not change
+#: the spelling of any existing id; add a new constant if a
+#: new stop path is introduced.
 STOP_REASON_MAX_ROUNDS_REACHED: str = "max_rounds_reached"
 STOP_REASON_ACCEPTED: str = "accepted"
 STOP_REASON_NO_CANDIDATE_EDITS: str = "no_candidate_edits"
@@ -2419,11 +2419,7 @@ def run_optimizer_pipeline(
         # history lineage so a downstream audit can detect
         # which round tripped the gate (the run-level
         # BLOCKED status is composed at the evidence layer;
-        # this marker carries the per-round cause). The
-        # ``stop_reason`` is duplicated onto the history
-        # payload so a downstream lineage reader can branch
-        # on the machine-stable reason without cross-
-        # referencing the evidence bundle.
+        # this marker carries the per-round cause).
         _append_history(
             repo,
             {

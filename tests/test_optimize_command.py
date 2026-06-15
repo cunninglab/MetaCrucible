@@ -3617,3 +3617,138 @@ def test_stop_reason_in_cli_json_payload_for_optimizer_run(
         f"from {sorted(STOP_REASONS)!r}; got "
         f"{payload['stop_reason']!r}"
     )
+
+def test_optimize_default_max_rounds_is_one_without_flag(
+    tmp_path: Path,
+) -> None:
+    """The ``optimize`` CLI defaults ``max_rounds`` to 1
+    when the operator omits the ``--max-rounds`` flag.
+
+    Issue #36 Stopping Condition: the MVP round budget
+    (one round per optimize invocation) is the safe
+    default; an explicit ``--max-rounds N>1`` opt-in is
+    the only way to spend more than one round. The test
+    runs the full ``metacrucible optimize`` command
+    without the flag and asserts the CLI ``--json``
+    payload surfaces both ``max_rounds == 1`` (the
+    propagated default) and ``rounds == 1`` (the
+    single-iteration execution) and ``stop_reason`` is
+    a vocabulary id.
+
+    The fixture is the same OPT-9 shape used by
+    :func:`test_stop_reason_in_cli_json_payload_for_optimizer_run`:
+    a single-mutable-range Skill body, an envelope that
+    declares the artifact path, and a benchmark with one
+    eligible eval + one eligible held-out case. The MVP
+    no-LLM path (``call_fn=None``) produces the
+    ``no_candidate_edits`` stop reason - the exact value
+    is not asserted here; only that the value comes from
+    the canonical ``STOP_REASONS`` vocabulary.
+    """
+    workspace = _init_workspace(tmp_path)
+    benchmark = workspace / BENCHMARK_FILE_NAME
+    artifact = workspace / "SKILL.md"
+    artifact.write_text(
+        "---\n"
+        "name: default-max-rounds-skill\n"
+        "description: Default max_rounds=1 regression fixture\n"
+        "---\n"
+        "# body\nThe body is the only mutable range.\n",
+        encoding="utf-8",
+    )
+    envelope = workspace / ".metacrucible" / "envelope.json"
+    envelope.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "artifact_path": str(artifact),
+                "artifact_workspace": str(workspace),
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_jsonl(
+        benchmark,
+        [
+            _metadata_record(),
+            _reviewed_case("eval-1", split="eval"),
+            _reviewed_case("held-1", split="held_out"),
+        ],
+    )
+
+    # No ``--max-rounds`` flag: the operator accepts the
+    # default. The CLI must propagate ROUND_BUDGET_DEFAULT
+    # (1) into the payload so a downstream reader can see
+    # the configured budget alongside the rounds actually
+    # executed.
+    result = _run_metacrucible(
+        ["optimize", str(workspace), "--json"],
+        cwd=REPO_ROOT,
+    )
+    assert result.returncode in (EXIT_OK, EXIT_BLOCKED), (
+        f"`optimize --json` (no --max-rounds) must exit "
+        f"0 or {EXIT_BLOCKED}; got rc={result.returncode} "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        pytest.fail(
+            f"`optimize --json` must emit valid JSON on "
+            f"stdout; got stdout={result.stdout!r} error={exc}"
+        )
+    assert isinstance(payload, dict), (
+        f"optimize --json must return a JSON object; got "
+        f"{type(payload).__name__} ({payload!r})"
+    )
+
+    # ``max_rounds`` is propagated from
+    # ROUND_BUDGET_DEFAULT (1) into the CLI payload when
+    # the operator omits the flag. A regression that
+    # bumps the default OR that drops the propagation
+    # would change this value - the assertion pins it.
+    assert "max_rounds" in payload, (
+        f"optimize --json must surface max_rounds at the "
+        f"top level so downstream readers can see the "
+        f"configured budget; got keys={sorted(payload.keys())!r}"
+    )
+    assert payload["max_rounds"] == 1, (
+        f"optimize --json without --max-rounds must "
+        f"propagate ROUND_BUDGET_DEFAULT (1) into the "
+        f"payload; got payload['max_rounds']="
+        f"{payload['max_rounds']!r}"
+    )
+
+    # ``rounds`` reflects the actual number of iterations
+    # the pipeline ran. With max_rounds=1 the loop runs
+    # exactly one iteration then exits.
+    assert "rounds" in payload, (
+        f"optimize --json must surface rounds at the top "
+        f"level alongside max_rounds; got keys="
+        f"{sorted(payload.keys())!r}"
+    )
+    assert payload["rounds"] == 1, (
+        f"optimize --json without --max-rounds must run "
+        f"exactly 1 round (matches the propagated "
+        f"budget); got payload['rounds']={payload['rounds']!r}"
+    )
+
+    # ``stop_reason`` must come from the canonical
+    # vocabulary so the operator's downstream tooling
+    # can branch on it. The MVP no-LLM path produces
+    # ``no_candidate_edits``; this assertion is the
+    # broader vocabulary check that pairs with the
+    # no-LLM specific assertion in the sibling test.
+    from metacrucible.optimizer import STOP_REASONS
+    assert "stop_reason" in payload, (
+        f"optimize --json must surface stop_reason at "
+        f"the top level; got keys={sorted(payload.keys())!r}"
+    )
+    assert payload["stop_reason"] in STOP_REASONS, (
+        f"CLI stop_reason must be a vocabulary string "
+        f"from {sorted(STOP_REASONS)!r}; got "
+        f"payload['stop_reason']={payload['stop_reason']!r}"
+    )

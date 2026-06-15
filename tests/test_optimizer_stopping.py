@@ -578,3 +578,165 @@ def test_stop_reason_default_for_clean_exhaustion() -> None:
         f"STOP_REASONS must enumerate exactly the six "
         f"contract stop reasons; got {sorted(STOP_REASONS)!r}"
     )
+
+# --------------------------------------------------------------------------- #
+# Loop-bound: ``max_rounds`` is honored on continuous rejection                #
+# --------------------------------------------------------------------------- #
+
+def test_max_rounds_not_exceeded_under_continuous_rejection(
+    tmp_path: Path,
+) -> None:
+    """``run_optimizer_pipeline`` runs EXACTLY ``max_rounds``
+    iterations under continuous suggestion + rejection and
+    stops with ``stop_reason == max_rounds_reached``.
+
+    Issue #36 Stopping Condition: the round loop is bounded
+    by ``max_rounds``; a regression that breaks the loop
+    early, runs more than ``max_rounds``, or fails to set
+    the default ``stop_reason`` after the loop exhausts
+    must be visible at the result level.
+
+    The test injects:
+
+      - a ``call_fn`` stub that returns one valid
+        :data:`ROUND_REFLECTION_SCHEMA`-shaped suggestion
+        every invocation. The suggestion targets the only
+        mutable range with the parser-owned
+        ``content_hash`` and a non-empty
+        ``replacement`` so the merge step marks the plan
+        ``fits_in_range = True``. ``routing = False`` so
+        the per-round routing-cap / HITL gates do not
+        trip.
+      - an ``eval_call_fn`` stub that returns
+        ``{"status": "FAIL"}`` for every case. The
+        comparator sees zero ``FAIL -> PASS`` transitions
+        on the candidate side and rejects every round.
+
+    With ``max_rounds=2`` and a never-improving candidate,
+    the loop runs both iterations, rolls back the
+    candidate after each rejection, exits the ``for``
+    loop naturally (no early ``break``), and reports
+    ``stop_reason="max_rounds_reached"`` (the
+    init-time default that survives because no explicit
+    break path overwrote it).
+    """
+    import hashlib
+
+    workspace = _init_workspace(tmp_path)
+    benchmark, artifact = _seed_fixture(workspace)
+    body_hash = hashlib.sha256(_BODY_TEXT.encode("utf-8")).hexdigest()
+
+    def _suggestion_call_fn(
+        *, repair_context: Any = None
+    ) -> dict[str, Any]:
+        """Return one valid suggestion targeting range 0.
+
+        The replacement is a non-empty string that fits
+        inside the body range so the merge plan marks
+        ``fits_in_range = True``; the ``base_hash``
+        matches the parser-owned ``content_hash`` so the
+        suggestion survives the stale-hash dedup in step
+        3c. ``routing = False`` so the per-round
+        routing-cap / HITL gates do not block.
+        """
+        return {
+            "rationale": (
+                "continuous-rejection regression: one valid "
+                "non-routing suggestion per round"
+            ),
+            "suggested_edits": [
+                {
+                    "range_id": 0,
+                    "base_hash": body_hash,
+                    "intent": "no_improvement_yet",
+                    "replacement": (
+                        "# body\n"
+                        "The body is the only mutable range.\n"
+                    ),
+                    "rationale": (
+                        "candidate that always fails the eval "
+                        "comparator under the stub eval_call_fn"
+                    ),
+                    "routing": False,
+                }
+            ],
+        }
+
+    def _failing_eval_call_fn(
+        case: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Return ``FAIL`` for every case.
+
+        The shape mirrors :func:`_evaluate_single_case`
+        enough for :func:`compare_eval_held_out` to read
+        ``status``. Both baseline and candidate eval /
+        held-out results report ``FAIL`` so the
+        comparator sees zero ``FAIL -> PASS`` transitions
+        and rejects every round.
+        """
+        case_id = (
+            case.get("case_id") if isinstance(case, dict) else None
+        )
+        case_id_str = case_id if isinstance(case_id, str) else "?"
+        return {
+            "case_id": case_id_str,
+            "evaluator": "rule_check",
+            "status": "FAIL",
+            "blockers": [],
+            "evidence": {"stub": "continuous-rejection"},
+        }
+
+    result = run_optimizer_pipeline(
+        workspace=workspace,
+        benchmark_path=benchmark,
+        artifact_path=artifact,
+        call_fn=_suggestion_call_fn,
+        max_rounds=2,
+        human_confirmed=False,
+        eval_call_fn=_failing_eval_call_fn,
+    )
+
+    # The loop ran exactly ``max_rounds`` iterations: not
+    # 1 (would be a regression that breaks the loop on
+    # the first rejection) and not 3+ (would be a
+    # regression that ignores the configured budget).
+    assert result.rounds == 2, (
+        f"continuous-rejection run with max_rounds=2 must "
+        f"run EXACTLY 2 iterations before stopping; got "
+        f"result.rounds={result.rounds!r}"
+    )
+    # The init-time default survives because no explicit
+    # break path overwrote it: every round produced a
+    # non-empty ranked set (the stub returns one
+    # valid suggestion), the comparator rejected
+    # (stub eval_call_fn returns FAIL), and the loop
+    # exhausted the budget without an early break.
+    assert result.stop_reason == STOP_REASON_MAX_ROUNDS_REACHED, (
+        f"continuous-rejection run that exhausts the "
+        f"budget must report stop_reason="
+        f"{STOP_REASON_MAX_ROUNDS_REACHED!r}; got "
+        f"result.stop_reason={result.stop_reason!r}"
+    )
+    assert result.stop_reason in STOP_REASONS, (
+        f"stop_reason must be a vocabulary string from "
+        f"{sorted(STOP_REASONS)!r}; got "
+        f"result.stop_reason={result.stop_reason!r}"
+    )
+    # The comparator rejected every round; the run
+    # terminates with REJECTED status (no blockers, no
+    # accepted round).
+    assert result.status == "REJECTED", (
+        f"continuous-rejection run must terminate with "
+        f"REJECTED status (the comparator never accepted "
+        f"and there are no blockers); got "
+        f"result.status={result.status!r}"
+    )
+    # The on-disk artifact must be unchanged: every
+    # rejected round rolled back the candidate write so
+    # the run-level artifact equals the seed bytes.
+    assert artifact.read_bytes() == _ARTIFACT_TEXT.encode("utf-8"), (
+        f"continuous-rejection run must NOT mutate the "
+        f"artifact on disk (per-round rollback restores "
+        f"the seed bytes after each rejection); got "
+        f"artifact bytes={artifact.read_bytes()!r}"
+    )

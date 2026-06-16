@@ -100,6 +100,7 @@ __all__ = [
     "run_optimizer_pipeline",
     "validate_resume_interrupted_runs",
     "ROUTING_REVISION_CONFIRMATION_REQUIRED_BLOCKER",
+    "ROUTING_REVISION_DIVERGENCE_BLOCKER",
     "ROUTING_REVISION_NON_INTERACTIVE_BLOCKER",
     "detect_routing_revision_confirmation",
     "validate_routing_revision_confirmation",
@@ -193,6 +194,17 @@ ROUTING_REVISION_CONFIRMATION_REQUIRED_BLOCKER: str = (
 ROUTING_REVISION_NON_INTERACTIVE_BLOCKER: str = (
     "routing-revision-non-interactive-blocked"
 )
+
+#: Stable blocker id emitted by the CLI when the mutating apply
+#: pass returns ``selected_candidate_ids`` that do NOT intersect
+#: the operator-approved routing ``suggestion_id`` set from the
+#: preview pass (Issue #39 global review). With
+#: ``call_fn=None`` this divergence is impossible (deterministic),
+#: but a future real ``call_fn`` could surface a different
+#: routing set in the apply pass than what the operator just
+#: approved in the preview. The CLI must BLOCK rather than
+#: silently accept an unapproved routing change.
+ROUTING_REVISION_DIVERGENCE_BLOCKER: str = "routing-revision-divergence"
 
 #: Bounded theme summary cap (OPT-4). Rejected edit buffers are
 #: injected into later rounds only as bounded theme summaries

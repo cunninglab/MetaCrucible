@@ -5390,6 +5390,16 @@ def test_optimize_interactive_routing_revision_preview_accept_runs_mutating_pass
         preview_records=preview_records,
         mutating_status="REJECTED",
         mutating_run_id="mutating-run-1",
+        # Stub the mutating pass as coherent with the
+        # operator-approved routing revision: the apply pass
+        # selected the same suggestion_id the operator
+        # approved, so the post-apply divergence guard
+        # (Issue #39 global review) does not fire and the
+        # test exercises the central exit-code matrix
+        # (REJECTED + no blockers => EXIT_OK).
+        mutating_selected_candidate_ids=[
+            r["suggestion_id"] for r in preview_records
+        ],
     )
 
     # HUMAN mode (json_output=False) so the interactive prompt
@@ -5483,6 +5493,16 @@ def test_optimize_non_interactive_routing_revision_preview_with_allow_flag_runs(
         preview_records=preview_records,
         mutating_status="REJECTED",
         mutating_run_id="mutating-run-2",
+        # Stub the mutating pass as coherent with the
+        # operator-approved routing revision: the apply pass
+        # selected the same suggestion_id the operator
+        # approved, so the post-apply divergence guard
+        # (Issue #39 global review) does not fire and the
+        # test exercises the central exit-code matrix
+        # (REJECTED + no blockers => EXIT_OK).
+        mutating_selected_candidate_ids=[
+            r["suggestion_id"] for r in preview_records
+        ],
     )
 
     args = _build_optimize_routing_namespace(
@@ -5683,4 +5703,124 @@ def test_optimize_routing_revision_preview_apply_consistency(
     assert "name" in blob and "opt9-skill" in blob, (
         f"routing_revisions must carry field/old/new; got "
         f"{routing_revisions!r}"
+    )
+
+
+def test_optimize_routing_revision_preview_apply_divergence_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Issue #39 global review: post-apply divergence guard.
+
+    If the operator approves a routing revision in the preview
+    pass and the mutating apply pass returns
+    ``selected_candidate_ids`` that do NOT intersect the
+    approved ``suggestion_id`` set, the CLI must BLOCK with
+    ``ROUTING_REVISION_DIVERGENCE_BLOCKER`` rather than
+    silently accept an unapproved routing change. With
+    ``call_fn=None`` this divergence is impossible
+    (deterministic), but a future real ``call_fn`` could
+    surface a different routing set in the apply pass than
+    what the operator just approved in the preview — the
+    guard pins the contract at the CLI surface so a future
+    non-deterministic ``call_fn`` is caught, not silently
+    accepted.
+    """
+    from metacrucible.__main__ import cmd_optimize
+
+    workspace = _init_resume_workspace(tmp_path)
+
+    # Non-interactive: bypass the prompt and force the mutating
+    # pass via the explicit --allow-routing-revision flag.
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    prompt_calls: list[str] = []
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt="": prompt_calls.append(prompt) or "",
+    )
+
+    # Preview surfaces suggestion_id="sug-1". The mutating pass
+    # returns a disjoint selected_candidate_ids list (e.g. the
+    # LLM produced different suggestions on the second pass).
+    preview_records = [_routing_preview_record()]
+    pipeline_calls = _install_routing_stub_pipeline(
+        monkeypatch,
+        preview_records=preview_records,
+        mutating_status="ACCEPTED",
+        mutating_run_id="mutating-apply-divergent",
+        # Divergent: the apply pass selected a suggestion_id
+        # that the operator did NOT approve in the preview.
+        mutating_selected_candidate_ids=["different-id"],
+    )
+
+    args = _build_optimize_routing_namespace(
+        workspace, allow_routing_revision=True
+    )
+    rc = cmd_optimize(args)
+    captured = capsys.readouterr()
+
+    # The CLI must exit EXIT_BLOCKED and emit the stable
+    # divergence blocker id (Issue #39 global review). The
+    # blocker id is the machine contract; the message is
+    # operator-readable prose.
+    assert rc == EXIT_BLOCKED, (
+        f"preview->apply divergence must BLOCK "
+        f"(rc={EXIT_BLOCKED}); got rc={rc} "
+        f"stdout={captured.out!r} stderr={captured.err!r}"
+    )
+    try:
+        payload = json.loads(captured.out)
+    except json.JSONDecodeError as exc:
+        pytest.fail(
+            f"optimize --json must emit valid JSON on "
+            f"divergence; got stdout={captured.out!r} "
+            f"error={exc}"
+        )
+    assert isinstance(payload, dict)
+    assert payload.get("status") == "BLOCKED", (
+        f"divergence payload must have status=BLOCKED; "
+        f"got payload={payload!r}"
+    )
+    blockers = payload.get("blockers")
+    assert isinstance(blockers, list) and blockers, (
+        f"divergence payload must carry a non-empty "
+        f"blockers list; got {blockers!r}"
+    )
+    blocker_ids = [b.get("id") for b in blockers]
+    assert "routing-revision-divergence" in blocker_ids, (
+        f"divergence payload must contain "
+        f"ROUTING_REVISION_DIVERGENCE_BLOCKER "
+        f"id=routing-revision-divergence; got "
+        f"blocker_ids={blocker_ids!r} payload={payload!r}"
+    )
+
+    # The payload must surface both the approved
+    # suggestion_ids and the apply pass's selected_candidate_ids
+    # so an operator / auditor can see exactly what diverged.
+    approved = payload.get("approved_suggestion_ids")
+    assert approved == ["sug-1"], (
+        f"divergence payload must surface the approved "
+        f"suggestion_ids from the preview; got "
+        f"approved={approved!r} payload={payload!r}"
+    )
+    selected = payload.get("selected_candidate_ids")
+    assert selected == ["different-id"], (
+        f"divergence payload must surface the apply "
+        f"pass's selected_candidate_ids; got "
+        f"selected={selected!r} payload={payload!r}"
+    )
+
+    # Sanity: the mutating pass ran exactly once and the
+    # divergence guard fired BEFORE the central payload
+    # composition (so the divergence blockers did NOT get
+    # clobbered by the ACCEPTED-status happy path).
+    assert len(pipeline_calls) == 2, (
+        f"divergence guard must run after preview + "
+        f"mutating exactly once each; got pipeline_calls="
+        f"{pipeline_calls!r}"
+    )
+    assert prompt_calls == [], (
+        f"--allow-routing-revision must not prompt in "
+        f"non-interactive mode; got prompts={prompt_calls!r}"
     )

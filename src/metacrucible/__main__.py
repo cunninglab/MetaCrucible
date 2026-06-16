@@ -49,6 +49,7 @@ from .optimizer import (
     ROUND_BUDGET_DEFAULT,
     ROUTING_CAP_EXCEEDED_BLOCKER,
     ROUTING_HITL_UNCONFIRMED_BLOCKER,
+    ROUTING_REVISION_DIVERGENCE_BLOCKER,
     SCHEMA_VALIDATION_BLOCKED,
     STALE_BASE_HASH_BLOCKER,
     MUTABLE_RANGE_CONFLICT_BLOCKER,
@@ -2891,6 +2892,44 @@ def cmd_optimize(args: argparse.Namespace) -> int:
             human_confirmed=True,
             routing_confirmation_preview=False,
         )
+
+        # Post-apply divergence check (Issue #39 global review):
+        # If the operator approved routing revisions in the
+        # preview but the apply pass selected none of them, the
+        # suggestions diverged between passes. With
+        # ``call_fn=None`` this is impossible (deterministic),
+        # but a future real LLM could produce different
+        # suggestions. BLOCK rather than silently accept an
+        # unapproved routing change.
+        if routing_records and pipeline_result.status != "BLOCKED":
+            approved_ids = {
+                str(r.get("suggestion_id", ""))
+                for r in routing_records
+            }
+            applied_ids = set(pipeline_result.selected_candidate_ids)
+            if not (approved_ids & applied_ids):
+                blockers = [{
+                    "id": ROUTING_REVISION_DIVERGENCE_BLOCKER,
+                    "message": (
+                        "routing revision approved in preview was "
+                        "not selected in the apply pass; the "
+                        "pipeline may have produced different "
+                        "suggestions (Issue #39)"
+                    ),
+                }]
+                _write_optimize_blocked_bundle(blockers=blockers)
+                _emit({
+                    "status": "BLOCKED",
+                    "workspace": str(workspace),
+                    "benchmark": str(benchmark),
+                    "artifact_path": str(artifact_path),
+                    "routing_revisions": routing_records,
+                    "approved_suggestion_ids": sorted(approved_ids),
+                    "selected_candidate_ids": sorted(applied_ids),
+                    "rounds": pipeline_result.rounds,
+                    "blockers": blockers,
+                }, as_json=as_json)
+                return EXIT_BLOCKED
 
     # Compose the OPT-8 / OPT-9 output. The status field
     # is the machine-stable verdict: ``ACCEPTED`` /

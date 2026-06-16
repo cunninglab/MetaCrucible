@@ -2876,6 +2876,12 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         # injects a real ``call_fn`` here, the apply pass
         # could surface routing records that differ from
         # what the operator just approved in the preview.
+        # The post-MVP mitigation for a non-deterministic
+        # ``call_fn`` is a resume token or deterministic
+        # replay that pins the approved suggestion set
+        # across both passes; until that lands, the MVP
+        # ``call_fn=None`` path is the single source of
+        # truth for determinism.
         pipeline_result = run_optimizer_pipeline(
             workspace=workspace,
             benchmark_path=benchmark,

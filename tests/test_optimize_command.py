@@ -85,6 +85,16 @@ PENDING_GENERATED_BLOCKER = "pending-generated-case"
 MISSING_REVIEWED_EVAL_BLOCKER = "missing-reviewed-eval-case"
 MISSING_REVIEWED_HELD_OUT_BLOCKER = "missing-reviewed-held-out-case"
 
+#: Stable blocker id emitted by ``optimize`` when the git
+#: worktree carries dirty files unrelated to the optimize
+#: inputs (artifact, envelope, benchmark). Mirrors the
+#: module-level constant in
+#: :mod:`metacrucible.__main__` so a future rename of the
+#: source constant fails the test loud. Pinned locally so
+#: the test file does not depend on the internal layout
+#: of ``__main__``.
+OPTIMIZE_UNRELATED_DIRTY_FILES_BLOCKER = "optimize-unrelated-dirty-files"
+
 
 # --------------------------------------------------------------------------- #
 # Helpers                                                                     #
@@ -179,6 +189,126 @@ def _reviewed_case(
         "execution_boundary": {"permissions": ["read"]},
         "checks": [{"name": "ok", "pattern": "ok"}],
     }
+
+
+def _run_git(
+    argv: list[str], *, cwd: Path
+) -> subprocess.CompletedProcess[str]:
+    """Invoke ``git`` with captured output.
+
+    Mirrors the helper in :mod:`tests.test_baseline_command`
+    so the optimize dirty-file guard tests can seed a real
+    git worktree the guard will consult.
+    """
+    return subprocess.run(
+        ["git", *argv],
+        capture_output=True,
+        text=True,
+        cwd=str(cwd),
+    )
+
+
+def _git_dirty_paths(workspace: Path) -> list[str]:
+    """Return ``git status --porcelain`` paths from ``workspace``.
+
+    Mirrors the helper in :mod:`tests.test_baseline_command`
+    so the optimize dirty-file tests can pin the
+    fixture-invariant "the scratch file is reported dirty"
+    shape. Each returned entry is the path component of a
+    ``git status --porcelain`` line, exactly as the optimize
+    payload's ``dirty_files_at_run`` field carries it.
+    """
+    result = _run_git(["status", "--porcelain"], cwd=workspace)
+    assert result.returncode == 0, (
+        f"git status failed: rc={result.returncode} "
+        f"stderr={result.stderr!r}"
+    )
+    paths: list[str] = []
+    for line in result.stdout.splitlines():
+        if len(line) < 4:
+            continue
+        path_str = line[3:].strip()
+        if " -> " in path_str:
+            path_str = path_str.split(" -> ", 1)[1]
+        if path_str.startswith('"') and path_str.endswith('"'):
+            path_str = path_str[1:-1]
+        paths.append(path_str)
+    return paths
+
+
+def _seed_optimize_inputs(workspace: Path) -> Path:
+    """Seed the optimize inputs (benchmark, artifact, envelope).
+
+    The dirty-file guard needs a complete input set on disk
+    so the workspace survives ``git add -A`` with tracked
+    files only. Mirrors the seed pattern in
+    :func:`tests.test_baseline_command._init_workspace` but
+    split out so the no-git dirty-guard test (which calls
+    :func:`_init_workspace` and then seeds WITHOUT a git
+    worktree) can reuse it.
+    """
+    benchmark = workspace / BENCHMARK_FILE_NAME
+    _write_jsonl(
+        benchmark,
+        [
+            _metadata_record(),
+            _reviewed_case("eval-1", split="eval"),
+            _reviewed_case("held-1", split="held_out"),
+        ],
+    )
+    artifact = workspace / "SKILL.md"
+    artifact.write_text(
+        "---\n"
+        "name: opt-skill\n"
+        "description: optimize-dirty-guard fixture\n"
+        "---\n"
+        "# body\nThe body is the only mutable range.\n",
+        encoding="utf-8",
+    )
+    envelope = workspace / ".metacrucible" / "envelope.json"
+    envelope.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "artifact_path": str(artifact.resolve()),
+                "artifact_workspace": str(workspace),
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return workspace
+
+
+def _init_workspace_with_git(tmp_path: Path) -> Path:
+    """Init + seed + git-init/add/commit a workspace.
+
+    Mirrors :func:`tests.test_baseline_command._init_workspace`
+    so the optimize dirty-file guard tests can exercise the
+    ``git status --porcelain`` path. The order matters: the
+    workspace must be seeded BEFORE ``git commit`` so the
+    initial commit covers the tracked inputs (artifact,
+    envelope, benchmark) and a later write to one of those
+    paths shows up as a "tracked-input dirty" rather than an
+    "untracked dirty".
+    """
+    workspace = _init_workspace(tmp_path)
+    _seed_optimize_inputs(workspace)
+    _run_git(["init", "-q"], cwd=workspace)
+    _run_git(
+        ["config", "user.email", "test@example.com"], cwd=workspace
+    )
+    _run_git(
+        ["config", "user.name", "Optimize Test"], cwd=workspace
+    )
+    _run_git(["add", "-A"], cwd=workspace)
+    _run_git(
+        ["commit", "-q", "-m", "init optimize workspace"],
+        cwd=workspace,
+    )
+    return workspace
 
 
 # --------------------------------------------------------------------------- #
@@ -3499,6 +3629,256 @@ def test_acg6r_blocker_ids_stable() -> None:
     assert ROUTING_HITL_UNCONFIRMED_BLOCKER == "routing-hitl-unconfirmed"
     assert ROUTING_CAP_EXCEEDED_BLOCKER == "routing-cap-exceeded"
     assert MUTABLE_RANGE_CONFLICT_BLOCKER == "mutable-range-conflict"
+# --------------------------------------------------------------------------- #
+# Dirty-file guard regression tests (Issue #31 / #37)                         #
+# --------------------------------------------------------------------------- #
+#
+# These tests pin the issue #31 / #37 contract: ``optimize`` BLOCKS on
+# unrelated dirty files in a git worktree unless the operator passes
+# ``--allow-dirty-unrelated``. A workspace outside any git worktree
+# skips the guard with a stderr warning. The contract mirrors the
+# baseline create dirty-file guard (see
+# :mod:`tests.test_baseline_command`) so the two commands stay
+# consistent.
+#
+# The tests run the CLI via the subprocess pattern the rest of the
+# optimize test suite uses; the dirty-file guard runs inside
+# :func:`metacrucible.__main__.cmd_optimize` before the pipeline
+# starts, so direct pipeline calls would NOT exercise the guard.
+
+def test_optimize_blocks_on_unrelated_dirty_files(
+    tmp_path: Path,
+) -> None:
+    """An unrelated dirty file in the git worktree blocks
+    ``optimize`` with the ``optimize-unrelated-dirty-files``
+    blocker id; the command never reaches the pipeline.
+
+    Mirrors the baseline test
+    :func:`tests.test_baseline_command.test_baseline_create_blocks_on_unrelated_dirty_files`
+    so the two commands enforce the same preconditions.
+    """
+    workspace = _init_workspace_with_git(tmp_path)
+    # Create an unrelated dirty file (untracked) so ``git status
+    # --porcelain`` reports it as ``?? <path>`` and the guard
+    # classifies it as unrelated.
+    (workspace / "scratch-notes.txt").write_text(
+        "untracked; not an optimize input\n",
+        encoding="utf-8",
+    )
+    dirty = _git_dirty_paths(workspace)
+    assert "scratch-notes.txt" in dirty, (
+        f"fixture invariant: scratch-notes.txt must be reported "
+        f"as dirty; got dirty={dirty!r}"
+    )
+
+    result = _run_metacrucible(
+        ["optimize", str(workspace), "--json"],
+        cwd=REPO_ROOT,
+    )
+    assert result.returncode == EXIT_BLOCKED, (
+        f"`optimize` on a worktree with unrelated dirty files "
+        f"must exit {EXIT_BLOCKED}; got rc={result.returncode} "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    payload = json.loads(result.stdout)
+    blocker_ids = [
+        b.get("id") for b in payload.get("blockers", [])
+        if isinstance(b, dict)
+    ]
+    assert OPTIMIZE_UNRELATED_DIRTY_FILES_BLOCKER in blocker_ids, (
+        f"optimize-unrelated-dirty-files blocker must surface; "
+        f"got blocker_ids={blocker_ids!r}"
+    )
+    assert payload["status"] == "BLOCKED", (
+        f"unrelated-dirty optimize must report status=BLOCKED; "
+        f"got {payload.get('status')!r}"
+    )
+    assert "scratch-notes.txt" in (
+        payload.get("dirty_files_at_run") or []
+    ), (
+        f"dirty_files_at_run must record the unrelated dirty "
+        f"file; got "
+        f"{payload.get('dirty_files_at_run')!r}"
+    )
+
+def test_optimize_allows_unrelated_dirty_with_flag(
+    tmp_path: Path,
+) -> None:
+    """``--allow-dirty-unrelated`` records the dirty list and
+    proceeds: success exit (the pipeline runs and reaches its
+    normal REJECTED outcome in the absence of an LLM),
+    ``allow_dirty_unrelated: true``, ``dirty_files_at_run``
+    populated.
+
+    Mirrors the baseline test
+    :func:`tests.test_baseline_command.test_baseline_create_allows_unrelated_dirty_with_flag`.
+    The exit code is EXIT_OK (the optimize pipeline ran); the
+    status is REJECTED (the no-LLM default path), but NEVER
+    BLOCKED with the ``optimize-unrelated-dirty-files`` id.
+    """
+    workspace = _init_workspace_with_git(tmp_path)
+    (workspace / "scratch-notes.txt").write_text(
+        "untracked; not an optimize input\n",
+        encoding="utf-8",
+    )
+
+    result = _run_metacrucible(
+        [
+            "optimize",
+            str(workspace),
+            "--allow-dirty-unrelated",
+            "--json",
+        ],
+        cwd=REPO_ROOT,
+    )
+    assert result.returncode == EXIT_OK, (
+        f"`optimize --allow-dirty-unrelated` must exit "
+        f"{EXIT_OK}; got rc={result.returncode} "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    payload = json.loads(result.stdout)
+    assert payload["status"] != "BLOCKED" or all(
+        b.get("id") != OPTIMIZE_UNRELATED_DIRTY_FILES_BLOCKER
+        for b in payload.get("blockers", [])
+        if isinstance(b, dict)
+    ), (
+        f"--allow-dirty-unrelated must NOT surface the "
+        f"optimize-unrelated-dirty-files blocker; got "
+        f"status={payload.get('status')!r} "
+        f"blocker_ids="
+        f"{[b.get('id') for b in payload.get('blockers', [])]!r}"
+    )
+    assert payload["allow_dirty_unrelated"] is True, (
+        f"allow_dirty_unrelated must be True when the flag is "
+        f"set; got {payload['allow_dirty_unrelated']!r}"
+    )
+    assert "scratch-notes.txt" in (
+        payload.get("dirty_files_at_run") or []
+    ), (
+        f"dirty_files_at_run must record the unrelated dirty "
+        f"file; got {payload.get('dirty_files_at_run')!r}"
+    )
+
+def test_optimize_allows_only_tracked_inputs_dirty(
+    tmp_path: Path,
+) -> None:
+    """A dirty file that IS one of the optimize inputs (artifact,
+    envelope, benchmark) does NOT block ``optimize``: the guard
+    only blocks UNRELATED dirty files.
+
+    Mirrors the baseline test
+    :func:`tests.test_baseline_command.test_baseline_create_allows_only_tracked_inputs_dirty`.
+    The test edits the tracked artifact (one of the optimize
+    inputs) without committing; ``git status --porcelain``
+    reports it as `` M SKILL.md`` and the guard must treat it
+    as a tracked input, not unrelated.
+    """
+    workspace = _init_workspace_with_git(tmp_path)
+    artifact = workspace / "SKILL.md"
+    # Modify the tracked artifact (one of the optimize inputs)
+    # without committing. ``git status --porcelain`` reports it
+    # as `` M SKILL.md`` and the guard must treat it as an
+    # optimize input, not unrelated.
+    artifact.write_text(
+        "---\n"
+        "name: opt-skill\n"
+        "description: optimize-dirty-guard fixture\n"
+        "---\n"
+        "# body\nThe body is the only mutable range.\n"
+        "Updated body content.\n",
+        encoding="utf-8",
+    )
+    dirty = _git_dirty_paths(workspace)
+    assert "SKILL.md" in dirty, (
+        f"fixture invariant: SKILL.md must be reported as "
+        f"dirty after the edit; got dirty={dirty!r}"
+    )
+
+    result = _run_metacrucible(
+        ["optimize", str(workspace), "--json"],
+        cwd=REPO_ROOT,
+    )
+    assert result.returncode == EXIT_OK, (
+        f"`optimize` with only tracked optimize inputs dirty "
+        f"must exit {EXIT_OK}; got rc={result.returncode} "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    payload = json.loads(result.stdout)
+    blocker_ids = [
+        b.get("id") for b in payload.get("blockers", [])
+        if isinstance(b, dict)
+    ]
+    assert OPTIMIZE_UNRELATED_DIRTY_FILES_BLOCKER not in blocker_ids, (
+        f"optimize with tracked-input dirty must NOT surface "
+        f"the optimize-unrelated-dirty-files blocker; got "
+        f"blocker_ids={blocker_ids!r}"
+    )
+    assert "SKILL.md" in (
+        payload.get("dirty_files_at_run") or []
+    ), (
+        f"dirty_files_at_run must record the dirty tracked "
+        f"input; got {payload.get('dirty_files_at_run')!r}"
+    )
+
+def test_optimize_skips_dirty_guard_outside_worktree(
+    tmp_path: Path,
+) -> None:
+    """A workspace outside any git worktree skips the
+    dirty-file guard with a stderr warning; ``optimize``
+    reaches the pipeline.
+
+    Mirrors the baseline test
+    :func:`tests.test_baseline_command.test_baseline_create_skips_dirty_guard_outside_worktree`
+    so the two commands share the OD3 "skip the guard with a
+    warning" contract for non-worktree workspaces.
+    """
+    # Initialise the workspace WITHOUT a git worktree. The
+    # optimize dirty-file guard must skip the check and emit a
+    # stderr warning so the operator sees the silent-skip.
+    workspace = _init_workspace(tmp_path)
+    _seed_optimize_inputs(workspace)
+    # Create an unrelated dirty file. Because there is no git
+    # worktree, the guard must NOT block on it.
+    (workspace / "scratch-notes.txt").write_text(
+        "untracked; not an optimize input\n",
+        encoding="utf-8",
+    )
+
+    result = _run_metacrucible(
+        ["optimize", str(workspace), "--json"],
+        cwd=REPO_ROOT,
+    )
+    assert result.returncode == EXIT_OK, (
+        f"`optimize` outside a worktree must exit {EXIT_OK} "
+        f"(dirty guard is skipped per OD3); got "
+        f"rc={result.returncode} stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
+    assert "dirty-file guard skipped" in result.stderr, (
+        f"non-worktree optimize must surface a stderr warning "
+        f"so the operator sees the dirty-guard skip; got "
+        f"stderr={result.stderr!r}"
+    )
+    payload = json.loads(result.stdout)
+    blocker_ids = [
+        b.get("id") for b in payload.get("blockers", [])
+        if isinstance(b, dict)
+    ]
+    assert OPTIMIZE_UNRELATED_DIRTY_FILES_BLOCKER not in blocker_ids, (
+        f"non-worktree optimize must NOT surface the "
+        f"optimize-unrelated-dirty-files blocker (the guard "
+        f"is skipped); got blocker_ids={blocker_ids!r}"
+    )
+    assert payload["allow_dirty_unrelated"] is False, (
+        f"allow_dirty_unrelated must be False when the flag "
+        f"is not set; got {payload['allow_dirty_unrelated']!r}"
+    )
+    assert payload.get("dirty_files_at_run") == [], (
+        f"non-worktree optimize must report an empty "
+        f"dirty_files_at_run (the guard does not enumerate "
+        f"files outside a worktree); got "
+        f"{payload.get('dirty_files_at_run')!r}"
+    )
 
 
 

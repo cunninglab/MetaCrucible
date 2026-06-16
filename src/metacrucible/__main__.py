@@ -55,7 +55,9 @@ from .optimizer import (
     OptimizerContext,
     OptimizerPipelineResult,
     build_optimizer_context,
+    detect_interrupted_optimizer_runs,
     run_optimizer_pipeline,
+    validate_resume_interrupted_runs,
 )
 import subprocess
 import hashlib
@@ -591,6 +593,19 @@ def _build_parser() -> argparse.ArgumentParser:
             "git worktree carries dirty files unrelated to the "
             "optimize inputs (artifact, envelope, benchmark); "
             "default is to BLOCK on unrelated dirty files"
+        ),
+    )
+    optimize_parser.add_argument(
+        "--confirm-resume",
+        action="store_true",
+        help=(
+            "explicit human confirmation that interrupted "
+            "optimize runs (optimize_started without a matching "
+            "optimize_finished in workspace history) may be "
+            "resumed; without this flag the CLI refuses to "
+            "resume silently and either BLOCKs in "
+            "non-interactive mode or prompts in interactive "
+            "mode (Issue #38 / ADR 0017)"
         ),
     )
     optimize_parser.add_argument(
@@ -2581,6 +2596,68 @@ def cmd_optimize(args: argparse.Namespace) -> int:
             as_json=as_json,
         )
         return EXIT_BLOCKED
+
+    # Precondition 5: interrupted-run gate (Issue #38 /
+    # ADR 0017). The workspace may carry an
+    # ``optimize_started`` history event without a
+    # matching ``optimize_finished``; that means a
+    # previous optimize invocation did not finish and
+    # we may be resuming from a stale state. The CLI
+    # refuses to resume silently: in non-interactive
+    # mode it BLOCKs unless ``--confirm-resume`` was
+    # passed; in interactive mode it prompts the operator
+    # and accepts only an explicit yes. The pure detector
+    # and gate live in :mod:`metacrucible.optimizer`; this
+    # block wires storage access, the prompt, and the
+    # canonical BLOCKED payload + evidence bundle write.
+    storage = RepositoryStorage(workspace)
+    history_events = storage.read_history()
+    interrupted_runs = detect_interrupted_optimizer_runs(
+        history_events
+    )
+    if interrupted_runs:
+        interactive = sys.stdin.isatty()
+        confirmed = bool(getattr(args, "confirm_resume", False))
+        if interactive and not confirmed:
+            # Prompt once; accept only a clear yes so a
+            # mistyped default does not silently resume.
+            prompt = (
+                "detected interrupted optimize run(s): "
+                f"{', '.join(interrupted_runs)}.\n"
+                "Resume? Type 'y' or 'yes' to continue, "
+                "anything else to abort: "
+            )
+            try:
+                answer = input(prompt)
+            except EOFError:
+                answer = ""
+            if answer.strip().lower() in ("y", "yes"):
+                confirmed = True
+        gate = validate_resume_interrupted_runs(
+            interrupted_runs,
+            interactive=interactive,
+            confirmed=confirmed,
+        )
+        if not gate["ok"]:
+            blockers = list(gate["blockers"])
+            _write_optimize_blocked_bundle(blockers=blockers)
+            _emit(
+                {
+                    "status": "BLOCKED",
+                    "workspace": str(workspace),
+                    "benchmark": str(benchmark),
+                    "artifact_path": str(artifact_path),
+                    "allow_dirty_unrelated": bool(
+                        args.allow_dirty_unrelated
+                    ),
+                    "dirty_files_at_run": list(dirty_paths),
+                    "interrupted_runs": list(interrupted_runs),
+                    "rounds": 0,
+                    "blockers": blockers,
+                },
+                as_json=as_json,
+            )
+            return EXIT_BLOCKED
 
     # Run the pipeline. The CLI passes ``call_fn=None``;
     # tests monkey-patch ``run_optimizer_pipeline`` to

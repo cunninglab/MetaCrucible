@@ -4454,3 +4454,389 @@ def test_stop_reason_does_not_leak_held_out_content(
             f"contain held-out sentinel; got blocker="
             f"{blocker!r}"
         )
+
+
+# --------------------------------------------------------------------------- #
+# Issue #38: interrupted-run detection and explicit resume / abort            #
+# --------------------------------------------------------------------------- #
+
+#: Stable blocker id emitted by ``optimize`` in non-interactive mode when the
+#: workspace carries an interrupted run (optimize_started without a matching
+#: optimize_finished) and the operator did not pass ``--confirm-resume``.
+RESUME_NON_INTERACTIVE_BLOCKER = "resume-non-interactive-blocked"
+
+#: Stable blocker id emitted by ``optimize`` in interactive mode when the
+#: operator declines the resume prompt.
+RESUME_CONFIRMATION_REQUIRED_BLOCKER = "resume-confirmation-required"
+
+
+def _init_resume_workspace(tmp_path: Path) -> Path:
+    """Seed a workspace that survives all preflight checks up to the resume gate.
+
+    Builds on ``_init_workspace`` (which runs ``metacrucible init``) and
+    layers on the OPT-9 fixture artifact, the envelope that declares it,
+    and a clean benchmark with one eligible eval + one eligible held-out
+    case. The dirty-guard skips when the workspace is not a git worktree
+    so the resume gate is the next decision point.
+    """
+    workspace = _init_workspace(tmp_path)
+    _opt9_seed_artifact(workspace)
+    _opt9_seed_envelope(workspace, _opt9_skill_artifact_path(workspace))
+    benchmark = workspace / BENCHMARK_FILE_NAME
+    _write_jsonl(
+        benchmark,
+        [
+            _metadata_record(),
+            _reviewed_case("eval-1", split="eval"),
+            _reviewed_case("held-1", split="held_out"),
+        ],
+    )
+    return workspace
+
+
+def _seed_interrupted_history(
+    workspace: Path, *, run_ids: tuple[str, ...] = ("stale-run-1",)
+) -> Path:
+    """Write ``optimize_started`` events with no matching ``optimize_finished``."""
+    history_path = workspace / ".metacrucible" / "history.jsonl"
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        json.dumps(
+            {
+                "event": "optimize_started",
+                "run_id": run_id,
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+            sort_keys=True,
+        )
+        for run_id in run_ids
+    ]
+    history_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return history_path
+
+
+def _seed_clean_history(
+    workspace: Path, *, run_id: str = "done-run-1"
+) -> Path:
+    """Write a matching ``optimize_started`` + ``optimize_finished`` pair."""
+    history_path = workspace / ".metacrucible" / "history.jsonl"
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        json.dumps(
+            {"event": "optimize_started", "run_id": run_id},
+            sort_keys=True,
+        ),
+        json.dumps(
+            {
+                "event": "optimize_finished",
+                "run_id": run_id,
+                "stop_reason": "no_candidate_edits",
+            },
+            sort_keys=True,
+        ),
+    ]
+    history_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return history_path
+
+
+def _build_resume_namespace(
+    workspace: Path,
+    *,
+    confirm_resume: bool = False,
+    json_output: bool = True,
+) -> "argparse.Namespace":
+    """Build a Namespace with the fields ``cmd_optimize`` reads."""
+    import argparse as _argparse
+
+    return _argparse.Namespace(
+        workspace=str(workspace),
+        json=json_output,
+        max_rounds=1,
+        confirm_routing=False,
+        confirm_resume=confirm_resume,
+        allow_dirty_unrelated=False,
+    )
+
+
+def _install_stub_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[tuple[Any, ...], dict[str, Any]]]:
+    """Install a stub ``run_optimizer_pipeline`` and return its call log."""
+    from dataclasses import dataclass as _dataclass
+
+    @_dataclass
+    class _StubResult:
+        status: str = "REJECTED"
+        run_id: str = "stub-run"
+        rounds: int = 0
+        record_counts: dict[str, int] = None  # type: ignore[assignment]
+        evidence_refs: dict[str, str] = None  # type: ignore[assignment]
+        blockers: list = None  # type: ignore[assignment]
+        warnings: list = None  # type: ignore[assignment]
+        best_revision = None
+        acceptance_decision: dict = None  # type: ignore[assignment]
+        selected_candidate_ids: list = None  # type: ignore[assignment]
+        stop_reason: str = "no_candidate_edits"
+
+    calls: list = []
+
+    def _stub(*args, **kwargs):
+        calls.append((args, kwargs))
+        return _StubResult(
+            record_counts={},
+            evidence_refs={},
+            blockers=[],
+            warnings=[],
+            acceptance_decision={},
+            selected_candidate_ids=[],
+        )
+
+    monkeypatch.setattr(
+        "metacrucible.__main__.run_optimizer_pipeline", _stub
+    )
+    return calls
+
+
+def test_optimize_non_interactive_interrupted_history_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC1 (CLI): non-interactive + interrupted history + no
+    ``--confirm-resume`` -> ``EXIT_BLOCKED`` with the resume-non-
+    interactive-blocked payload; the optimizer pipeline is NOT
+    called (no silent resume).
+    """
+    from metacrucible.__main__ import cmd_optimize
+
+    workspace = _init_resume_workspace(tmp_path)
+    _seed_interrupted_history(workspace, run_ids=("stale-run-1",))
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    prompt_calls: list[str] = []
+    monkeypatch.setattr(
+        "builtins.input", lambda prompt="": prompt_calls.append(prompt) or ""
+    )
+    pipeline_calls = _install_stub_pipeline(monkeypatch)
+
+    args = _build_resume_namespace(workspace, confirm_resume=False)
+    rc = cmd_optimize(args)
+    captured = capsys.readouterr()
+
+    assert rc == EXIT_BLOCKED, (
+        f"non-interactive interrupted history without "
+        f"--confirm-resume must exit {EXIT_BLOCKED}; got "
+        f"rc={rc} stdout={captured.out!r} stderr={captured.err!r}"
+    )
+    try:
+        payload = json.loads(captured.out)
+    except json.JSONDecodeError as exc:
+        pytest.fail(
+            f"optimize --json must emit valid JSON; got "
+            f"stdout={captured.out!r} error={exc}"
+        )
+    assert isinstance(payload, dict)
+    assert payload.get("status") == "BLOCKED", (
+        f"non-interactive interrupted history must report "
+        f"status=BLOCKED; got {payload.get('status')!r}"
+    )
+    blocker_ids = [
+        b.get("id") for b in payload.get("blockers", [])
+        if isinstance(b, dict)
+    ]
+    assert RESUME_NON_INTERACTIVE_BLOCKER in blocker_ids, (
+        f"non-interactive interrupted history must surface "
+        f"the {RESUME_NON_INTERACTIVE_BLOCKER!r} blocker id; "
+        f"got blocker_ids={blocker_ids!r}"
+    )
+    interrupted_blob = json.dumps(payload, sort_keys=True)
+    assert "stale-run-1" in interrupted_blob, (
+        f"BLOCKED payload must name the interrupted run id; "
+        f"got payload={payload!r}"
+    )
+    assert pipeline_calls == [], (
+        f"pipeline must NOT be called when interrupted and "
+        f"not confirmed; got pipeline_calls={pipeline_calls!r}"
+    )
+    assert prompt_calls == [], (
+        f"non-interactive branch must not prompt for "
+        f"confirmation; got prompts={prompt_calls!r}"
+    )
+
+
+def test_optimize_interactive_interrupted_history_without_confirmation_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC2 (CLI): interactive + interrupted history + operator
+    declines the prompt -> ``EXIT_BLOCKED`` with the resume-
+    confirmation-required blocker; the optimizer pipeline is
+    NOT called.
+    """
+    from metacrucible.__main__ import cmd_optimize
+
+    workspace = _init_resume_workspace(tmp_path)
+    _seed_interrupted_history(workspace, run_ids=("stale-run-2",))
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    prompt_calls: list[str] = []
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt="": (prompt_calls.append(prompt), "n")[1],
+    )
+    pipeline_calls = _install_stub_pipeline(monkeypatch)
+
+    args = _build_resume_namespace(workspace, confirm_resume=False)
+    rc = cmd_optimize(args)
+    captured = capsys.readouterr()
+
+    assert rc == EXIT_BLOCKED, (
+        f"interactive interrupted history with decline must "
+        f"exit {EXIT_BLOCKED}; got rc={rc} "
+        f"stdout={captured.out!r} stderr={captured.err!r}"
+    )
+    payload = json.loads(captured.out)
+    blocker_ids = [
+        b.get("id") for b in payload.get("blockers", [])
+        if isinstance(b, dict)
+    ]
+    assert RESUME_CONFIRMATION_REQUIRED_BLOCKER in blocker_ids, (
+        f"interactive interrupted history with decline must "
+        f"surface {RESUME_CONFIRMATION_REQUIRED_BLOCKER!r}; "
+        f"got blocker_ids={blocker_ids!r}"
+    )
+    assert pipeline_calls == [], (
+        f"pipeline must NOT be called when interactive "
+        f"decline; got pipeline_calls={pipeline_calls!r}"
+    )
+    assert prompt_calls, "interactive branch must prompt exactly once"
+
+
+def test_optimize_interactive_interrupted_history_with_confirmation_proceeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC3 (CLI): interactive + interrupted history + operator
+    accepts the prompt -> optimize proceeds to the pipeline.
+    """
+    from metacrucible.__main__ import cmd_optimize
+
+    workspace = _init_resume_workspace(tmp_path)
+    _seed_interrupted_history(workspace, run_ids=("stale-run-3",))
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    prompt_calls: list[str] = []
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt="": (prompt_calls.append(prompt), "y")[1],
+    )
+    pipeline_calls = _install_stub_pipeline(monkeypatch)
+
+    args = _build_resume_namespace(workspace, confirm_resume=False)
+    rc = cmd_optimize(args)
+    captured = capsys.readouterr()
+
+    # Pipeline stub returns REJECTED, so EXIT_OK (cmd_optimize
+    # returns OK for ACCEPTED / no-blocking REJECTED).
+    assert rc == EXIT_OK, (
+        f"interactive interrupted history with accept must "
+        f"reach the pipeline (rc={EXIT_OK}); got rc={rc} "
+        f"stdout={captured.out!r} stderr={captured.err!r}"
+    )
+    assert len(pipeline_calls) == 1, (
+        f"pipeline must be called exactly once when "
+        f"interactive accept; got pipeline_calls={pipeline_calls!r}"
+    )
+    assert prompt_calls, "interactive accept branch must prompt"
+
+
+def test_optimize_non_interactive_interrupted_history_with_confirm_resume_proceeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC4 (CLI): non-interactive + interrupted history + operator
+    passed ``--confirm-resume`` -> optimize proceeds to the pipeline
+    without prompting.
+    """
+    from metacrucible.__main__ import cmd_optimize
+
+    workspace = _init_resume_workspace(tmp_path)
+    _seed_interrupted_history(workspace, run_ids=("stale-run-4",))
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    prompt_calls: list[str] = []
+    monkeypatch.setattr(
+        "builtins.input", lambda prompt="": prompt_calls.append(prompt) or ""
+    )
+    pipeline_calls = _install_stub_pipeline(monkeypatch)
+
+    args = _build_resume_namespace(workspace, confirm_resume=True)
+    rc = cmd_optimize(args)
+    captured = capsys.readouterr()
+
+    assert rc == EXIT_OK, (
+        f"non-interactive interrupted history with "
+        f"--confirm-resume must reach the pipeline "
+        f"(rc={EXIT_OK}); got rc={rc} "
+        f"stdout={captured.out!r} stderr={captured.err!r}"
+    )
+    assert len(pipeline_calls) == 1, (
+        f"pipeline must be called exactly once when "
+        f"--confirm-resume is set; got pipeline_calls={pipeline_calls!r}"
+    )
+    assert prompt_calls == [], (
+        f"--confirm-resume must not prompt; got prompts="
+        f"{prompt_calls!r}"
+    )
+
+
+def test_optimize_clean_history_does_not_emit_resume_blocker_or_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC5 (CLI): clean history (matching started + finished)
+    -> no resume prompt, no resume blocker, optimize proceeds
+    normally.
+    """
+    from metacrucible.__main__ import cmd_optimize
+
+    workspace = _init_resume_workspace(tmp_path)
+    _seed_clean_history(workspace, run_id="done-run-1")
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    prompt_calls: list[str] = []
+    monkeypatch.setattr(
+        "builtins.input", lambda prompt="": prompt_calls.append(prompt) or ""
+    )
+    pipeline_calls = _install_stub_pipeline(monkeypatch)
+
+    args = _build_resume_namespace(workspace, confirm_resume=False)
+    rc = cmd_optimize(args)
+    captured = capsys.readouterr()
+
+    assert rc == EXIT_OK, (
+        f"clean history must reach the pipeline; got rc={rc} "
+        f"stdout={captured.out!r} stderr={captured.err!r}"
+    )
+    assert len(pipeline_calls) == 1, (
+        f"pipeline must be called exactly once on clean "
+        f"history; got pipeline_calls={pipeline_calls!r}"
+    )
+    assert prompt_calls == [], (
+        f"clean history must not prompt; got prompts="
+        f"{prompt_calls!r}"
+    )
+    payload = json.loads(captured.out)
+    blocker_ids = [
+        b.get("id") for b in payload.get("blockers", [])
+        if isinstance(b, dict)
+    ]
+    assert RESUME_NON_INTERACTIVE_BLOCKER not in blocker_ids
+    assert RESUME_CONFIRMATION_REQUIRED_BLOCKER not in blocker_ids, (
+        f"clean history must not emit any resume blocker; "
+        f"got blocker_ids={blocker_ids!r}"
+    )

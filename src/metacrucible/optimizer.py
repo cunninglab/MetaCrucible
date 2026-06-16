@@ -97,6 +97,10 @@ __all__ = [
     "detect_interrupted_optimizer_runs",
     "run_optimizer_pipeline",
     "validate_resume_interrupted_runs",
+    "ROUTING_REVISION_CONFIRMATION_REQUIRED_BLOCKER",
+    "ROUTING_REVISION_NON_INTERACTIVE_BLOCKER",
+    "detect_routing_revision_confirmation",
+    "validate_routing_revision_confirmation",
 ]
 
 
@@ -169,6 +173,24 @@ MUTABLE_RANGE_CONFLICT_BLOCKER: str = "mutable-range-conflict"
 #: cap-exceeded / hitl-unconfirmed ids so a downstream report
 #: can group on the specific reason.
 ROUTING_CHANGE_REJECTED_BLOCKER: str = "routing-change-rejected"
+
+#: Stable blocker id emitted when an interactive ``optimize`` run
+#: proposes a routing revision (a change to a routing-surface
+#: field) without explicit confirmation (Issue #39). The gate
+#: surfaces this blocker so the CLI can prompt the user; the
+#: pipeline never auto-applies a routing revision.
+ROUTING_REVISION_CONFIRMATION_REQUIRED_BLOCKER: str = (
+    "routing-revision-confirmation-required"
+)
+
+#: Stable blocker id emitted when a non-interactive ``optimize``
+#: run proposes a routing revision without the
+#: ``--allow-routing-revision`` flag (Issue #39). The gate
+#: blocks the run so automation aborts instead of silently
+#: applying the routing revision.
+ROUTING_REVISION_NON_INTERACTIVE_BLOCKER: str = (
+    "routing-revision-non-interactive-blocked"
+)
 
 #: Bounded theme summary cap (OPT-4). Rejected edit buffers are
 #: injected into later rounds only as bounded theme summaries
@@ -861,6 +883,171 @@ def validate_resume_interrupted_runs(
         )
     blocker: dict[str, str] = {"id": blocker_id, "message": message}
     return {"ok": False, "blockers": [blocker]}
+
+
+
+# --------------------------------------------------------------------------- #
+# Issue #39 — routing revision detection + confirmation gate (pure)             #
+# --------------------------------------------------------------------------- #
+
+
+def detect_routing_revision_confirmation(
+    suggestions: Sequence[EditSuggestion],
+    *,
+    context: OptimizerContext | None = None,
+    profile_verdict: Mapping[str, Any] | None = None,
+) -> list[dict[str, object]]:
+    """Detect proposed routing revisions and build their diff / evidence.
+
+    The detector is pure: it consumes an already-built sequence
+    of :class:`EditSuggestion` records (the bounded edits the
+    round produced) plus the immutable
+    :class:`OptimizerContext` and the optional routing-surface-
+    safety :func:`metacrucible.profiles.evaluate_acceptance`
+    verdict, and emits one record per routing edit.
+
+    Contract:
+
+    - Filters ``suggestions`` to those with ``routing=True``;
+      non-routing edits are silently dropped (a non-routing
+      revision never needs HITL confirmation).
+    - For each routing edit, builds a record carrying
+      ``suggestion_id``, ``routing_field``, ``old``, ``new``,
+      ``intent``, and ``rationale`` so the CLI can render a
+      minimal diff and the human reviewer can see why the
+      change was proposed.
+    - The ``old`` text is read from the matching mutable range
+      (``context.mutable_ranges[range_id].text``). If the
+      context is absent or the range id is not in the mutable
+      range set, ``old`` is the empty string so the record is
+      still well-formed (a downstream renderer can fall back
+      to "no baseline available").
+    - The ``profile_verdict`` mapping is attached to every
+      record unchanged, and its ``accepted``, ``blockers``,
+      and ``supplemental_findings`` fields are surfaced as
+      top-level keys on the record so a CLI consumer can
+      branch without re-walking the verdict mapping.
+    - Returns a ``list``; the order mirrors the input
+      ``suggestions`` order so the CLI renders a stable list.
+
+    The function performs no I/O, reads no stdin, writes no
+    output, accesses no environment variables, instantiates
+    no storage, and does not call :func:`run_optimizer_pipeline`.
+    It is the unit-testable core the CLI layer (Task 2) wires
+    into the confirmation gate.
+    """
+    # Index mutable ranges by range_id once so the per-edit
+    # lookup is O(1). The parser is the single producer of
+    # ``range_id``; we trust the suggestion's recorded
+    # ``range_id`` to match a context range (a miss is the
+    # "old text unavailable" case, handled below).
+    range_text_by_id: dict[int, str] = {}
+    if context is not None:
+        for mutable_range in context.mutable_ranges:
+            range_text_by_id[mutable_range.range_id] = mutable_range.text
+
+    accepted: bool = True
+    verdict_blockers: list[dict[str, Any]] = []
+    supplemental_findings: list[dict[str, Any]] = []
+    if profile_verdict is not None:
+        accepted = bool(profile_verdict.get("accepted", True))
+        raw_blockers = profile_verdict.get("blockers", [])
+        if isinstance(raw_blockers, list):
+            verdict_blockers = [dict(b) for b in raw_blockers
+                                if isinstance(b, Mapping)]
+        raw_findings = profile_verdict.get("supplemental_findings", [])
+        if isinstance(raw_findings, list):
+            supplemental_findings = [
+                dict(f) for f in raw_findings if isinstance(f, Mapping)
+            ]
+
+    records: list[dict[str, object]] = []
+    for suggestion in suggestions:
+        if not suggestion.routing:
+            continue
+        record: dict[str, object] = {
+            "suggestion_id": suggestion.suggestion_id,
+            "routing_field": suggestion.routing_field,
+            "old": range_text_by_id.get(suggestion.range_id, ""),
+            "new": suggestion.replacement,
+            "intent": suggestion.intent,
+            "rationale": suggestion.rationale,
+            "accepted": accepted,
+            "blockers": list(verdict_blockers),
+            "supplemental_findings": list(supplemental_findings),
+        }
+        if profile_verdict is not None:
+            record["profile_verdict"] = dict(profile_verdict)
+        records.append(record)
+    return records
+
+
+def validate_routing_revision_confirmation(
+    records: Sequence[Mapping[str, object]],
+    *,
+    interactive: bool,
+    confirmed: bool,
+) -> dict[str, object]:
+    """Gate confirmation of a proposed routing revision (Issue #39).
+
+    The gate is pure: it takes the record list produced by
+    :func:`detect_routing_revision_confirmation` plus the
+    caller's interactivity and confirmation flags, and returns
+    a ``{"ok", "blockers"}`` payload the CLI can render or
+    ``--json``-emit directly.
+
+    Decision matrix:
+
+    - Empty ``records`` → ``{"ok": True, "blockers": []}``.
+      There is no routing revision to confirm.
+    - ``confirmed=True`` → ``{"ok": True, "blockers": []}``.
+      The caller explicitly opted in via ``--allow-routing-revision``
+      (or the interactive prompt); the gate honors that.
+    - Otherwise → ``{"ok": False, "blockers": [...]}`` with one
+      ``{id, message}`` blocker per record. The ``id`` is
+      :data:`ROUTING_REVISION_CONFIRMATION_REQUIRED_BLOCKER`
+      for ``interactive=True`` and
+      :data:`ROUTING_REVISION_NON_INTERACTIVE_BLOCKER` for
+      ``interactive=False``. The message names the opt-in
+      flag (``--allow-routing-revision`` for non-interactive),
+      embeds the routing field name and the suggestion id so
+      the payload is actionable, and cites Issue #39.
+
+    The function never reads stdin, reads history, writes
+    output, accesses environment variables, instantiates
+    storage, or calls other optimizer code. The CLI layer
+    owns those side effects.
+    """
+    if not records:
+        return {"ok": True, "blockers": []}
+    if confirmed:
+        return {"ok": True, "blockers": []}
+
+    blockers: list[dict[str, str]] = []
+    for record in records:
+        suggestion_id = str(record.get("suggestion_id", ""))
+        routing_field = str(record.get("routing_field", ""))
+        if interactive:
+            blocker_id: str = ROUTING_REVISION_CONFIRMATION_REQUIRED_BLOCKER
+            message = (
+                "interactive optimize requires explicit "
+                "confirmation before applying routing revision "
+                f"to routing_field={routing_field!r} "
+                f"(suggestion_id={suggestion_id!r}); "
+                "acknowledge the routing change to proceed "
+                "(Issue #39)"
+            )
+        else:
+            blocker_id = ROUTING_REVISION_NON_INTERACTIVE_BLOCKER
+            message = (
+                "non-interactive optimize cannot apply routing "
+                f"revision to routing_field={routing_field!r} "
+                f"(suggestion_id={suggestion_id!r}) without "
+                "--allow-routing-revision; aborting to avoid a "
+                "silent routing change (Issue #39)"
+            )
+        blockers.append({"id": blocker_id, "message": message})
+    return {"ok": False, "blockers": blockers}
 
 
 def _emit_evidence_bundle(

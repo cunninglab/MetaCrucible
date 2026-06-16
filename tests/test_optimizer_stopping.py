@@ -1148,3 +1148,355 @@ def test_detect_interrupted_runs_after_synthetic_finish_is_clean() -> None:
         f"interrupted-run detection; got "
         f"{detect_interrupted_optimizer_runs(history)!r}"
     )
+
+# --------------------------------------------------------------------------- #
+# Issue #39 — routing revision detection + confirmation gate (pure)             #
+# --------------------------------------------------------------------------- #
+
+
+def _make_routing_test_suggestion(
+    *,
+    suggestion_id: str = "opt-routing-001",
+    routing_field: str = "description",
+    replacement: str = "new routing text",
+    intent: str = "clarify_routing",
+    rationale: str = "evidence rationale",
+    range_id: int = 0,
+) -> Any:
+    """Build one bounded EditSuggestion with routing=True for tests."""
+    from metacrucible.optimizer import EditSuggestion
+
+    return EditSuggestion(
+        record_type="edit_suggestion",
+        suggestion_id=suggestion_id,
+        run_id="opt-20260616-routing01",
+        round_id="round-routing-1",
+        timestamp="2026-01-01T00:00:00Z",
+        range_id=range_id,
+        base_hash="",
+        intent=intent,
+        replacement=replacement,
+        rationale=rationale,
+        routing=True,
+        human_confirmed=False,
+        routing_field=routing_field,
+    )
+
+
+def _make_routing_test_context(
+    *,
+    old_text: str = "old routing text",
+    routing_fields: frozenset[str] = frozenset({"description"}),
+) -> Any:
+    """Build one minimal OptimizerContext carrying a single mutable range."""
+    from metacrucible.artifact import MutableRange
+    from metacrucible.optimizer import OptimizerContext
+
+    mutable_range = MutableRange(text=old_text, range_id=0, content_hash="")
+    return OptimizerContext(
+        run_id="opt-20260616-routing01",
+        workspace="/tmp/metacrucible-routing-test",
+        benchmark_path="/tmp/metacrucible-routing-test/benchmark.jsonl",
+        artifact_path="/tmp/metacrucible-routing-test/SKILL.md",
+        artifact_kind="skill",
+        base_content_hash="",
+        mutable_ranges=(mutable_range,),
+        routing_surface_fields=routing_fields,
+        eligible_eval_case_ids=(),
+        eligible_held_out_case_ids=(),
+        benchmark_metadata={},
+        max_rounds=1,
+        human_confirmed=False,
+    )
+
+
+def test_detect_routing_revision_confirmation_no_routing_returns_empty() -> None:
+    """No suggestions at all → detector returns an empty record list.
+
+    Issue #39 AC: the detector is the pure entry point the CLI
+    layer feeds the record list into the gate with; an empty
+    candidate set means there is nothing to confirm.
+    """
+    from metacrucible.optimizer import detect_routing_revision_confirmation
+
+    assert detect_routing_revision_confirmation([]) == [], (
+        "empty suggestion list must produce zero routing revision "
+        "records; the gate then short-circuits on no-routing input"
+    )
+
+
+def test_detect_routing_revision_confirmation_extracts_diff() -> None:
+    """Detector builds one record per routing edit with old/new/field.
+
+    The record is the minimal diff/evidence the CLI needs to
+    surface the proposed routing revision. The ``old`` text comes
+    from the context's mutable range whose ``range_id`` matches
+    the suggestion; the ``new`` text is the suggestion's
+    ``replacement``; the intent and rationale round-trip so a
+    human reviewing the gate can see why the change was proposed.
+    """
+    from metacrucible.optimizer import detect_routing_revision_confirmation
+
+    suggestion = _make_routing_test_suggestion()
+    context = _make_routing_test_context()
+    records = detect_routing_revision_confirmation([suggestion], context=context)
+    assert len(records) == 1, (
+        f"one routing suggestion must produce one record; got "
+        f"{records!r}"
+    )
+    record = records[0]
+    assert record["suggestion_id"] == "opt-routing-001", (
+        f"record must carry the suggestion_id for traceability; "
+        f"got record={record!r}"
+    )
+    assert record["routing_field"] == "description", (
+        f"record must carry the routing_field name; got record={record!r}"
+    )
+    assert record["old"] == "old routing text", (
+        f"record must carry the mutable range text as the 'old' "
+        f"diff side; got record={record!r}"
+    )
+    assert record["new"] == "new routing text", (
+        f"record must carry the suggestion's replacement as the "
+        f"'new' diff side; got record={record!r}"
+    )
+    assert record["intent"] == "clarify_routing", (
+        f"record must carry the suggestion's intent so a human "
+        f"reviewer can see the proposed change shape; got "
+        f"record={record!r}"
+    )
+    assert record["rationale"] == "evidence rationale", (
+        f"record must carry the suggestion's rationale so a "
+        f"human reviewer can see why the change was proposed; "
+        f"got record={record!r}"
+    )
+
+
+def test_detect_routing_revision_confirmation_attaches_profile_evidence() -> None:
+    """Detector carries the profile verdict (and its parts) on the record.
+
+    The CLI surfaces the profile verdict inside the BLOCKED /
+    confirmation payload so the human reviewer can see exactly
+    which profile flagged the routing change as needing HITL.
+    The detector must embed the verdict unchanged so downstream
+    rendering is byte-stable.
+    """
+    from metacrucible.optimizer import detect_routing_revision_confirmation
+
+    suggestion = _make_routing_test_suggestion()
+    context = _make_routing_test_context()
+    profile_verdict: dict[str, Any] = {
+        "accepted": False,
+        "blockers": [
+            {
+                "id": "routing-surface-safety.hitl-required",
+                "message": "confirmation required",
+            }
+        ],
+        "supplemental_findings": [
+            {
+                "id": "routing-surface-safety.routing-change",
+                "message": "description changed",
+            }
+        ],
+    }
+    records = detect_routing_revision_confirmation(
+        [suggestion],
+        context=context,
+        profile_verdict=profile_verdict,
+    )
+    assert len(records) == 1, (
+        f"profile verdict must not change the record count; got "
+        f"records={records!r}"
+    )
+    record = records[0]
+    assert record["profile_verdict"] == profile_verdict, (
+        f"profile_verdict must round-trip unchanged so the CLI "
+        f"can render the evidence byte-for-byte; got "
+        f"record={record!r}"
+    )
+    assert record["accepted"] is False, (
+        f"record must surface the verdict's accepted flag so "
+        f"the CLI can branch without re-parsing the verdict; "
+        f"got record={record!r}"
+    )
+    assert record["blockers"] == profile_verdict["blockers"], (
+        f"record must surface the verdict's blockers list "
+        f"unchanged; got record={record!r}"
+    )
+    assert (
+        record["supplemental_findings"]
+        == profile_verdict["supplemental_findings"]
+    ), (
+        f"record must surface the verdict's supplemental_findings "
+        f"list unchanged; got record={record!r}"
+    )
+
+
+def test_validate_routing_revision_confirmation_empty_passes() -> None:
+    """No records → ok=True with empty blockers.
+
+    The gate short-circuits when the detector found no routing
+    revisions: there is nothing to confirm and no HITL to request.
+    """
+    from metacrucible.optimizer import validate_routing_revision_confirmation
+
+    result = validate_routing_revision_confirmation(
+        [], interactive=False, confirmed=False
+    )
+    assert result == {"ok": True, "blockers": []}, (
+        f"empty record list must pass the gate; got {result!r}"
+    )
+
+
+def test_validate_routing_revision_confirmation_non_interactive_blocks() -> None:
+    """Non-interactive optimize without --allow-routing-revision BLOCKS.
+
+    Issue #39 AC: a non-interactive caller cannot silently apply
+    a routing revision; the gate requires the explicit
+    ``--allow-routing-revision`` flag or the run aborts. The
+    blocker id is the stable
+    :data:`ROUTING_REVISION_NON_INTERACTIVE_BLOCKER` and the
+    message names the opt-in flag plus the routing field /
+    suggestion id so the payload is actionable.
+    """
+    from metacrucible.optimizer import (
+        ROUTING_REVISION_NON_INTERACTIVE_BLOCKER,
+        validate_routing_revision_confirmation,
+    )
+
+    records = [
+        {
+            "suggestion_id": "opt-routing-001",
+            "routing_field": "description",
+            "old": "old routing text",
+            "new": "new routing text",
+            "intent": "clarify_routing",
+            "rationale": "evidence rationale",
+            "accepted": False,
+            "blockers": [],
+            "supplemental_findings": [],
+        }
+    ]
+    result = validate_routing_revision_confirmation(
+        records, interactive=False, confirmed=False
+    )
+    assert result.get("ok") is False, (
+        f"non-interactive + no confirm + routing revision must "
+        f"BLOCK; got result={result!r}"
+    )
+    blockers = result.get("blockers") or []
+    assert blockers, (
+        f"BLOCKED result must carry at least one blocker; got "
+        f"blockers={blockers!r}"
+    )
+    blocker_ids = [b.get("id") for b in blockers]
+    assert ROUTING_REVISION_NON_INTERACTIVE_BLOCKER in blocker_ids, (
+        f"non-interactive blocker id must be "
+        f"{ROUTING_REVISION_NON_INTERACTIVE_BLOCKER!r}; got "
+        f"blockers={blockers!r}"
+    )
+    joined = " ".join(str(b.get("message", "")) for b in blockers)
+    assert "--allow-routing-revision" in joined, (
+        f"non-interactive blocker must name the "
+        f"--allow-routing-revision flag so automation knows how "
+        f"to opt in; got blockers={blockers!r}"
+    )
+    assert "description" in joined, (
+        f"non-interactive blocker must name the routing_field so "
+        f"the operator knows which field is gated; got "
+        f"blockers={blockers!r}"
+    )
+    assert "opt-routing-001" in joined, (
+        f"non-interactive blocker must name the suggestion_id "
+        f"for traceability; got blockers={blockers!r}"
+    )
+
+
+def test_validate_routing_revision_confirmation_interactive_without_confirm_blocks() -> None:
+    """Interactive optimize without confirmation BLOCKS.
+
+    Issue #39 AC: an interactive caller still must explicitly
+    confirm the routing revision — the gate does not auto-prompt;
+    it BLOCKS so the CLI can surface the blocker and ask. The
+    blocker id is the stable
+    :data:`ROUTING_REVISION_CONFIRMATION_REQUIRED_BLOCKER` and
+    the message names the routing field and suggestion id.
+    """
+    from metacrucible.optimizer import (
+        ROUTING_REVISION_CONFIRMATION_REQUIRED_BLOCKER,
+        validate_routing_revision_confirmation,
+    )
+
+    records = [
+        {
+            "suggestion_id": "opt-routing-001",
+            "routing_field": "description",
+            "old": "old routing text",
+            "new": "new routing text",
+            "intent": "clarify_routing",
+            "rationale": "evidence rationale",
+            "accepted": False,
+            "blockers": [],
+            "supplemental_findings": [],
+        }
+    ]
+    result = validate_routing_revision_confirmation(
+        records, interactive=True, confirmed=False
+    )
+    assert result.get("ok") is False, (
+        f"interactive + no confirm + routing revision must "
+        f"BLOCK; got result={result!r}"
+    )
+    blockers = result.get("blockers") or []
+    assert blockers, (
+        f"BLOCKED result must carry at least one blocker; got "
+        f"blockers={blockers!r}"
+    )
+    blocker_ids = [b.get("id") for b in blockers]
+    assert (
+        ROUTING_REVISION_CONFIRMATION_REQUIRED_BLOCKER in blocker_ids
+    ), (
+        f"interactive blocker id must be "
+        f"{ROUTING_REVISION_CONFIRMATION_REQUIRED_BLOCKER!r}; got "
+        f"blockers={blockers!r}"
+    )
+    joined = " ".join(str(b.get("message", "")) for b in blockers)
+    assert "description" in joined, (
+        f"interactive blocker must name the routing_field; got "
+        f"blockers={blockers!r}"
+    )
+    assert "opt-routing-001" in joined, (
+        f"interactive blocker must name the suggestion_id; got "
+        f"blockers={blockers!r}"
+    )
+
+
+def test_validate_routing_revision_confirmation_confirmed_passes() -> None:
+    """--allow-routing-revision / interactive confirm PASSES.
+
+    The positive path: the caller confirmed the routing revision
+    via the CLI flag and the gate honors it. The returned payload
+    is ``{"ok": True, "blockers": []}`` so the CLI can proceed.
+    """
+    from metacrucible.optimizer import validate_routing_revision_confirmation
+
+    records = [
+        {
+            "suggestion_id": "opt-routing-001",
+            "routing_field": "description",
+            "old": "old routing text",
+            "new": "new routing text",
+            "intent": "clarify_routing",
+            "rationale": "evidence rationale",
+            "accepted": False,
+            "blockers": [],
+            "supplemental_findings": [],
+        }
+    ]
+    result = validate_routing_revision_confirmation(
+        records, interactive=False, confirmed=True
+    )
+    assert result == {"ok": True, "blockers": []}, (
+        f"confirmed record must pass the gate; got result={result!r}"
+    )

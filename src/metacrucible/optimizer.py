@@ -787,13 +787,13 @@ def detect_interrupted_optimizer_runs(
         elif event_name == "optimize_finished":
             entry = state.get(run_id)
             if entry is None:
-                # Finish with no prior start: track it so a
-                # later start can re-mark the run as
-                # interrupted (the finish only cleared a
-                # previously-started run, not this future one).
-                state[run_id] = {"started": False, "finished": True}
-            else:
-                entry["finished"] = True
+                # Orphan finish (no prior start): nothing
+                # to clear. A later optimize_started for the
+                # same run_id starts a fresh state entry
+                # independent of this finish, so recording
+                # an intermediate entry adds no information.
+                continue
+            entry["finished"] = True
     return [
         run_id
         for run_id, entry in state.items()

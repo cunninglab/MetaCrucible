@@ -1118,3 +1118,33 @@ def test_validate_resume_interrupted_runs_non_interactive_with_confirm_passes() 
         f"non-interactive + --confirm-resume must pass the gate; "
         f"got result={result!r}"
     )
+
+def test_detect_interrupted_runs_after_synthetic_finish_is_clean() -> None:
+    """A started run followed by a synthetic optimize_finished is clean.
+
+    The CLI retirement write in cmd_optimize appends a synthetic
+    ``optimize_finished`` event for every stale ``run_id`` after the
+    user confirms the resume. The detector must treat the pair
+    ``optimize_started`` + synthetic ``optimize_finished`` as a clean
+    (non-interrupted) lineage so the next optimize call does not
+    re-trigger the gate.
+
+    Issue #38 (post-integration-fix).
+    """
+    from metacrucible.optimizer import detect_interrupted_optimizer_runs
+
+    history = [
+        {"event": "optimize_started", "run_id": "opt-20260616-retire12"},
+        {
+            "event": "optimize_finished",
+            "run_id": "opt-20260616-retire12",
+            "status": "SUPERSEDED",
+            "stop_reason": "interrupted-run-resumed",
+            "superseded_by": "confirmed-resume",
+        },
+    ]
+    assert detect_interrupted_optimizer_runs(history) == [], (
+        f"synthetic finish after the start must clear the "
+        f"interrupted-run detection; got "
+        f"{detect_interrupted_optimizer_runs(history)!r}"
+    )

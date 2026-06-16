@@ -4711,6 +4711,10 @@ def test_optimize_interactive_interrupted_history_without_confirmation_blocks(
         f"decline; got pipeline_calls={pipeline_calls!r}"
     )
     assert prompt_calls, "interactive branch must prompt exactly once"
+    assert any('stale-run-2' in p for p in prompt_calls), (
+        f"interactive prompt must surface the stale run id "
+        f"'stale-run-2'; got prompt_calls={prompt_calls!r}"
+    )
 
 
 def test_optimize_interactive_interrupted_history_with_confirmation_proceeds(
@@ -4750,6 +4754,10 @@ def test_optimize_interactive_interrupted_history_with_confirmation_proceeds(
         f"interactive accept; got pipeline_calls={pipeline_calls!r}"
     )
     assert prompt_calls, "interactive accept branch must prompt"
+    assert any('stale-run-3' in p for p in prompt_calls), (
+        f"interactive prompt must surface the stale run id "
+        f"'stale-run-3'; got prompt_calls={prompt_calls!r}"
+    )
 
 
 def test_optimize_non_interactive_interrupted_history_with_confirm_resume_proceeds(
@@ -4839,4 +4847,112 @@ def test_optimize_clean_history_does_not_emit_resume_blocker_or_prompt(
     assert RESUME_CONFIRMATION_REQUIRED_BLOCKER not in blocker_ids, (
         f"clean history must not emit any resume blocker; "
         f"got blocker_ids={blocker_ids!r}"
+    )
+
+def test_optimize_confirmed_resume_retires_interrupted_runs_in_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC6 (CLI): a confirmed resume MUST retire stale run_ids in history.
+
+    Without the synthetic ``optimize_finished`` write the gate would
+    fire on every subsequent optimize call forever (the next pipeline
+    invocation generates a fresh ``run_id`` so the previous stale one
+    never gets matched). After the first confirmed resume:
+
+      - a synthetic ``optimize_finished`` is appended to ``history.jsonl``
+        for every stale ``run_id``,
+      - a follow-up ``cmd_optimize`` (no ``--confirm-resume``, no
+        interactive prompt) must NOT re-trigger the gate -- the pipeline
+        runs and no resume blockers appear.
+    """
+    from metacrucible.__main__ import cmd_optimize
+
+    workspace = _init_resume_workspace(tmp_path)
+    stale_run_id = "stale-run-5-retire"
+    _seed_interrupted_history(workspace, run_ids=(stale_run_id,))
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    prompt_calls: list[str] = []
+    monkeypatch.setattr(
+        "builtins.input", lambda prompt="": prompt_calls.append(prompt) or ""
+    )
+    pipeline_calls = _install_stub_pipeline(monkeypatch)
+
+    # First call: confirmed resume must proceed AND retire the
+    # stale run_id so a second call does not re-trigger the gate.
+    args = _build_resume_namespace(workspace, confirm_resume=True)
+    rc = cmd_optimize(args)
+    captured = capsys.readouterr()
+
+    assert rc == EXIT_OK, (
+        f"confirmed resume must reach the pipeline (rc={EXIT_OK}); "
+        f"got rc={rc} stdout={captured.out!r} stderr={captured.err!r}"
+    )
+    assert len(pipeline_calls) == 1, (
+        f"pipeline must run exactly once on confirmed resume; "
+        f"got pipeline_calls={pipeline_calls!r}"
+    )
+    assert prompt_calls == [], (
+        f"--confirm-resume must not prompt; got prompts="
+        f"{prompt_calls!r}"
+    )
+
+    # The synthetic retire event MUST be in history.jsonl.
+    history_path = workspace / ".metacrucible" / "history.jsonl"
+    history_records = [
+        json.loads(line)
+        for line in history_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    retired = [
+        rec
+        for rec in history_records
+        if isinstance(rec, dict)
+        and rec.get("event") == "optimize_finished"
+        and rec.get("run_id") == stale_run_id
+    ]
+    assert len(retired) == 1, (
+        f"confirmed resume must retire the stale run_id "
+        f"{stale_run_id!r} via a synthetic optimize_finished; "
+        f"got retired={retired!r} history_records={history_records!r}"
+    )
+    retire_record = retired[0]
+    assert retire_record.get("status") == "SUPERSEDED", (
+        f"synthetic retire event must mark the stale run as "
+        f"SUPERSEDED; got retire_record={retire_record!r}"
+    )
+
+    # Second call: WITHOUT --confirm-resume. The retire must have
+    # closed the audit lineage so the gate does not re-fire.
+    pipeline_calls.clear()
+    prompt_calls.clear()
+    args_no_confirm = _build_resume_namespace(
+        workspace, confirm_resume=False
+    )
+    rc2 = cmd_optimize(args_no_confirm)
+    captured2 = capsys.readouterr()
+
+    assert rc2 == EXIT_OK, (
+        f"second optimize call must proceed (retire closed the "
+        f"lineage); got rc={rc2} stdout={captured2.out!r} "
+        f"stderr={captured2.err!r}"
+    )
+    assert len(pipeline_calls) == 1, (
+        f"second call must reach the pipeline; "
+        f"got pipeline_calls={pipeline_calls!r}"
+    )
+    payload2 = json.loads(captured2.out)
+    blocker_ids2 = [
+        b.get("id") for b in payload2.get("blockers", [])
+        if isinstance(b, dict)
+    ]
+    assert RESUME_NON_INTERACTIVE_BLOCKER not in blocker_ids2, (
+        f"second call must not re-emit the resume blocker "
+        f"(retire closed the lineage); got blocker_ids={blocker_ids2!r}"
+    )
+    assert RESUME_CONFIRMATION_REQUIRED_BLOCKER not in blocker_ids2, (
+        f"second call must not emit the confirmation blocker; "
+        f"got blocker_ids={blocker_ids2!r}"
     )

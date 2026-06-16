@@ -2658,6 +2658,24 @@ def cmd_optimize(args: argparse.Namespace) -> int:
                 as_json=as_json,
             )
             return EXIT_BLOCKED
+        # Gate passed: retire the stale run_ids so the
+        # next invocation does not re-trigger the gate.
+        # A synthetic ``optimize_finished`` event closes
+        # the audit lineage for runs that were interrupted
+        # and then explicitly superseded by this confirmed
+        # resume. Without this write the gate fires on
+        # every subsequent optimize call forever.
+        for stale_run_id in interrupted_runs:
+            storage.append_history(
+                {
+                    "event": "optimize_finished",
+                    "run_id": stale_run_id,
+                    "status": "SUPERSEDED",
+                    "stop_reason": "interrupted-run-resumed",
+                    "superseded_by": "confirmed-resume",
+                    "created_at": _now_iso(),
+                }
+            )
 
     # Run the pipeline. The CLI passes ``call_fn=None``;
     # tests monkey-patch ``run_optimizer_pipeline`` to

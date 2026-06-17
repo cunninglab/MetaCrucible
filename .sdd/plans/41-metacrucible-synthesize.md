@@ -269,8 +269,8 @@ Commit: a558d8d8972f472210ac7e8a6fff8166efcff319
 Affected tasks: 1, 2, 3, 4, 5 (integration fix; re-spec-reviewed)
 Review exemption: integration repair touches Task 1 (parser help + flag dests) and Task 3 (run_synthesis_optimizer signature) acceptance-critical files; re-run spec on Tasks 1 and 3 + global review after repair
 Run Record: ready-for-pr
-Finish decision: pending
-PR URL: pending
+Finish decision: open-pr
+PR URL: https://github.com/Cunning-Kang/MetaCrucible/pull/56
 
 ## Final verification commands
 - `/Users/cunning/Workspaces/heavy/.sdd-worktrees/MetaCrucible/issue-41-metacrucible-synthesize/.venv/bin/python -m pytest tests/test_synthesize_command.py -v`

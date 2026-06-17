@@ -78,6 +78,7 @@ from .exit_codes import (
 )
 from .promote import _atomic_write_jsonl, promote_case
 from .storage import RepositoryStorage, UserGlobalStorage
+from .synthesize import run_synthesize_command
 from . import rule_checks as _rule_checks
 
 __all__ = [
@@ -119,9 +120,6 @@ BOOTSTRAP_INVALID_CASE_COUNT_BLOCKER = "bootstrap-invalid-case-count"
 #: contract is "we will surface a clear reason" rather than
 #: "we silently do nothing".
 OPTIMIZE_NOT_IMPLEMENTED_BLOCKER = "optimize-not-implemented"
-
-#: Stable blocker id emitted by ``synthesize`` while the F4 synthesis pipeline is not yet implemented (Issue #41 Task 1 placeholder). The block is intentionally transient: it is removed in Task 2 once the synthesis stage ships. Pinned to a machine-stable id so the temporary surface is observable to callers reading the BLOCKED bundle in the meantime.
-SYNTHESIZE_NOT_IMPLEMENTED_BLOCKER = "synthesize-not-implemented"
 
 #: Stable blocker id emitted by ``optimize`` when the workspace
 #: is inside a git worktree and ``git status --porcelain`` reports
@@ -3030,10 +3028,21 @@ def cmd_optimize(args: argparse.Namespace) -> int:
 
 
 def cmd_synthesize(args: argparse.Namespace) -> int:
-    """Task 1 placeholder (Issue #41 / PRD F4). Removed by Task 2."""
-    payload = {"status": "BLOCKED", "blockers": [{"id": SYNTHESIZE_NOT_IMPLEMENTED_BLOCKER, "message": "synthesize command is not implemented yet"}]}
-    _emit(payload, as_json=args.json)
-    return EXIT_BLOCKED
+    """Run the ``synthesize`` subcommand; return the exit code.
+
+    Thin wrapper around
+    :func:`metacrucible.synthesize.run_synthesize_command`
+    (Issue #41 / PRD F4 Task 2). The real synthesis pipeline
+    lives in :mod:`metacrucible.synthesize`; this function
+    only threads the shared ``_emit`` and ``_now_iso``
+    helpers into the dispatcher and returns the stable
+    exit code.
+    """
+    return run_synthesize_command(
+        args,
+        emit=lambda payload: _emit(payload, as_json=args.json),
+        now=_now_iso,
+    )
 
 
 def cmd_init(args: argparse.Namespace) -> int:

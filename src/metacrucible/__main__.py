@@ -77,7 +77,7 @@ from .exit_codes import (
     EXIT_USER_ERROR,
 )
 from .promote import _atomic_write_jsonl, promote_case
-from .storage import RepositoryStorage, UserGlobalStorage
+from .storage import REPO_DIR_NAME, RepositoryStorage, UserGlobalStorage
 from .synthesize import run_synthesize_command
 from . import rule_checks as _rule_checks
 
@@ -712,6 +712,25 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     evaluate_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="emit a parseable JSON object on stdout",
+    )
+    inspect_parser = subparsers.add_parser(
+        "inspect",
+        help=(
+            "read prior MetaCrucible optimization state for an "
+            "artifact or workspace (PRD F5 / Issue #42)"
+        ),
+    )
+    inspect_parser.add_argument(
+        "path",
+        help=(
+            "path to a capability artifact or to its "
+            ".metacrucible workspace"
+        ),
+    )
+    inspect_parser.add_argument(
         "--json",
         action="store_true",
         help="emit a parseable JSON object on stdout",
@@ -3225,6 +3244,43 @@ def cmd_review(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_inspect(args: argparse.Namespace) -> int:
+    """Run the ``inspect`` subcommand; return the process exit code.
+
+    Task 1 thin wrapper (PRD F5 / Issue #42 tracer bullet):
+
+      - The artifact / workspace path must exist on disk; a
+        missing path is reported to ``stderr`` and the
+        command returns :data:`EXIT_USER_ERROR` without
+        writing any BLOCKED evidence bundle.
+      - On a present path, the wrapper emits a minimal
+        ``status: ok`` payload that names the resolved
+        artifact path and the sibling workspace directory.
+        Later tasks replace this temporary payload with the
+        full revision-history / acceptance-decision reader
+        pinned by the F5 acceptance criteria.
+      - No files on disk are modified.
+    """
+    target = Path(args.path).resolve()
+    if not target.exists():
+        print(
+            f"metacrucible: inspect path {target} does not exist",
+            file=sys.stderr,
+        )
+        return EXIT_USER_ERROR
+    workspace_path = (
+        target if target.name == REPO_DIR_NAME
+        else target.parent / REPO_DIR_NAME
+    )
+    payload = {
+        "artifact_path": str(target),
+        "workspace_path": str(workspace_path),
+        "status": "ok",
+    }
+    _emit(payload, as_json=args.json)
+    return EXIT_OK
+
+
 def _baseline_git_dirty_check(
     workspace: Path, baseline_inputs: list[Path]
 ) -> tuple[bool, list[str], bool]:
@@ -3947,6 +4003,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_baseline(args)
         if getattr(args, "command", None) == "evaluate":
             return cmd_evaluate(args)
+        if getattr(args, "command", None) == "inspect":
+            return cmd_inspect(args)
         return EXIT_OK
     except Exception as exc:  # noqa: BLE001 - exit-code firewall
         # Catch-all so an uncaught command-handler bug still

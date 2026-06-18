@@ -111,3 +111,37 @@ def test_blocked_bundle_propagation_is_documented() -> None:
     ]
     for phrase in required:
         assert phrase in text
+
+
+def test_agent_docs_include_examples_troubleshooting_and_references() -> None:
+    text = skill_text()
+    required_sections = [
+        "## Agent workflow examples",
+        "## Troubleshooting",
+        "## Terminology for agent responses",
+        "## References",
+    ]
+    for heading in required_sections:
+        assert heading in text
+
+    required_terms = [
+        "Skill",
+        "Subagent",
+        "Capability Artifact",
+        "Canonical Source",
+        "Evidence Bundle",
+        "Receipt",
+        "Acceptance Gate",
+        "Runtime Adapter",
+        "Routing Surface",
+    ]
+    for term in required_terms:
+        assert term in text
+
+    required_links = [
+        "docs/prd.md",
+        "docs/adr/0035-pin-mvp-cli-surface-and-operational-behavior.md",
+        "CONTEXT.md",
+    ]
+    for link in required_links:
+        assert link in text

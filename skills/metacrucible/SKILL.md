@@ -167,3 +167,66 @@ If the CLI prints a local evidence path, include it in the user-facing answer. I
 - Dirty unrelated files: surface the dirty-guard message and wait for the user to clean, stash, or explicitly allow the requested behavior.
 - Missing artifact or malformed frontmatter: surface the path and parse error from the CLI.
 - High-risk `--no-isolation`: require explicit user confirmation before passing the flag.
+
+
+## Agent workflow examples
+
+### Review an existing Skill without mutation
+
+```sh
+python -m metacrucible review skills/example/SKILL.md --json
+```
+
+Agent response rule: summarize Static Review scores and weakest dimensions. If Execution Evaluation is skipped because no reviewed Benchmark exists, report that warning as a non-mutating review result.
+
+### Generate Evaluation Cases before optimization
+
+```sh
+python -m metacrucible bootstrap skills/example/SKILL.md --json
+```
+
+Agent response rule: report generated cases and tell the user that human review must clear pending-review state before `optimize`.
+
+### Run optimization only after review state is clean
+
+```sh
+python -m metacrucible optimize skills/example/SKILL.md --json
+```
+
+Agent response rule: preserve Baseline, Revision, Evidence Bundle, and Acceptance Decision identifiers. Do not say a Capability Artifact is accepted unless the CLI reports a passing Acceptance Gate.
+
+### Synthesize a new Capability Artifact
+
+```sh
+python -m metacrucible synthesize "build a Skill for repeatable database migration review" --json
+```
+
+Agent response rule: distinguish draft Canonical Source creation from accepted synthesis. Generated Evaluation Cases require human review before optimization can complete acceptance.
+
+### Inspect prior state
+
+```sh
+python -m metacrucible inspect skills/example/SKILL.md --json
+```
+
+Agent response rule: report Revision History, current best revision id, Acceptance Decisions, and Evidence Bundle index without suggesting file mutation.
+
+## Troubleshooting
+
+- If a command returns `EXIT_USER_ERROR`, quote the CLI's missing or invalid input message and ask for the smallest missing fact.
+- If a command returns `EXIT_BLOCKED`, lead with `BLOCKED`, include the blocker category, and preserve Evidence Bundle paths.
+- If a command returns `EXIT_INTERNAL_ERROR`, report the command and captured output; do not fabricate a Receipt or Acceptance Decision.
+- If the user asks whether to proceed past an Execution Boundary, explain the risk and wait for explicit confirmation before passing risky flags.
+- If the user asks for a command not listed in the public command overview, check whether it is a support command from ADR 0035 before presenting it as user-facing.
+
+## Terminology for agent responses
+
+Use the vocabulary in `CONTEXT.md`: Skill, Subagent, Capability Artifact, Revision, Baseline, Evidence Bundle, Receipt, Acceptance Gate, Execution Boundary, Runtime Adapter, Canonical Source, Artifact Envelope, Mutable Range, Routing Surface, Static Review, Execution Evaluation, Rubric, Static Review Profile, Model Provider, Adapter Preflight, Acceptance Decision, and Revision History.
+
+Avoid replacing those terms with generic labels such as prompt, plugin, log, trial, or approval.
+
+## References
+
+- `CONTEXT.md` — domain vocabulary for agent responses.
+- `docs/prd.md` — PRD F1 through F5 public command intent.
+- `docs/adr/0035-pin-mvp-cli-surface-and-operational-behavior.md` — public CLI surface, support command boundary, exit behavior, and BLOCKED Evidence Bundle policy.

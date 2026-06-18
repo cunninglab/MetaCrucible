@@ -145,3 +145,33 @@ def test_agent_docs_include_examples_troubleshooting_and_references() -> None:
     ]
     for link in required_links:
         assert link in text
+
+
+def test_issue_43_acceptance_is_covered_by_skill_wrapper() -> None:
+    text = skill_text()
+
+    for command in PUBLIC_COMMANDS:
+        assert f"### `{command}`" in text
+        assert f"python -m metacrucible {command}" in text
+
+    for evidence_phrase in ("EXIT_BLOCKED", "Evidence Bundle", "receipt.json"):
+        assert evidence_phrase in text
+
+    for docs_heading in (
+        "## When to use",
+        "## Command reference",
+        "## Agent workflow examples",
+        "## Troubleshooting",
+        "## References",
+    ):
+        assert docs_heading in text
+
+    retired_phrases = (
+        "SKE" + "LETON",
+        "Issue" + " #" + "3",
+        "tracked " + "separately",
+        "out of " + "scope",
+        "not implemented " + "yet",
+    )
+    for phrase in retired_phrases:
+        assert phrase not in text

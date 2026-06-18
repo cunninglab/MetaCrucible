@@ -40,3 +40,35 @@ def test_retired_wrapper_boundary_is_absent() -> None:
     ]
     for phrase in forbidden:
         assert phrase not in text
+
+
+PUBLIC_COMMANDS = ("review", "bootstrap", "optimize", "synthesize", "inspect")
+REQUIRED_COMMAND_SUBSECTIONS = (
+    "Purpose:",
+    "Use when:",
+    "Required inputs:",
+    "Key flags:",
+    "Example:",
+    "Output and evidence:",
+)
+
+
+def section_for_command(text: str, command: str) -> str:
+    heading = f"### `{command}`"
+    start = text.index(heading)
+    next_start = text.find("\n### `", start + len(heading))
+    if next_start == -1:
+        next_start = text.find("\n## ", start + len(heading))
+    if next_start == -1:
+        next_start = len(text)
+    return text[start:next_start]
+
+
+def test_public_command_sections_are_complete() -> None:
+    text = skill_text()
+    assert "## Command reference" in text
+    for command in PUBLIC_COMMANDS:
+        section = section_for_command(text, command)
+        for label in REQUIRED_COMMAND_SUBSECTIONS:
+            assert label in section, f"{command} missing {label}"
+        assert f"python -m metacrucible {command}" in section

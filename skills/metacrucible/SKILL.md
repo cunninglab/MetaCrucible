@@ -163,7 +163,7 @@ If the CLI prints a local evidence path, include it in the user-facing answer. I
 ### Common blocked or error states
 
 - Generated Evaluation Cases still pending review: tell the user to review the benchmark records before `optimize`.
-- Runtime Adapter ambiguity: ask for an envelope update or a `--runtime-adapter` value instead of guessing.
+- Runtime Adapter ambiguity: ask for an envelope update (per ADR 0035) instead of guessing.
 - Dirty unrelated files: surface the dirty-guard message and wait for the user to clean, stash, or explicitly allow the requested behavior.
 - Missing artifact or malformed frontmatter: surface the path and parse error from the CLI.
 - High-risk `--no-isolation`: require explicit user confirmation before passing the flag.

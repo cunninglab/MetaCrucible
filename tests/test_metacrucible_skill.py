@@ -72,3 +72,42 @@ def test_public_command_sections_are_complete() -> None:
         for label in REQUIRED_COMMAND_SUBSECTIONS:
             assert label in section, f"{command} missing {label}"
         assert f"python -m metacrucible {command}" in section
+
+
+from metacrucible.exit_codes import (
+    EXIT_BLOCKED,
+    EXIT_INTERNAL_ERROR,
+    EXIT_OK,
+    EXIT_USER_ERROR,
+)
+
+
+def test_exit_code_table_matches_cli_contract() -> None:
+    text = skill_text()
+    expected_rows = {
+        EXIT_OK: "`EXIT_OK`",
+        EXIT_USER_ERROR: "`EXIT_USER_ERROR`",
+        EXIT_BLOCKED: "`EXIT_BLOCKED`",
+        EXIT_INTERNAL_ERROR: "`EXIT_INTERNAL_ERROR`",
+    }
+    for code, label in expected_rows.items():
+        assert label in text
+        assert f"| {code} |" in text
+
+
+def test_blocked_bundle_propagation_is_documented() -> None:
+    text = skill_text()
+    required = [
+        "baseline create",
+        "evaluate",
+        "optimize",
+        "evaluation-stage `synthesize`",
+        "execution-requested `review`",
+        "receipt.json",
+        "summary.json",
+        "trajectory-digest.json",
+        "EXIT_BLOCKED",
+        "do not retry automatically",
+    ]
+    for phrase in required:
+        assert phrase in text

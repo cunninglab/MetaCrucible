@@ -136,3 +136,34 @@ Output and evidence: The command reports prior state and must not modify the art
 ## Support command boundary
 
 ADR 0035 also defines `init`, `baseline create`, and `evaluate` as support commands. Use them only when a public command or maintainer instruction requires that lower-level operation; do not present them as the primary agent-facing Routing Surface.
+
+## Error and evidence propagation
+
+The CLI is the Canonical Source for command success, failure, and blocked state. The Agent Runtime must preserve the observed exit code, human output, JSON output when requested, and any Evidence Bundle path. Do not convert `EXIT_BLOCKED` into success, do not hide stderr, and do not retry automatically unless the user explicitly asks for a corrected invocation.
+
+| Exit constant | Code | Agent behavior |
+| --- | ---: | --- |
+| `EXIT_OK` | 0 | Report success and summarize the CLI payload or human output. |
+| `EXIT_USER_ERROR` | 1 | Surface the user-correctable input problem and ask only for missing information that tools cannot determine. |
+| `EXIT_BLOCKED` | 2 | Report `BLOCKED`, preserve blocker ids and Evidence Bundle references, and stop before optimization or evaluation continues. |
+| `EXIT_INTERNAL_ERROR` | 3 | Surface the internal failure with the command, exit code, and captured output; do not invent recovery evidence. |
+
+### BLOCKED Evidence Bundles
+
+ADR 0035 requires minimal BLOCKED Evidence Bundles for `baseline create`, `evaluate`, `optimize`, evaluation-stage `synthesize`, and execution-requested `review`. Ordinary `init`, `inspect`, and non-evaluation `bootstrap` failures surface normal CLI errors and do not create BLOCKED bundles.
+
+When the CLI reports a blocked bundle, preserve these file references exactly as returned:
+
+- `receipt.json` — stable Receipt entrypoint binding run result, artifact, benchmark, envelope, adapter, and model identities;
+- `summary.json` — bounded machine-readable blocked summary;
+- `trajectory-digest.json` — redacted Trajectory Digest for reviewers and optimizers.
+
+If the CLI prints a local evidence path, include it in the user-facing answer. If JSON output includes relative bundle references, preserve those references in structured downstream messages. Never treat JSONL logs as the Evidence Bundle source of truth.
+
+### Common blocked or error states
+
+- Generated Evaluation Cases still pending review: tell the user to review the benchmark records before `optimize`.
+- Runtime Adapter ambiguity: ask for an envelope update or a `--runtime-adapter` value instead of guessing.
+- Dirty unrelated files: surface the dirty-guard message and wait for the user to clean, stash, or explicitly allow the requested behavior.
+- Missing artifact or malformed frontmatter: surface the path and parse error from the CLI.
+- High-risk `--no-isolation`: require explicit user confirmation before passing the flag.

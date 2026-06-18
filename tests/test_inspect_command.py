@@ -663,3 +663,142 @@ def test_inspect_does_not_modify_workspace_or_home(tmp_path, monkeypatch, capsys
 
     assert snapshot_tree(tmp_path) == before
     assert workspace.is_dir()
+
+# --------------------------------------------------------------------------- #
+# Task 4 — full PRD F5 public acceptance + negative BLOCKED-bundle tests     #
+# --------------------------------------------------------------------------- #
+
+def test_inspect_public_command_full_prd_f5_acceptance(
+    tmp_path, monkeypatch, capsys
+):
+    """End-to-end ``main()`` acceptance for Issue #42 / PRD F5.
+
+    Pins every public surface that PRD F5 demands:
+
+      * ``metacrucible inspect <path>`` returns ``EXIT_OK``.
+      * ``metacrucible inspect <path> --json`` returns
+        ``EXIT_OK`` and the JSON payload exposes
+        ``revision_history`` (non-empty),
+        ``acceptance_decisions`` (non-empty),
+        ``evidence_bundles`` (non-empty), and
+        ``current_best_revision_id`` resolved to ``"rev-001"``.
+      * Human output names the artifact path, envelope status,
+        current best revision, revision-history table,
+        acceptance decisions, and evidence bundle index.
+      * The inspected workspace and monkeypatched ``$HOME``
+        tree are byte-for-byte unchanged after both runs
+        (read-only contract from PRD F5 bullet "No files are
+        modified").
+
+    The receipt is written under BOTH the repo-local
+    ``workspace / "evidence" / "run-001" / "receipt.json"``
+    (so the workspace snapshot stays consistent) and the
+    user-global ``$HOME/.metacrucible/evidence/run-001/``
+    (so the evidence-bundle indexer finds it). The
+    repo-local copy is *not* indexed by inspect.
+    """
+    from metacrucible.__main__ import main
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    artifact, workspace = make_inspect_workspace(tmp_path)
+
+    # Repo-local receipt — kept for snapshot consistency only;
+    # the inspect indexer reads from $HOME/.metacrucible/evidence.
+    _write_json(
+        workspace / "evidence" / "run-001" / "receipt.json",
+        {"run_id": "run-001", "run_type": "optimize", "status": "PASS"},
+    )
+    # User-global receipt — the one the indexer actually picks up.
+    user_evidence = home / ".metacrucible" / "evidence" / "run-001"
+    _write_json(
+        user_evidence / "receipt.json",
+        {
+            "run_id": "run-001",
+            "run_type": "optimize",
+            "status": "PASS",
+            "summary_ref": "summary.json",
+            "trajectory_digest_ref": "trajectory-digest.json",
+        },
+    )
+    _write_json(user_evidence / "summary.json", {"status": "PASS"})
+    _write_json(user_evidence / "trajectory-digest.json", {"steps": []})
+
+    before = snapshot_tree(tmp_path)
+
+    human_code = main(["inspect", str(artifact)])
+    human = capsys.readouterr().out
+    json_code = main(["inspect", str(artifact), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert human_code == EXIT_OK
+    assert json_code == EXIT_OK
+    assert "Artifact path:" in human
+    assert "Envelope status:" in human
+    assert "Current best revision id: rev-001" in human
+    assert "Revision history:" in human
+    assert "revision_id | status | accepted_at | eval_score | held_out_delta" in human
+    assert "Acceptance decisions:" in human
+    assert "Evidence bundle index:" in human
+    assert payload["revision_history"]
+    assert payload["acceptance_decisions"]
+    assert payload["evidence_bundles"]
+    assert payload["current_best_revision_id"] == "rev-001"
+    assert snapshot_tree(tmp_path) == before
+
+def test_inspect_never_writes_blocked_bundle_on_bad_input(
+    tmp_path, monkeypatch, capsys
+):
+    """Pin the F5 contract: bad input never emits a BLOCKED bundle.
+
+    The ``write_blocked_bundle`` writer is monkeypatched to raise
+    on every call. If ``cmd_inspect`` accidentally routes any
+    bad-input branch through ``write_blocked_bundle``, the test
+    blows up with a loud ``AssertionError`` carrying the
+    forbidden call message. Each bad-input scenario must instead
+    return :data:`EXIT_USER_ERROR` with a clean ``metacrucible:``
+    line on ``stderr``.
+
+    Covers three negative paths:
+
+      * missing artifact path (no file at all),
+      * artifact present but no ``.metacrucible`` workspace,
+      * workspace present but ``state.json`` missing.
+    """
+    import metacrucible.__main__ as cli
+
+    def fail_writer(*args, **kwargs):
+        raise AssertionError("inspect must not write BLOCKED bundle")
+
+    monkeypatch.setattr(cli, "write_blocked_bundle", fail_writer)
+
+    missing = tmp_path / "missing.md"
+    assert cli.main(["inspect", str(missing)]) == EXIT_USER_ERROR
+    capsys.readouterr()
+
+    artifact = tmp_path / "artifact.md"
+    artifact.write_text("# Artifact\n", encoding="utf-8")
+    assert cli.main(["inspect", str(artifact)]) == EXIT_USER_ERROR
+    capsys.readouterr()
+
+    (tmp_path / ".metacrucible").mkdir()
+    assert cli.main(["inspect", str(artifact)]) == EXIT_USER_ERROR
+    captured = capsys.readouterr()
+    assert "missing state.json" in captured.err
+
+def test_inspect_is_not_blocked_bundle_emitter(tmp_path, monkeypatch, capsys):
+    """Inspect must never create ``$HOME/.metacrucible/evidence``.
+
+    Pins the policy matrix cell for ``inspect``: it is a
+    non-emitting diagnostic, so the user-global evidence root
+    must stay untouched even when the command fails on a missing
+    path. Mirrors the BLOCKED-bundle policy coverage used for
+    the other non-emitting commands.
+    """
+    import metacrucible.__main__ as cli
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    assert cli.main(["inspect", str(tmp_path / "missing.md")]) == EXIT_USER_ERROR
+    capsys.readouterr()
+    assert not (home / ".metacrucible" / "evidence").exists()

@@ -116,7 +116,7 @@ def test_skill_name_is_metacrucible() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Wrapper body — invokes CLI stub, skeletal, complete UX tracked separately    #
+# Wrapper body — invokes CLI stub                                              #
 # --------------------------------------------------------------------------- #
 
 
@@ -150,40 +150,8 @@ def test_skill_body_invokes_cli_stub() -> None:
 
 
 def test_skill_is_explicitly_skeletal() -> None:
-    """The wrapper body must declare itself a SKELETON/STUB, not a full impl.
-
-    Issue #3 pins that the wrapper is explicitly skeletal. We accept
-    any of the conventional skeleton markers so the contract is
-    enforced without coupling to one specific word.
-    """
-    _, body = _parse_skill_parts()
-    body_lower = body.lower()
-    for marker in ("skeleton", "stub", "placeholder"):
-        if marker in body_lower:
-            return
-    pytest.fail(
-        f"{SKILL_FILE.relative_to(REPO_ROOT)} body must declare itself a "
-        f"skeleton/stub/placeholder; got body:\n{body!r}"
-    )
+    pytest.skip("retired by Issue #43; skeleton boundary is replaced")
 
 
 def test_skill_documents_complete_ux_tracked_separately() -> None:
-    """The wrapper must note that the complete UX is tracked elsewhere.
-
-    Issue #3 separates the skeleton from the complete UX. The wrapper
-    body must carry an explicit hand-off so readers do not mistake the
-    stub for the finished skill.
-    """
-    _, body = _parse_skill_parts()
-    body_lower = body.lower()
-    tracked_separately = (
-        "tracked separately" in body_lower
-        or "tracked elsewhere" in body_lower
-        or "tracked in a separate" in body_lower
-        or "out of scope" in body_lower
-        or "not implemented" in body_lower
-    )
-    assert tracked_separately, (
-        f"{SKILL_FILE.relative_to(REPO_ROOT)} body must note that the "
-        f"complete UX is tracked separately; got body:\n{body!r}"
-    )
+    pytest.skip("retired by Issue #43; complete UX is now in this file")

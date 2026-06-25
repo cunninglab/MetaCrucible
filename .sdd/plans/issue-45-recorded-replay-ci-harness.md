@@ -323,13 +323,13 @@ Non-goals:
 
 ## Finalization
 
-Final code review: pending
-Final code review report: none
-Final verification: pending
+Final code review: pass
+Final code review report: .sdd/work/issue-45-recorded-replay-ci-harness/final/code-review-report.json
+Final verification: pass
 Integration fix:
   Status: none
   Commit: none
   Affected tasks: none
-Run Record: pending
-Finish decision: pending
-PR URL: none
+Run Record: ready-for-pr
+Finish decision: open-pr
+PR URL: pending

@@ -111,3 +111,65 @@ def test_mise_toml_is_valid_toml() -> None:
     """
     with MISE_TOML.open("rb") as fh:
         tomllib.load(fh)
+
+
+
+# Test files that `mise run test-replay` must keep together. The task
+# exists to exercise the recorded-replay CI harness (issue #45) for
+# `review`, `bootstrap`, `optimize`, and `synthesize`; any one of these
+# four files becoming orphaned from the replay subset should fail CI.
+REPLAY_TEST_FILES: tuple[str, ...] = (
+    "tests/test_replay_harness.py",
+    "tests/test_replay_cli.py",
+    "tests/test_ci_workflow.py",
+    "tests/test_mise_toolchain.py",
+)
+
+
+def _load_mise_toml() -> dict:
+    with MISE_TOML.open("rb") as fh:
+        return tomllib.load(fh)
+
+
+def test_mise_toml_exposes_test_replay_task() -> None:
+    """`mise.toml` must declare a `[tasks.test-replay]` entry with a non-empty `run`.
+
+    Guards issue #45: removing the `test-replay` task or emptying its `run`
+    string would silently disable the recorded-replay CI harness.
+    """
+    data = _load_mise_toml()
+    tasks = data.get("tasks")
+    assert isinstance(tasks, dict), "mise.toml must declare a [tasks] table"
+    test_replay = tasks.get("test-replay")
+    assert isinstance(test_replay, dict), (
+        "mise.toml must define [tasks.test-replay] (issue #45 CI harness)"
+    )
+    run = test_replay.get("run")
+    assert isinstance(run, str) and run.strip(), (
+        "[tasks.test-replay].run must be a non-empty string so "
+        "`mise run test-replay` actually executes pytest"
+    )
+
+
+def test_mise_toml_test_replay_references_replay_test_files() -> None:
+    """The `test-replay` task must reference the four replay-related test files.
+
+    Pins the recorded-replay subset so a refactor that renames or drops
+    one of the four files fails CI rather than silently narrowing the
+    replay coverage of `review` / `bootstrap` / `optimize` / `synthesize`.
+    """
+    data = _load_mise_toml()
+    tasks = data.get("tasks")
+    assert isinstance(tasks, dict), "mise.toml must declare a [tasks] table"
+    test_replay = tasks.get("test-replay")
+    assert isinstance(test_replay, dict), (
+        "mise.toml must define [tasks.test-replay] (issue #45 CI harness)"
+    )
+    run = test_replay.get("run", "")
+    assert isinstance(run, str), "[tasks.test-replay].run must be a string"
+    missing = [path for path in REPLAY_TEST_FILES if path not in run]
+    assert not missing, (
+        "[tasks.test-replay].run must reference every replay test file so "
+        "CI exercises the full replay subset; missing: "
+        + ", ".join(missing)
+    )

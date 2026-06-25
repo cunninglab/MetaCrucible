@@ -80,6 +80,7 @@ from .promote import _atomic_write_jsonl, promote_case
 from .storage import REPO_DIR_NAME, RepositoryStorage, UserGlobalStorage
 from .synthesize import run_synthesize_command
 from . import rule_checks as _rule_checks
+from .replay import build_judge_call_fns, build_optimizer_call_fn, load_replay
 
 __all__ = [
     "main",
@@ -490,6 +491,40 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="emit a parseable JSON object on stdout",
     )
+    review_parser.add_argument(
+        "--replay",
+        default=None,
+        metavar="REPLAY",
+        help=(
+            "path to a recorded-replay JSONL fixture "
+            "(Issue #45, ADR 0021). When supplied, the F1 "
+            "judgment path consumes the recorded judge "
+            "verdicts instead of relying on a live provider. "
+            "Default no-replay behavior is unchanged."
+        ),
+    )
+    review_parser.add_argument(
+        "--judge-replay",
+        default=None,
+        metavar="REPLAY",
+        help=(
+            "compatibility alias for ``--replay`` bound to "
+            "the first judge entry (judge_1). When supplied, "
+            "the F1 judgment path uses the recorded judge_1 "
+            "responses for the first judge callable."
+        ),
+    )
+    review_parser.add_argument(
+        "--judge-replay-2",
+        default=None,
+        metavar="REPLAY",
+        help=(
+            "compatibility alias for ``--replay`` bound to "
+            "the second judge entry (judge_2). When supplied, "
+            "the F1 judgment path uses the recorded judge_2 "
+            "responses for the second judge callable."
+        ),
+    )
     promote_parser = subparsers.add_parser(
         "promote",
         help="promote a generated benchmark case after human review",
@@ -555,6 +590,18 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="emit a parseable JSON object on stdout",
     )
+    bootstrap_parser.add_argument(
+        "--replay",
+        default=None,
+        metavar="REPLAY",
+        help=(
+            "path to a recorded-replay JSONL fixture "
+            "(Issue #45, ADR 0021). When supplied, "
+            "bootstrap may use replay responses to populate "
+            "generated case content; default no-replay "
+            "behavior is unchanged."
+        ),
+    )
     optimize_parser = subparsers.add_parser(
         "optimize",
         help=(
@@ -619,6 +666,19 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="emit a parseable JSON object on stdout",
     )
+    optimize_parser.add_argument(
+        "--replay",
+        default=None,
+        metavar="REPLAY",
+        help=(
+            "path to a recorded-replay JSONL fixture "
+            "(Issue #45, ADR 0021). When supplied, the F3 "
+            "optimizer pipeline consumes the recorded "
+            "optimizer responses instead of relying on a "
+            "live LLM. Default no-replay behavior is "
+            "unchanged."
+        ),
+    )
     # Task 1 of MetaCrucible issue #41 (PRD F4) ships the parser
     # shell + a transient ``synthesize-not-implemented`` placeholder;
     # Task 2 replaces the placeholder with the real synthesis pipeline.
@@ -640,6 +700,7 @@ def _build_parser() -> argparse.ArgumentParser:
     synthesize_parser.add_argument("--allow-dirty-unrelated", dest="allow_dirty_unrelated", action="store_true", help="record dirty-file list and proceed even with unrelated dirty files; aligned with optimize")
     synthesize_parser.add_argument("--confirm-resume", dest="confirm_resume", action="store_true", help="explicit confirmation that interrupted synthesis runs may be resumed; aligned with optimize")
     synthesize_parser.add_argument("--json", dest="json", action="store_true", help="emit a parseable JSON object on stdout")
+    synthesize_parser.add_argument("--replay", dest="replay", default=None, metavar="REPLAY", help="path to a recorded-replay JSONL fixture (Issue #45, ADR 0021). When supplied, the synthesis resume path consumes the recorded optimizer responses. Default no-replay behavior is unchanged.")
     # ``verify``) extend the same nested parser without breaking
     # the ``baseline`` outer shape. ``dest="baseline_action"`` on
     # the inner subparser so the dispatcher can branch on
@@ -1256,6 +1317,7 @@ def _discover_benchmark_state(workspace: Path) -> dict[str, Any]:
 def _run_execution_evaluation(
     *,
     benchmark_state: dict[str, Any],
+    call_fns: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
     """Compute the F1 Execution Evaluation diagnostic (Issue #29).
 
@@ -1406,7 +1468,7 @@ def _run_execution_evaluation(
 
     case_results: list[dict[str, Any]] = []
     for case in eligible_cases:
-        result = _evaluate_single_case(case)
+        result = _evaluate_single_case(case, call_fns=call_fns)
         case_results.append(result)
 
     # 3. Aggregate per-case verdicts into the top-level
@@ -1521,7 +1583,11 @@ def _collect_eligible_cases(
     )
 
 
-def _evaluate_single_case(case: Mapping[str, Any]) -> dict[str, Any]:
+def _evaluate_single_case(
+    case: Mapping[str, Any],
+    *,
+    call_fns: Sequence[Any] | None = None,
+) -> dict[str, Any]:
     """Evaluate one eligible reviewed case.
 
     The dispatcher branches on the case schema:
@@ -1564,6 +1630,7 @@ def _evaluate_single_case(case: Mapping[str, Any]) -> dict[str, Any]:
         result = _evaluate_case_with_judgment(
             case=case,
             case_id=case_id_str,
+            call_fns=call_fns,
         )
         return result
     return {
@@ -1717,6 +1784,7 @@ def _evaluate_case_with_judgment(
     *,
     case: Mapping[str, Any],
     case_id: str,
+    call_fns: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate one case via the two-judge LLM path (ADR 0010).
 
@@ -1765,11 +1833,36 @@ def _evaluate_case_with_judgment(
             }],
             "evidence": None,
         }
+    effective_call_fns: Sequence[Any] = (
+        call_fns
+        if call_fns is not None
+        else [_stub_judge_call, _stub_judge_call]
+    )
+    # When replay-backed callables are in use, supply a synthetic
+    # ``control_plane.judge`` config so the provider-config
+    # preflight in :func:`run_judge_evaluator` accepts the call.
+    # The replay harness bypasses the provider layer (the recorded
+    # responses come from the fixture); the config values are
+    # placeholders whose only purpose is to satisfy the structural
+    # contract. The default no-replay path keeps ``config={}`` so
+    # the no-provider BLOCKED condition is preserved.
+    judge_config: dict[str, Any] = (
+        {
+            "control_plane": {
+                "judge": {
+                    "provider": "replay",
+                    "model": "replay",
+                }
+            }
+        }
+        if call_fns is not None
+        else {}
+    )
     judge_result = run_judge_evaluator(
-        config={},
+        config=judge_config,
         trajectory_digest={"steps": []},
         rubric=rubric,
-        call_fns=[_stub_judge_call, _stub_judge_call],
+        call_fns=effective_call_fns,
     )
     if not judge_result.get("ok"):
         return {
@@ -1801,6 +1894,110 @@ def _evaluate_case_with_judgment(
             "pass_condition": pass_condition,
         },
     }
+
+
+def _resolve_replay_judge_call_fns(
+    args: argparse.Namespace,
+) -> list[Any] | None:
+    """Return two replay-backed judge callables, or ``None``.
+
+    The :mod:`metacrucible.replay` module exposes
+    :func:`build_judge_call_fns` and :func:`build_optimizer_call_fn`
+    (Issue #45, ADR 0021, ADR 0036). The ``review`` subcommand
+    accepts a primary ``--replay PATH`` plus two compatibility
+    aliases ``--judge-replay PATH`` and ``--judge-replay-2 PATH``;
+    when at least one of these is supplied, the F1 judgment path
+    must consume the recorded judge verdicts instead of relying
+    on a live provider. The default no-replay behavior is
+    unchanged: the helper returns ``None`` and the caller falls
+    back to the two ``_stub_judge_call`` placeholders that
+    :func:`run_judge_evaluator` rejects with
+    ``review-case-judge-provider-unavailable``.
+
+    Returns a list of exactly two distinct callables when at
+    least one replay path is supplied, in judge_1 / judge_2
+    order. The two callables are distinct objects so the
+    two-judge independence contract enforced by
+    :func:`metacrucible.provider_config.run_judge_evaluator`
+    is preserved.
+    """
+    paths: list[Path] = []
+    primary = getattr(args, "replay", None)
+    if primary:
+        paths.append(Path(primary))
+    alias_a = getattr(args, "judge_replay", None)
+    if alias_a:
+        paths.append(Path(alias_a))
+    alias_b = getattr(args, "judge_replay_2", None)
+    if alias_b:
+        paths.append(Path(alias_b))
+    if not paths:
+        return None
+    # Primary ``--replay``: hand the whole fixture to
+    # :func:`build_judge_call_fns`, which returns two distinct
+    # callables bound to judge_1 and judge_2.
+    if primary:
+        return build_judge_call_fns(load_replay(Path(primary)))
+    # Aliases: each alias path is loaded independently so a
+    # future caller can supply separate fixtures for judge_1
+    # and judge_2. We pull the first judge_* entry from each
+    # path; if only one alias is supplied we build a second
+    # callable from a fresh load of the same path so the
+    # two-distinct-callables contract is preserved.
+    from .replay import _judge_call_fn as _replay_judge_call_fn
+
+    fns: list[Any] = []
+    for pth in paths:
+        replay = load_replay(pth)
+        judge_names = [
+            name for name in replay.entry_names
+            if name.startswith("judge_")
+        ]
+        if not judge_names:
+            continue
+        fns.append(_replay_judge_call_fn(replay, judge_names[0]))
+    if len(fns) >= 2:
+        return fns[:2]
+    if len(fns) == 1:
+        # Re-load the alias path to build a second distinct
+        # callable bound to judge_1 (a fresh Replay gives a
+        # fresh function object with its own queue).
+        replay_extra = load_replay(paths[0])
+        judge_names_extra = [
+            name for name in replay_extra.entry_names
+            if name.startswith("judge_")
+        ]
+        if judge_names_extra:
+            fns.append(
+                _replay_judge_call_fn(
+                    replay_extra, judge_names_extra[0]
+                )
+            )
+    if len(fns) >= 2:
+        return fns[:2]
+    # No judge entries found in any supplied path; let the
+    # caller fall back to the stub path. The :func:`load_replay`
+    # call above would have raised on a structural error, so
+    # reaching here is a contract violation in the fixture.
+    return None
+
+
+def _resolve_optimizer_call_fn(
+    args: argparse.Namespace,
+) -> Any | None:
+    """Return a replay-backed optimizer callable, or ``None``.
+
+    The ``optimize`` subcommand accepts ``--replay PATH``
+    (Issue #45, ADR 0021). When supplied, the F3 optimizer
+    pipeline consumes the recorded optimizer responses via
+    :func:`build_optimizer_call_fn`; the default no-replay
+    behavior is unchanged (``call_fn=None``, the MVP
+    no-LLM sentinel path).
+    """
+    primary = getattr(args, "replay", None)
+    if not primary:
+        return None
+    return build_optimizer_call_fn(load_replay(Path(primary)))
 
 
 def _stub_judge_call(*args: Any, **kwargs: Any) -> Any:
@@ -1955,6 +2152,7 @@ def _run_review(
     *,
     artifact_path: Path,
     workspace: Path,
+    call_fns: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
     """Run the F1 ``review`` orchestrator (Issue #29).
 
@@ -2071,7 +2269,8 @@ def _run_review(
 
     # 6. Run the F1 Execution Evaluation diagnostic.
     execution_evaluation = _run_execution_evaluation(
-        benchmark_state=benchmark_state
+        benchmark_state=benchmark_state,
+        call_fns=call_fns,
     )
 
     # 7. Compose warnings and blockers. The F1 contract is
@@ -2205,6 +2404,7 @@ def _build_bootstrap_case(
     *,
     case_id: str,
     created_at: str,
+    input_text: str | None = None,
 ) -> dict[str, Any]:
     """Build a single draft case record for the bootstrap flow.
 
@@ -2227,7 +2427,7 @@ def _build_bootstrap_case(
         "case_id": case_id,
         "status": STATUS_GENERATED,
         "split": None,
-        "input": BOOTSTRAP_DRAFT_INPUT,
+        "input": input_text if input_text else BOOTSTRAP_DRAFT_INPUT,
         "checks": [],
         "judgment": None,
         "created_at": created_at,
@@ -2303,13 +2503,38 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
 
     records = _read_benchmark_records(benchmark)
     now = _now_iso()
+    # Optional replay-backed draft content (Issue #45 / ADR 0021). When
+    # ``--replay`` is supplied and the fixture exposes a ``bootstrap``
+    # entry, the first recorded response (which is expected to be a
+    # string) replaces :data:`BOOTSTRAP_DRAFT_INPUT` as the case
+    # ``input``. The case still carries ``status=generated`` and the
+    # ``BOOTSTRAP_PENDING_REVIEW`` sentinel so the F3 optimize gate
+    # remains intact; the replay is purely a draft-content source.
+    replay_input: str | None = None
+    replay_path = getattr(args, "replay", None)
+    if replay_path:
+        try:
+            replay_obj = load_replay(Path(replay_path))
+        except Exception:
+            replay_obj = None
+        if replay_obj is not None and "bootstrap" in replay_obj.entry_names:
+            try:
+                first_value = replay_obj.take("bootstrap")
+            except Exception:
+                first_value = None
+            if isinstance(first_value, str) and first_value:
+                replay_input = first_value
     generated_case_ids: list[str] = []
     new_records: list[dict[str, Any]] = []
     for _ in range(case_count):
         case_id = f"bootstrap-{uuid.uuid4().hex[:8]}"
         generated_case_ids.append(case_id)
         new_records.append(
-            _build_bootstrap_case(case_id=case_id, created_at=now)
+            _build_bootstrap_case(
+                case_id=case_id,
+                created_at=now,
+                input_text=replay_input,
+            )
         )
 
     merged = list(records) + new_records
@@ -2780,11 +3005,12 @@ def cmd_optimize(args: argparse.Namespace) -> int:
     # safe for the non-preview path (no routing revision proposed).
     approved_routing_revisions: list[dict[str, Any]] = []
     approved_profile_verdict: dict[str, Any] = {}
+    optimizer_call_fn = _resolve_optimizer_call_fn(args)
     pipeline_result: OptimizerPipelineResult = run_optimizer_pipeline(
         workspace=workspace,
         benchmark_path=benchmark,
         artifact_path=artifact_path,
-        call_fn=None,
+        call_fn=optimizer_call_fn,
         max_rounds=max_rounds,
         human_confirmed=False,
         routing_confirmation_preview=True,
@@ -2928,7 +3154,7 @@ def cmd_optimize(args: argparse.Namespace) -> int:
             workspace=workspace,
             benchmark_path=benchmark,
             artifact_path=artifact_path,
-            call_fn=None,
+            call_fn=optimizer_call_fn,
             max_rounds=max_rounds,
             human_confirmed=True,
             routing_confirmation_preview=False,
@@ -3061,6 +3287,7 @@ def cmd_synthesize(args: argparse.Namespace) -> int:
         args,
         emit=lambda payload: _emit(payload, as_json=args.json),
         now=_now_iso,
+        replay=getattr(args, "replay", None),
     )
 
 
@@ -3196,8 +3423,11 @@ def cmd_review(args: argparse.Namespace) -> int:
     )
 
     try:
+        review_call_fns = _resolve_replay_judge_call_fns(args)
         review = _run_review(
-            artifact_path=artifact_path, workspace=workspace
+            artifact_path=artifact_path,
+            workspace=workspace,
+            call_fns=review_call_fns,
         )
     except FileNotFoundError as exc:
         # The artifact path was resolved above, so a

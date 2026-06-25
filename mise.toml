@@ -19,3 +19,6 @@ run = "uv pip install -e \".[dev]\""
 description = "Run the test suite"
 depends = ["install"]
 run = "pytest"
+[tasks.test-replay]
+description = "Run the recorded-replay pytest subset (issue #45 CI harness)"
+run = "pytest tests/test_replay_harness.py tests/test_replay_cli.py tests/test_ci_workflow.py tests/test_mise_toolchain.py"

@@ -37,6 +37,7 @@ from .blocked_bundles import write_blocked_bundle
 from .exit_codes import EXIT_BLOCKED, EXIT_OK
 from .promote import _atomic_write_jsonl
 from .optimizer import ROUND_BUDGET_DEFAULT as _ROUND_BUDGET_DEFAULT, run_optimizer_pipeline
+from .replay import build_optimizer_call_fn, load_replay
 from .storage import (
     RepositoryStorage,
     UserGlobalStorage,
@@ -903,6 +904,7 @@ def run_synthesis_optimizer(
     allow_routing_revision: bool = False,
     allow_dirty_unrelated: bool = False,
     confirm_resume: bool = False,
+    replay: str | None = None,
 ) -> Any:
     """Invoke the F3 optimizer pipeline from the synthesize resume path.
 
@@ -957,11 +959,16 @@ def run_synthesis_optimizer(
         observable end-to-end instead of silently
         dropped before the optimizer call.
     """
+    replay_call_fn = (
+        build_optimizer_call_fn(load_replay(Path(replay)))
+        if replay
+        else None
+    )
     preview_result = run_optimizer_pipeline(
         workspace=Path(workspace),
         benchmark_path=Path(benchmark_path),
         artifact_path=Path(artifact_path),
-        call_fn=None,
+        call_fn=replay_call_fn,
         max_rounds=max_rounds,
         human_confirmed=False,
         routing_confirmation_preview=True,
@@ -974,7 +981,7 @@ def run_synthesis_optimizer(
             workspace=Path(workspace),
             benchmark_path=Path(benchmark_path),
             artifact_path=Path(artifact_path),
-            call_fn=None,
+            call_fn=replay_call_fn,
             max_rounds=max_rounds,
             human_confirmed=True,
             routing_confirmation_preview=False,
@@ -1045,6 +1052,7 @@ def _synthesize_resume_branch(
     *,
     emit: Callable[[dict[str, Any]], None],
     now: Callable[[], str],
+    replay: str | None = None,
 ) -> int:
     """Dispatch the Task 3 resume path on a loaded synthesis workspace.
 
@@ -1166,6 +1174,7 @@ def _synthesize_resume_branch(
         allow_routing_revision=allow_routing_revision,
         allow_dirty_unrelated=allow_dirty_unrelated,
         confirm_resume=confirm_resume,
+        replay=replay,
     )
     pipeline_status = str(getattr(pipeline_result, "status", ""))
     acceptance_decision = getattr(
@@ -1250,6 +1259,7 @@ def run_synthesize_command(
     *,
     emit: Callable[[dict[str, Any]], None],
     now: Callable[[], str],
+    replay: str | None = None,
 ) -> int:
     """Top-level entry point for the ``synthesize`` subcommand.
 
@@ -1310,7 +1320,7 @@ def run_synthesize_command(
             emit(payload)
             return EXIT_BLOCKED
         return _synthesize_resume_branch(
-            args, loaded, emit=emit, now=now
+            args, loaded, emit=emit, now=now, replay=replay
         )
 
     # Create branch (Task 2): the path does not exist.

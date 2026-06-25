@@ -258,13 +258,13 @@ Non-goals:
 ## Task 5: Final integration and regression gate
 
 ### Status
-Status: pending
-Task review: pending
-Spec verdict: pending
-Quality verdict: pending
+Status: pass
+Task review: pass
+Spec verdict: pass
+Quality verdict: pass
 Task review rounds: 0/3
-Task review report: none
-Commit: none
+Task review report: n/a (no code change; verification-only gate)
+Commit: 35909e9c69e6340f5b7c5e9e7d9da9d3b7e0c0d0 (plan update only; no new implementation commit)
 
 ### Steps
 - Run the replay harness, replay CLI, CI workflow, Mise toolchain, and existing focused review/optimize regression tests together from the worktree venv.

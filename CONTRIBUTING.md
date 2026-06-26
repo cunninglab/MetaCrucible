@@ -78,12 +78,134 @@ unit-tested.
 - `tests/test_mise_toolchain.py` — `mise.toml` exposes the
   `test-replay` task and references the four files above.
 
-### 3. Local-real tests (opt-in, not run in CI)
+### 3. Local-real tests — `mise run test-local-real` (opt-in, not run in CI)
 
-The developer can wire a real LLM provider on their local machine to
-sanity-check optimizer and adapter behavior end-to-end. These tests
-are not part of the suite and are not run in CI; they exist for
-reproducing real failures before recording a new replay fixture.
+Layer 3 wires a real Claude Code (`claude`) and/or oh-my-pi (`omp`)
+binary against a materialized Skill or injected subagent to prove the
+adapter contract end-to-end on the developer's machine. The tests are
+opt-in, never run in CI, and exist to reproduce real failures before
+recording a new replay fixture or cutting a release.
+
+#### How to invoke
+
+```bash
+# Runs the full local-real smoke suite (claude + omp tests).
+METACRUCIBLE_RUN_LOCAL_REAL=1 mise run test-local-real
+```
+
+Under the hood `mise run test-local-real` calls `pytest -m local_real`,
+which selects the eight `tests/test_local_real_adapter.py` cases that
+carry `@pytest.mark.local_real`. The `mise run test` task excludes
+these by design (`pytest -m 'not local_real'`).
+
+#### Skip rules
+
+A local-real test skips cleanly (not fails) when any of its gates are
+closed. There is no "skipped is red" surface; a developer who has not
+opted in sees a clean green skip summary.
+
+- **Env gate** — `METACRUCIBLE_RUN_LOCAL_REAL=1` must be set. Without
+  it, every binary-spawning test skips with
+  `METACRUCIBLE_RUN_LOCAL_REAL=1 is required to run local-real smoke tests`.
+- **Binary on `$PATH`** — The relevant runtime binary must be
+  installed:
+  - `claude` (Claude Code) for the four claude-path tests; absent
+    binaries skip with `claude binary not found on $PATH`.
+  - `omp` (oh-my-pi) for the two omp-path tests; absent binaries
+    skip with `omp binary not found on $PATH`.
+- **Marker sanity** — `test_local_real_marker_is_registered` runs
+  unconditionally so the marker discipline itself cannot silently rot.
+
+#### No provider API-key requirement
+
+The local-real harness uses the developer's existing OS-keychain /
+Claude / oh-my-pi subscription. It never reads `ANTHROPIC_API_KEY` or
+any provider key from the environment, and no test fixture holds a
+real key. CI does not require provider API keys either — recorded
+replay tests (layer 2) use deterministic JSONL fixtures.
+
+#### Does NOT mutate the user home
+
+The local-real smoke must not write to the user's real
+`~/.claude/` or `~/.omp/`. Two tests pin this contract by forcing
+`HOME`/`USERPROFILE` to a `tmp_path` fixture:
+
+- `test_local_real_skill_discovery_never_touches_user_home`
+  (`tests/test_local_real_adapter.py`)
+- `test_local_real_subagent_injection_never_touches_user_home`
+  (`tests/test_local_real_adapter.py`)
+
+If a future regression causes the harness to write to user-home
+layout under `fake-home`, one of those tests fails loudly. Do not
+relax those assertions to "make CI green" — they are the boundary
+between the smoke suite and the user's real environment.
+
+#### The eight local-real tests
+
+`tests/test_local_real_adapter.py` is the only file in layer 3. Each
+case proves one behavior:
+
+| Test | Proves |
+| --- | --- |
+| `test_local_real_marker_is_registered` | The `local_real` marker resolves; `pytest -m local_real` is well-formed. Always runs. |
+| `test_local_real_skill_discovery_via_claude` | End-to-end Skill discoverability under `claude --bare` with `--add-dir`; writes `tmp_path/evidence/` (raw stream-json, stderr, evidence.json, preflight.json). |
+| `test_local_real_skill_discovery_never_touches_user_home` | The skill smoke does not write under the (monkey-patched) user home. |
+| `test_local_real_subagent_injection_via_claude` | End-to-end subagent discoverability under `claude --bare` with `--agents`; writes `tmp_path/evidence-subagent/` (raw stream-json, stderr, evidence.json, preflight.json, argv.json). Uses the terse `local_real=True` confirm-prompt. |
+| `test_local_real_subagent_injection_never_touches_user_home` | The subagent smoke does not write under the (monkey-patched) user home. |
+| `test_local_real_skill_discovery_via_omp` | ADR 0003 shared-layout contract: a Skill materialized into `.claude/skills/<name>/SKILL.md` is discoverable under `omp --cwd <isolated_root>`; writes `tmp_path/evidence-omp-skill/`. |
+| `test_local_real_subagent_injection_via_omp` | ADR 0003 shared-layout contract: the same `agents.json` is discoverable under `omp --cwd <isolated_root>`; writes `tmp_path/evidence-omp-subagent/` (includes `agents_layout.json`). |
+| `test_local_real_omp_tests_skip_without_local_real_env` | The omp path is gated by `METACRUCIBLE_RUN_LOCAL_REAL=1` AND `shutil.which('omp')`; the contract is pinned in a unit-style assertion that always runs. |
+
+All eight tests carry `@pytest.mark.local_real` and live behind the
+single module-level `pytestmark = pytest.mark.local_real` at the top
+of the file.
+
+#### Evidence-ref discipline (for release audits)
+
+Each binary-spawning test writes its evidence bundle to a per-test
+directory under `tmp_path/evidence*/`. The bundle always contains the
+`run.evidence` dict (parsed by the harness) plus the raw stdout /
+stderr captured from the runtime, and may include `argv.json` (the
+exact argv the harness invoked) and `agents_layout.json` (the omp
+shared-layout copy path). The bundle is the audit trail for "what
+did the runtime actually do on this developer's box?".
+
+The four evidence-writing tests now call
+`_assert_evidence_present(evidence_dir, [...])` after writing, which
+guarantees the directory exists, every expected file is present and
+non-empty, and `evidence.json` / `preflight.json` parse as JSON. A
+regression that drops an evidence file fails the test loudly instead
+of silently shipping an incomplete bundle.
+
+#### How to capture evidence for a release
+
+When cutting a release, point pytest's per-test `tmp_path` at a
+persistent directory so the evidence bundles survive after the run:
+
+```bash
+# Capture release evidence for issue #46 (or any release tag).
+mkdir -p ./release-evidence/issue-46
+METACRUCIBLE_RUN_LOCAL_REAL=1 \
+    .venv/bin/python -m pytest tests/test_local_real_adapter.py \
+    --basetemp ./release-evidence/issue-46/ \
+    -v
+```
+
+After the run, every per-test scratch lives under
+`./release-evidence/issue-46/test_local_real_adapter*/evidence*/`.
+Cite the resulting `evidence.json` and `preflight.json` paths in the
+release notes under a "Local-real evidence" section. The bundles are
+test-owned scratch — they are NOT committed to the repo and they
+must NEVER contain a real provider API key.
+
+#### When to run layer 3
+
+- You are about to record a new replay fixture (record the real run
+  first, then commit the JSONL).
+- You are about to cut a release that touches the adapter or the
+  shared-layout contract (ADR 0003).
+- You are debugging a CI failure whose root cause is suspected to be
+  in the runtime harness rather than the orchestrator.
 
 > **CI does not require provider API keys. Recorded replay tests use
 > deterministic fixtures; do not put real secrets in fixtures.**

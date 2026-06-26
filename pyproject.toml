@@ -33,6 +33,7 @@ classifiers = [
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3.14",
   "Topic :: Software Development",
+
 ]
 
 [project.urls]
@@ -44,7 +45,17 @@ Issues = "https://github.com/Cunning-Kang/MetaCrucible/issues"
 metacrucible = "metacrucible.__main__:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "pytest-rerunfailures>=14"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/metacrucible"]
+
+[tool.pytest.ini_options]
+# Marker discipline for the three test layers (issue #45 + issue #46):
+#   - `local_real` tests require a real runtime binary and the
+#     `METACRUCIBLE_RUN_LOCAL_REAL=1` env gate. They are excluded
+#     from `mise run test` and selected explicitly via
+#     `mise run test-local-real`.
+markers = [
+    "local_real: opt-in tests that spawn a real Claude Code / oh-my-pi binary (deselect with -m 'not local_real')",
+]

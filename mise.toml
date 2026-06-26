@@ -7,6 +7,7 @@
 # added at the repo root without a rationale documented in this file.
 [tools]
 python = "3.14"
+uv = "latest"
 
 [env]
 _.python.venv = { path = ".venv", create = true }
@@ -16,9 +17,13 @@ description = "Install MetaCrucible (editable) and dev dependencies into the pro
 run = "uv pip install -e \".[dev]\""
 
 [tasks.test]
-description = "Run the test suite"
+description = "Run the test suite (excludes opt-in local_real tests)"
 depends = ["install"]
-run = "pytest"
+run = "pytest -m 'not local_real'"
 [tasks.test-replay]
 description = "Run the recorded-replay pytest subset (issue #45 CI harness)"
 run = "pytest tests/test_replay_harness.py tests/test_replay_cli.py tests/test_ci_workflow.py tests/test_mise_toolchain.py"
+
+[tasks.test-local-real]
+description = "Run opt-in local-real smoke tests (issue #46); requires METACRUCIBLE_RUN_LOCAL_REAL=1 and a real runtime binary"
+run = "pytest -m local_real"

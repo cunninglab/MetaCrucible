@@ -67,6 +67,24 @@ def test_mise_toml_pins_python_version() -> None:
     )
 
 
+def test_mise_toml_pins_uv_tool() -> None:
+    """`mise.toml` must pin `uv` under `[tools]`.
+
+    The `[tasks.install]` task runs `uv pip install ...`; without `uv`
+    declared as a mise tool, CI fails with `sh: 1: uv: not found`
+    because `jdx/mise-action` only installs tools listed under
+    `[tools]` (plus Python). Local dev works only because `uv` happens
+    to be in the developer's global mise config; CI must not rely on
+    that. This test guards the regression observed in CI run
+    #28216651878 / #28182757209 (both predating issue #46).
+    """
+    text = _read_mise_toml()
+    assert re.search(r'^\s*uv\s*=\s*"[\w.\-]+"\s*$', text, re.MULTILINE), (
+        "mise.toml must pin `uv` under [tools] so CI can run "
+        "`mise run install` (uv pip install) without a global uv"
+    )
+
+
 def test_mise_toml_defines_test_task() -> None:
     """A `test` task must be defined so `mise run test` exercises the suite."""
     text = _read_mise_toml()

@@ -57,7 +57,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .argv_normalize import REVIEWED_TOOL_NAMES
+from .argv_normalize import REVIEWED_TOOL_NAMES, validate_allowed_tools
 from .claude_stream_json import ADAPTER_VERSION, parse_stream_json
 from .preflight import (
     SKILL_SENTINEL_PREFIX,
@@ -66,6 +66,10 @@ from .preflight import (
     check_subagent_preflight,
     skill_preflight_prompt,
     subagent_preflight_prompt,
+)
+from .workspace_isolation import (
+    NO_ISOLATION_ENV_OVERRIDE,
+    validate_no_isolation,
 )
 
 __all__ = [
@@ -81,6 +85,9 @@ __all__ = [
     "RUNTIME_CLAUDE",
     "RUNTIME_OMP",
     "OMP_ADAPTER_VERSION",
+    "ADAPTER_NO_ISOLATION_ENV_OVERRIDE",
+    "ADAPTER_LOCAL_REAL_OPT_IN_ENV",
+    "ADAPTER_LOCAL_REAL_OPT_IN_VALUE",
     "SKILL_MATERIALIZE_NAME_MISSING_BLOCKER",
     "SKILL_MATERIALIZE_NAME_INVALID_BLOCKER",
     "SKILL_MATERIALIZE_BODY_MISSING_BLOCKER",
@@ -100,6 +107,8 @@ __all__ = [
     "build_evidence_summary",
     "SUBAGENT_LOCAL_REAL_CONFIRM_PROMPT_TEMPLATE",
     "local_real_subagent_confirm_prompt",
+    "validate_adapter_allowed_tools",
+    "validate_adapter_no_isolation",
 ]
 
 
@@ -174,6 +183,35 @@ RUNTIME_OMP: str = "omp"
 #: model lineage (e.g. ``"oh-my-pi/16.1.19"``).
 OMP_ADAPTER_VERSION: str = "oh-my-pi/16.1.19"
 
+#: Env-var name the harness reads to authorize a noninteractive
+#: no-isolation run (Issue #46 Task 4). Forwarded verbatim from
+#: :data:`metacrucible.workspace_isolation.NO_ISOLATION_ENV_OVERRIDE`
+#: so the adapter and the CLI share the exact same identifier. The
+#: adapter reads the env at subprocess-method entry; the upstream
+#: validator's :func:`validate_no_isolation` reads it when called
+#: with ``env_override=None``.
+ADAPTER_NO_ISOLATION_ENV_OVERRIDE: str = NO_ISOLATION_ENV_OVERRIDE
+
+#: Env-var name the harness treats as the developer's explicit
+#: local-real opt-in (Issue #46 Task 4). When the harness sees this
+#: variable set to :data:`ADAPTER_LOCAL_REAL_OPT_IN_VALUE`, it
+#: auto-passes the no-isolation gate: the env gate IS the
+#: confirmation. This is a local-real test convenience, NOT a
+#: default-behavior change — production callers must still set
+#: :data:`ADAPTER_NO_ISOLATION_ENV_OVERRIDE` or pass
+#: ``has_confirmation=True`` explicitly.
+ADAPTER_LOCAL_REAL_OPT_IN_ENV: str = "METACRUCIBLE_RUN_LOCAL_REAL"
+
+#: The exact value the local-real opt-in env var must carry to
+#: trigger the auto-pass policy. Any other value is treated as
+#: "opt-in not set" so a typo in the env does not silently
+#: authorize a noninteractive no-isolation run.
+ADAPTER_LOCAL_REAL_OPT_IN_VALUE: str = "1"
+
+
+# --------------------------------------------------------------------------- #
+# Pre-invocation validation (Issue #46 Task 4)                                #
+# --------------------------------------------------------------------------- #
 
 # --------------------------------------------------------------------------- #
 # Local-real adapter: subagent confirm-prompt (Issue #46 Repair 3)           #
@@ -419,6 +457,193 @@ def local_real_subagent_confirm_prompt(subagent_name: str = "") -> str:
         prefix=SUBAGENT_SENTINEL_PREFIX,
         subagent_name=subagent_name or "<unknown>",
     )
+
+
+def validate_adapter_allowed_tools(
+    tools: Sequence[str] | None,
+) -> dict[str, Any]:
+    """Validate an allowed-tools list against the reviewed Claude Code set.
+
+    Issue #46 Task 4 (pre-invocation validation, axis A): the
+    harness's Skill path MUST validate the supplied tools against
+    :data:`REVIEWED_TOOL_NAMES` BEFORE spawning the binary. If the
+    caller passes an unsupported tool name, the harness short-
+    circuits with an ``execution-boundary-allowed-tool-unsupported``
+    blocker and never invokes ``claude``. If the caller passes a
+    wildcard (``["*"]``), the harness short-circuits with an
+    ``execution-boundary-allowed-tool-wildcard`` blocker.
+
+    This helper is a thin wrapper around
+    :func:`metacrucible.argv_normalize.validate_allowed_tools`; the
+    harness re-exports the standard ``ok`` / ``blockers`` result
+    shape so callers do not have to import the normalize module
+    directly. The upstream validator's blocker ids
+    (Issue #11 AC2) are returned verbatim — they are the machine
+    contract the receipt writer and optimizer pipeline branch on.
+
+    Parameters
+    ----------
+    tools:
+        Iterable of tool name strings the caller intends to pass
+        to ``claude --allowed-tools ...``. An empty list is a
+        valid no-permission request and is allowed; ``None`` or a
+        non-list/tuple is a blocker.
+
+    Returns
+    -------
+    dict
+        Standard validator result: ``{"ok": bool, "blockers": [...]}``.
+    """
+    return validate_allowed_tools(tools)
+
+
+def validate_adapter_no_isolation(
+    *,
+    allow_no_isolation: bool,
+    has_confirmation: bool,
+) -> dict[str, Any]:
+    """Validate the noninteractive no-isolation guard (Issue #46 Task 4).
+
+    The harness's subprocess methods run in noninteractive mode
+    (``-p`` / ``--print``); :func:`metacrucible.workspace_isolation.validate_no_isolation`
+    enforces the safety gate (Issue #13 AC3 + AC4). This helper
+    delegates to the upstream validator with ``interactive=False``
+    and forwards the caller-supplied ``allow_no_isolation`` as the
+    ``env_override`` argument. The helper is pure: it does NOT
+    read the process environment; callers pass the env value
+    explicitly so the test seam can drive the gate without
+    mutating ``os.environ``.
+
+    Parameters
+    ----------
+    allow_no_isolation:
+        ``True`` iff :data:`ADAPTER_NO_ISOLATION_ENV_OVERRIDE` is
+        set to a non-empty value in the caller's environment.
+        Upstream contract: any non-empty string authorizes the
+        noninteractive call; this helper normalizes that to a
+        boolean for the gate logic.
+    has_confirmation:
+        ``True`` iff the caller explicitly opted in (the
+        equivalent of ``--confirm-no-isolation`` on the CLI).
+        Local-real tests pass this as ``True``; the harness
+        auto-passes it when the developer sets
+        :data:`ADAPTER_LOCAL_REAL_OPT_IN_ENV` (see
+        :func:`_effective_no_isolation_confirmation`).
+
+    Returns
+    -------
+    dict
+        Standard validator result: ``{"ok": bool, "blockers": [...]}``.
+        The blocker ids are the upstream strings
+        (``workspace-no-isolation-confirmation-required`` /
+        ``workspace-no-isolation-non-interactive``).
+    """
+    # When ``allow_no_isolation`` is False, pass an explicit empty
+    # string so the upstream ``validate_no_isolation`` does NOT
+    # re-read the process environment. Empty string is upstream-
+    # equivalent to ``None``-with-empty-env for the noninteractive
+    # blocker check (``not env_override`` is True for both) but
+    # skips the env read entirely — this lets the test seam
+    # exercise the "no env override" branch deterministically.
+    return validate_no_isolation(
+        confirmed=has_confirmation,
+        interactive=False,
+        env_override=(
+            ADAPTER_NO_ISOLATION_ENV_OVERRIDE
+            if allow_no_isolation
+            else ""
+        ),
+    )
+
+
+def _effective_no_isolation_confirmation(
+    has_confirmation: bool,
+) -> bool:
+    """Resolve the effective no-isolation confirmation flag.
+
+    The harness auto-passes the confirmation when the developer
+    sets :data:`ADAPTER_LOCAL_REAL_OPT_IN_ENV` to
+    :data:`ADAPTER_LOCAL_REAL_OPT_IN_VALUE` in the process
+    environment; this is the "local-real opt-in IS the
+    confirmation" policy (Issue #46 Task 4 brief). The
+    caller-supplied ``has_confirmation`` parameter always wins
+    when it is ``True`` so production callers retain an
+    out-of-process-free opt-in path.
+
+    Any value of the env var other than
+    :data:`ADAPTER_LOCAL_REAL_OPT_IN_VALUE` (e.g. an empty
+    string or a typo) is treated as "opt-in not set" so a
+    mistyped env does not silently authorize a noninteractive
+    no-isolation run.
+    """
+    if has_confirmation:
+        return True
+    return (
+        os.environ.get(ADAPTER_LOCAL_REAL_OPT_IN_ENV)
+        == ADAPTER_LOCAL_REAL_OPT_IN_VALUE
+    )
+
+
+def _local_real_opt_in_active() -> bool:
+    """Return ``True`` iff the local-real opt-in env var is set.
+
+    The local-real opt-in is a developer-level "I am deliberately
+    running a noninteractive real-binary smoke" signal (Issue #46
+    Task 4 brief). When active, the harness treats it as an
+    equivalent for BOTH the confirmation flag AND the env
+    override so the gate auto-passes for the local-real smoke
+    without forcing the developer to set a second env var.
+    Production callers that want this convenience must set the
+    env var explicitly; the auto-pass is a local-real smoke
+    convenience, NOT a default-behavior change.
+    """
+    return (
+        os.environ.get(ADAPTER_LOCAL_REAL_OPT_IN_ENV)
+        == ADAPTER_LOCAL_REAL_OPT_IN_VALUE
+    )
+
+def _blocked_preflight_evidence(
+    *,
+    blockers: list[dict[str, str]],
+    runtime: str,
+) -> dict[str, Any]:
+    """Build a minimal evidence dict for a blocked pre-invocation gate.
+
+    Used by the gate logic in :func:`run_skill_preflight` /
+    :func:`run_subagent_preflight` / :func:`run_omp_skill_preflight`
+    / :func:`run_omp_subagent_preflight` to short-circuit the spawn
+    when the pre-invocation validation fails. The shape mirrors
+    :func:`metacrucible.claude_stream_json.parse_stream_json` for
+    the claude path and :func:`_build_omp_evidence` for the omp
+    path, so :func:`build_evidence_summary` and other consumers
+    can branch on the same fields without special-casing the
+    "no spawn ever happened" case.
+
+    The ``claude_code_version`` field is ``None`` for the
+    claude path (no init event was observed) and the omp
+    surface fills ``runtime_version`` from
+    :data:`OMP_ADAPTER_VERSION` so the evidence dict
+    :func:`build_evidence_summary` consumes still has a
+    non-empty ``runtime_version`` even on a blocked run.
+    """
+    is_omp = runtime == RUNTIME_OMP
+    return {
+        "start_captured": False,
+        "completion_captured": False,
+        "raw_event_count": 0,
+        "malformed_line_count": 0,
+        "final_output": None,
+        "exit_code": -1,
+        "stderr": "",
+        "error": None,
+        "adapter_version": (
+            OMP_ADAPTER_VERSION if is_omp else ADAPTER_VERSION
+        ),
+        "claude_code_version": None,
+        "runtime_version": OMP_ADAPTER_VERSION if is_omp else None,
+        "blockers": list(blockers),
+        "warnings": [],
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -678,6 +903,7 @@ def run_skill_preflight(
     env: Mapping[str, str] | None = None,
     cwd: str | os.PathLike[str] | None = None,
     verbose: bool = DEFAULT_VERBOSE_FLAG,
+    has_confirmation: bool = False,
     run_subprocess: Any = None,
 ) -> SkillPreflightRun:
     """Spawn the binary once and parse the captured stream-json.
@@ -734,12 +960,62 @@ def run_skill_preflight(
         Inject ``--verbose`` before ``-p`` (default ``True``). The
         current ``claude`` runtime aborts ``--print --output-format
         stream-json`` without it.
+    has_confirmation:
+        Explicit opt-in flag for the noninteractive no-isolation
+        guard (Issue #46 Task 4 axis B). When ``True`` the harness
+        short-circuits the gate and spawns the binary. When
+        ``False`` (the default) the harness reads the
+        :data:`ADAPTER_LOCAL_REAL_OPT_IN_ENV` env var and the
+        :data:`ADAPTER_NO_ISOLATION_ENV_OVERRIDE` env var; the
+        local-real opt-in policy auto-passes the gate when
+        ``METACRUCIBLE_RUN_LOCAL_REAL=1`` is set.
     run_subprocess:
         Test seam. When supplied, the harness calls it as
         ``run_subprocess(full_argv, ...)`` and expects a
         ``subprocess.CompletedProcess``-like object. Production
         callers leave this ``None``.
     """
+    # Pre-invocation gate (Issue #46 Task 4). Validates the supplied
+    # allowed-tools against :data:`REVIEWED_TOOL_NAMES` AND the
+    # noninteractive no-isolation safety guard BEFORE any subprocess
+    # is spawned. If either check fails the harness returns a
+    # blocked pre-flight result (no spawn, ``argv=[]``, blockers
+    # surfaced through evidence + preflight) so the caller can
+    # branch on the same shape it already branches on for a
+    # runtime-failed run.
+    allowed_check = validate_adapter_allowed_tools(list(allowed_tools))
+    # Local-real opt-in auto-passes the entire gate (both the
+    # confirmation flag and the env override) so the local-real
+    # smoke can run without setting a second env var.
+    local_real_active = _local_real_opt_in_active()
+    allow_no_isolation = bool(
+        os.environ.get(ADAPTER_NO_ISOLATION_ENV_OVERRIDE)
+    ) or local_real_active
+    effective_confirmed = _effective_no_isolation_confirmation(
+        has_confirmation
+    )
+    no_isolation_check = validate_adapter_no_isolation(
+        allow_no_isolation=allow_no_isolation,
+        has_confirmation=effective_confirmed,
+    )
+    gate_blockers: list[dict[str, str]] = []
+    if not allowed_check["ok"]:
+        gate_blockers.extend(allowed_check.get("blockers") or [])
+    if not no_isolation_check["ok"]:
+        gate_blockers.extend(no_isolation_check.get("blockers") or [])
+    if gate_blockers:
+        evidence = _blocked_preflight_evidence(
+            blockers=gate_blockers, runtime=RUNTIME_CLAUDE
+        )
+        return SkillPreflightRun(
+            argv=[],
+            exit_code=-1,
+            stdout="",
+            stderr="",
+            evidence=evidence,
+            preflight={"ok": False, "blockers": list(gate_blockers)},
+        )
+
     if prompt is None:
         prompt = skill_preflight_prompt(skill_name=skill_name)
 
@@ -819,6 +1095,7 @@ def run_subagent_preflight(
     cwd: str | os.PathLike[str] | None = None,
     verbose: bool = DEFAULT_VERBOSE_FLAG,
     local_real: bool = False,
+    has_confirmation: bool = False,
     run_subprocess: Any = None,
 ) -> SubagentPreflightRun:
     """Spawn the binary once with ``--agents <inline_json>`` and parse stream-json.
@@ -910,7 +1187,58 @@ def run_subagent_preflight(
         ``run_subprocess(full_argv, ...)`` and expects a
         ``subprocess.CompletedProcess``-like object. Production
         callers leave this ``None``.
+    has_confirmation:
+        Explicit opt-in flag for the noninteractive no-isolation
+        guard (Issue #46 Task 4 axis B). The subagent path does
+        not take ``allowed_tools``; the allowed-tools gate
+        (:func:`validate_adapter_allowed_tools`) is therefore
+        skipped. The noninteractive no-isolation gate uses the
+        same effective-confirmation policy as
+        :func:`run_skill_preflight`: the
+        :data:`ADAPTER_LOCAL_REAL_OPT_IN_ENV` env var
+        auto-passes the gate when set to
+        :data:`ADAPTER_LOCAL_REAL_OPT_IN_VALUE`.
     """
+    # Pre-invocation gate (Issue #46 Task 4 axis B). The subagent
+    # path does not accept an ``allowed_tools`` parameter (the
+    # ``--agents`` flag carries inline JSON; tool allowlisting is
+    # a per-execution concern, not a registration concern), so
+    # only the noninteractive no-isolation guard runs. When the
+    # gate blocks the harness returns a blocked pre-flight
+    # result with ``argv=[]`` and the upstream workspace
+    # blocker ids, so the caller can branch on the same shape
+    # it already branches on for a runtime-failed run.
+    local_real_active_sub = _local_real_opt_in_active()
+    allow_no_isolation_sub = bool(
+        os.environ.get(ADAPTER_NO_ISOLATION_ENV_OVERRIDE)
+    ) or local_real_active_sub
+    effective_confirmed_sub = _effective_no_isolation_confirmation(
+        has_confirmation
+    )
+    no_isolation_check_sub = validate_adapter_no_isolation(
+        allow_no_isolation=allow_no_isolation_sub,
+        has_confirmation=effective_confirmed_sub,
+    )
+    if not no_isolation_check_sub["ok"]:
+        sub_blockers = list(
+            no_isolation_check_sub.get("blockers") or []
+        )
+        sub_evidence = _blocked_preflight_evidence(
+            blockers=sub_blockers, runtime=RUNTIME_CLAUDE
+        )
+        return SubagentPreflightRun(
+            argv=[],
+            exit_code=-1,
+            stdout="",
+            stderr="",
+            evidence=sub_evidence,
+            preflight={
+                "ok": False,
+                "blockers": sub_blockers,
+            },
+            agents_path=str(agents_path),
+        )
+
     path = _coerce_path(agents_path)
 
     try:
@@ -1197,6 +1525,7 @@ def run_omp_skill_preflight(
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     env: Mapping[str, str] | None = None,
     cwd: str | os.PathLike[str] | None = None,
+    has_confirmation: bool = False,
     run_subprocess: Any = None,
 ) -> SkillPreflightRun:
     """Spawn ``omp`` once against the materialized Skill tree (Issue #46 Task 3).
@@ -1248,7 +1577,49 @@ def run_omp_skill_preflight(
         Test seam. When supplied, the harness calls it as
         ``run_subprocess(full_argv, ...)`` and expects a
         ``subprocess.CompletedProcess``-like object.
+    has_confirmation:
+        Explicit opt-in flag for the noninteractive no-isolation
+        guard (Issue #46 Task 4 axis B). The omp argv does not
+        accept ``--allowed-tools``; the allowed-tools gate is
+        therefore skipped. The no-isolation gate uses the same
+        effective-confirmation policy as :func:`run_skill_preflight`.
     """
+    # Pre-invocation gate (Issue #46 Task 4 axis B). The omp
+    # argv does not include ``--allowed-tools`` (ADR 0003
+    # shared-layout contract), so the allowed-tools gate is
+    # not applicable. Only the noninteractive no-isolation
+    # safety guard runs.
+    local_real_active_omp_skill = _local_real_opt_in_active()
+    allow_no_isolation_omp_skill = bool(
+        os.environ.get(ADAPTER_NO_ISOLATION_ENV_OVERRIDE)
+    ) or local_real_active_omp_skill
+    effective_confirmed_omp_skill = _effective_no_isolation_confirmation(
+        has_confirmation
+    )
+    no_isolation_check_omp_skill = validate_adapter_no_isolation(
+        allow_no_isolation=allow_no_isolation_omp_skill,
+        has_confirmation=effective_confirmed_omp_skill,
+    )
+    if not no_isolation_check_omp_skill["ok"]:
+        omp_skill_blockers = list(
+            no_isolation_check_omp_skill.get("blockers") or []
+        )
+        omp_skill_evidence = _blocked_preflight_evidence(
+            blockers=omp_skill_blockers, runtime=RUNTIME_OMP
+        )
+        return SkillPreflightRun(
+            argv=[],
+            exit_code=-1,
+            stdout="",
+            stderr="",
+            evidence=omp_skill_evidence,
+            preflight={
+                "ok": False,
+                "blockers": omp_skill_blockers,
+            },
+            runtime=RUNTIME_OMP,
+        )
+
     if prompt is None:
         prompt = skill_preflight_prompt(skill_name=skill_name)
 
@@ -1332,6 +1703,7 @@ def run_omp_subagent_preflight(
     env: Mapping[str, str] | None = None,
     cwd: str | os.PathLike[str] | None = None,
     local_real: bool = False,
+    has_confirmation: bool = False,
     run_subprocess: Any = None,
 ) -> SubagentPreflightRun:
     """Spawn ``omp`` once against the materialized subagent JSON (Issue #46 Task 3).
@@ -1357,9 +1729,51 @@ def run_omp_subagent_preflight(
     because the main model cannot introspect subagent registration
     via the verbose prompt (subagents are registered, not loaded
     into the main context) and would otherwise hedge to ``no``.
-
     Returns a :class:`SubagentPreflightRun` with ``runtime="omp"``.
+    The ``has_confirmation`` parameter is the explicit opt-in for
+    the noninteractive no-isolation guard (Issue #46 Task 4 axis
+    B); the omp shared-layout path does not accept
+    ``--allowed-tools``, so the allowed-tools gate is not
+    applicable here. The no-isolation gate uses the same
+    effective-confirmation policy as
+    :func:`run_omp_skill_preflight`.
     """
+    # Pre-invocation gate (Issue #46 Task 4 axis B). omp does not
+    # accept ``--allowed-tools``; the allowed-tools gate is
+    # therefore skipped. Only the noninteractive no-isolation
+    # safety guard runs.
+    local_real_active_omp_sub = _local_real_opt_in_active()
+    allow_no_isolation_omp_sub = bool(
+        os.environ.get(ADAPTER_NO_ISOLATION_ENV_OVERRIDE)
+    ) or local_real_active_omp_sub
+    effective_confirmed_omp_sub = _effective_no_isolation_confirmation(
+        has_confirmation
+    )
+    no_isolation_check_omp_sub = validate_adapter_no_isolation(
+        allow_no_isolation=allow_no_isolation_omp_sub,
+        has_confirmation=effective_confirmed_omp_sub,
+    )
+    if not no_isolation_check_omp_sub["ok"]:
+        omp_sub_blockers = list(
+            no_isolation_check_omp_sub.get("blockers") or []
+        )
+        omp_sub_evidence = _blocked_preflight_evidence(
+            blockers=omp_sub_blockers, runtime=RUNTIME_OMP
+        )
+        return SubagentPreflightRun(
+            argv=[],
+            exit_code=-1,
+            stdout="",
+            stderr="",
+            evidence=omp_sub_evidence,
+            preflight={
+                "ok": False,
+                "blockers": omp_sub_blockers,
+            },
+            runtime=RUNTIME_OMP,
+            agents_path=str(agents_path),
+        )
+
     if prompt is None:
         if local_real:
             # Local-real adapter (Issue #46 Repair 3): use the terse

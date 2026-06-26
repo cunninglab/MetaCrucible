@@ -19,8 +19,6 @@ This test file covers the importable, binary-free surface of
 The tests run on every ``mise run test`` invocation; they do not
 depend on the local-real env gate.
 """
-from __future__ import annotations
-
 import os
 from dataclasses import asdict
 from pathlib import Path
@@ -32,6 +30,7 @@ ADAPTER_MODULE = "metacrucible.adapter_runtime"
 PREFLIGHT_MODULE = "metacrucible.preflight"
 STREAM_JSON_MODULE = "metacrucible.claude_stream_json"
 ARGV_NORMALIZE_MODULE = "metacrucible.argv_normalize"
+WORKSPACE_ISOLATION_MODULE = "metacrucible.workspace_isolation"
 
 
 # --------------------------------------------------------------------------- #
@@ -116,6 +115,47 @@ def argv_normalize() -> Any:
     import importlib
 
     return importlib.import_module(ARGV_NORMALIZE_MODULE)
+
+
+@pytest.fixture(scope="module")
+def workspace_isolation() -> Any:
+    """Import the workspace isolation module (no-isolation guard contract)."""
+    import importlib
+
+    return importlib.import_module(WORKSPACE_ISOLATION_MODULE)
+
+
+#: Session-scoped autouse opt-in: the harness's pre-invocation
+#: gate (Issue #46 Task 4 axis B) requires an explicit
+#: ``METACRUCIBLE_ALLOW_NO_ISOLATION`` env var OR an explicit
+#: ``has_confirmation=True`` parameter to spawn a noninteractive
+#: binary. Pure tests in this module exercise the harness's
+#: binary-free ``run_subprocess`` test seam; they do not actually
+#: need the env override for the production runtime. We set the
+#: override transparently so the existing pure tests keep
+#: working unchanged, and the new gate tests can opt-out via
+#: ``monkeypatch.delenv`` on the env var to exercise the blocked
+#: branch. Local-real tests are unaffected: they already set
+#: ``METACRUCIBLE_RUN_LOCAL_REAL=1``, which takes precedence over
+#: the no-isolation env override per
+#: :func:`metacrucible.adapter_runtime._effective_no_isolation_confirmation`.
+_NO_ISOLATION_ENV_NAME = "METACRUCIBLE_ALLOW_NO_ISOLATION"
+
+
+@pytest.fixture(autouse=True)
+def _no_isolation_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Opt every test in this module into the no-isolation env override.
+
+    Tests that want to exercise the BLOCKED branch of the gate
+    call ``monkeypatch.delenv`` on
+    ``METACRUCIBLE_ALLOW_NO_ISOLATION`` AND
+    ``METACRUCIBLE_RUN_LOCAL_REAL`` inside the test body (the
+    harness treats the local-real env var as a confirmation
+    equivalent — see
+    :func:`metacrucible.adapter_runtime._effective_no_isolation_confirmation`).
+    """
+    monkeypatch.setenv(_NO_ISOLATION_ENV_NAME, "1")
+    monkeypatch.setenv("METACRUCIBLE_RUN_LOCAL_REAL", "1")
 
 
 # --------------------------------------------------------------------------- #
@@ -1776,6 +1816,426 @@ def test_subagent_injection_materializes_into_omp_compatible_json(
     assert json.loads(agents_path.read_text(encoding="utf-8")).get(
         "metacrucible-omp-test"
     ) is not None
+
+
+# --------------------------------------------------------------------------- #
+# Pre-invocation gate: allowed-tools + no-isolation (Issue #46 Task 4)        #
+# --------------------------------------------------------------------------- #
+#
+# Axis A — ``validate_adapter_allowed_tools`` rejects unsupported tools and
+# wildcards before spawn; the harness's Skill path must short-circuit when
+# the caller passes an off-list tool name. Axis B — the noninteractive
+# no-isolation guard refuses to spawn when neither ``has_confirmation`` nor
+# the env override is set; the local-real opt-in env var is treated as a
+# confirmation equivalent (see harness docstring). The tests below cover
+# the helper surface AND the four subprocess methods.
+#
+# The autouse ``_no_isolation_env`` fixture sets
+# ``METACRUCIBLE_ALLOW_NO_ISOLATION=1`` and
+# ``METACRUCIBLE_RUN_LOCAL_REAL=1`` for every test in this module, so the
+# gate does not block the existing pure tests. Gate-specific tests opt
+# out by calling ``monkeypatch.delenv`` on BOTH variables inside the test
+# body so the upstream validator sees a clean, noninteractive,
+# unconfirmed call.
+
+
+def test_adapter_module_exposes_pre_invocation_helpers(adapter: Any) -> None:
+    """The harness must expose the Task 4 pre-invocation helpers."""
+    assert hasattr(adapter, "validate_adapter_allowed_tools")
+    assert callable(adapter.validate_adapter_allowed_tools)
+    assert hasattr(adapter, "validate_adapter_no_isolation")
+    assert callable(adapter.validate_adapter_no_isolation)
+
+
+def test_adapter_module_exposes_local_real_env_constants(adapter: Any) -> None:
+    """The harness must expose the no-isolation env names (forwarded contract)."""
+    assert adapter.ADAPTER_NO_ISOLATION_ENV_OVERRIDE == "METACRUCIBLE_ALLOW_NO_ISOLATION"
+    assert adapter.ADAPTER_LOCAL_REAL_OPT_IN_ENV == "METACRUCIBLE_RUN_LOCAL_REAL"
+    assert adapter.ADAPTER_LOCAL_REAL_OPT_IN_VALUE == "1"
+
+
+def test_validate_adapter_allowed_tools_accepts_reviewed_tools(
+    adapter: Any, argv_normalize: Any
+) -> None:
+    """Axis A (positive): every reviewed tool name passes the helper."""
+    for tool in argv_normalize.REVIEWED_TOOL_NAMES:
+        result = adapter.validate_adapter_allowed_tools([tool])
+        assert result["ok"] is True, (
+            f"validate_adapter_allowed_tools({tool!r}) must accept reviewed tool"
+        )
+        assert result["blockers"] == []
+
+
+def test_validate_adapter_allowed_tools_accepts_multiple_reviewed_tools(
+    adapter: Any,
+) -> None:
+    """Axis A (positive): a multi-entry list of reviewed tools passes."""
+    result = adapter.validate_adapter_allowed_tools(["Read", "Bash", "Glob"])
+    assert result["ok"] is True
+    assert result["blockers"] == []
+
+
+def test_validate_adapter_allowed_tools_blocks_unsupported_tool(
+    adapter: Any, argv_normalize: Any
+) -> None:
+    """Axis A (negative): an off-list tool name blocks with the pinned id."""
+    result = adapter.validate_adapter_allowed_tools(["SendEmail"])
+    assert result["ok"] is False
+    assert (
+        argv_normalize.ALLOWED_TOOL_UNSUPPORTED_BLOCKER
+        in _blocker_ids(result)
+    )
+
+
+def test_validate_adapter_allowed_tools_blocks_wildcard(
+    adapter: Any, argv_normalize: Any
+) -> None:
+    """Axis A (negative): a literal ``*`` blocks with the wildcard id."""
+    result = adapter.validate_adapter_allowed_tools(["*"])
+    assert result["ok"] is False
+    assert (
+        argv_normalize.ALLOWED_TOOL_WILDCARD_BLOCKER
+        in _blocker_ids(result)
+    )
+
+
+def test_validate_adapter_no_isolation_honors_confirmation(
+    adapter: Any, workspace_isolation: Any
+) -> None:
+    """Axis B (positive): explicit confirmation + env override pass the gate."""
+    result = adapter.validate_adapter_no_isolation(
+        allow_no_isolation=True,
+        has_confirmation=True,
+    )
+    assert result["ok"] is True
+    assert result["blockers"] == []
+
+
+def test_validate_adapter_no_isolation_blocks_without_confirmation(
+    adapter: Any, workspace_isolation: Any
+) -> None:
+    """Axis B (negative): missing confirmation emits the workspace blocker."""
+    result = adapter.validate_adapter_no_isolation(
+        allow_no_isolation=True,
+        has_confirmation=False,
+    )
+    assert result["ok"] is False
+    assert (
+        workspace_isolation.NO_ISOLATION_CONFIRMATION_REQUIRED_BLOCKER
+        in _blocker_ids(result)
+    )
+
+
+def test_validate_adapter_no_isolation_blocks_noninteractive_without_env(
+    adapter: Any, workspace_isolation: Any
+) -> None:
+    """Axis B (negative): noninteractive call without env override blocks."""
+    result = adapter.validate_adapter_no_isolation(
+        allow_no_isolation=False,
+        has_confirmation=True,
+    )
+    assert result["ok"] is False
+    assert (
+        workspace_isolation.NO_ISOLATION_NON_INTERACTIVE_BLOCKER
+        in _blocker_ids(result)
+    )
+
+
+def _unblock_all_no_isolation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tear down the autouse opt-in so the upstream gate sees a clean env.
+
+    Uses ``os.environ.pop`` (not ``monkeypatch.delenv``) so the
+    teardown is independent of whether the autouse fixture's
+    monkeypatch instance is shared with this test. The autouse
+    fixture restores the env after the test via its own
+    monkeypatch teardown.
+    """
+    os.environ.pop("METACRUCIBLE_ALLOW_NO_ISOLATION", None)
+    os.environ.pop("METACRUCIBLE_RUN_LOCAL_REAL", None)
+
+
+def test_run_skill_preflight_blocks_unsupported_allowed_tools_pre_invocation(
+    adapter: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Axis A: the Skill harness must NOT spawn when an off-list tool is passed.
+
+    The harness short-circuits with a blocked ``SkillPreflightRun`` whose
+    evidence carries the ``execution-boundary-allowed-tool-unsupported``
+    blocker. No subprocess is invoked.
+    """
+    _unblock_all_no_isolation(monkeypatch)
+    runner = _make_fake_runner(stdout="", stderr="", returncode=0)
+    run = adapter.run_skill_preflight(
+        skill_root="/tmp/x",
+        allowed_tools=("SendEmail",),  # not in the reviewed vocabulary
+        run_subprocess=runner,
+    )
+    # The subprocess must NEVER be invoked.
+    assert runner.calls == []  # type: ignore[attr-defined]
+    # The result must surface the upstream blocker id.
+    assert run.argv == []
+    assert run.exit_code == -1
+    assert "execution-boundary-allowed-tool-unsupported" in _blocker_ids(
+        run.evidence
+    )
+    assert "execution-boundary-allowed-tool-unsupported" in _blocker_ids(
+        run.preflight
+    )
+
+
+def test_run_skill_preflight_blocks_wildcard_allowed_tools_pre_invocation(
+    adapter: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Axis A: the Skill harness must NOT spawn when a wildcard is passed."""
+    _unblock_all_no_isolation(monkeypatch)
+    runner = _make_fake_runner(stdout="", stderr="", returncode=0)
+    run = adapter.run_skill_preflight(
+        skill_root="/tmp/x",
+        allowed_tools=("*",),
+        run_subprocess=runner,
+    )
+    assert runner.calls == []  # type: ignore[attr-defined]
+    assert "execution-boundary-allowed-tool-wildcard" in _blocker_ids(
+        run.evidence
+    )
+
+
+def test_run_skill_preflight_blocks_noninteractive_without_confirmation(
+    adapter: Any, monkeypatch: pytest.MonkeyPatch, workspace_isolation: Any
+) -> None:
+    """Axis B: the Skill harness blocks when no opt-in is provided."""
+    _unblock_all_no_isolation(monkeypatch)
+    runner = _make_fake_runner(stdout="", stderr="", returncode=0)
+    run = adapter.run_skill_preflight(
+        skill_root="/tmp/x",
+        run_subprocess=runner,
+    )
+    # No subprocess must be invoked.
+    assert runner.calls == []  # type: ignore[attr-defined]
+    # Both upstream blockers must be present.
+    evidence_ids = _blocker_ids(run.evidence)
+    preflight_ids = _blocker_ids(run.preflight)
+    assert (
+        workspace_isolation.NO_ISOLATION_CONFIRMATION_REQUIRED_BLOCKER
+        in evidence_ids
+    )
+    assert (
+        workspace_isolation.NO_ISOLATION_NON_INTERACTIVE_BLOCKER
+        in evidence_ids
+    )
+    # The same ids must be surfaced through the preflight result.
+    assert (
+        workspace_isolation.NO_ISOLATION_CONFIRMATION_REQUIRED_BLOCKER
+        in preflight_ids
+    )
+
+
+def test_run_skill_preflight_passes_with_explicit_has_confirmation(
+    adapter: Any,
+) -> None:
+    """Axis B (positive): ``has_confirmation=True`` + env override (set
+    by the autouse ``_no_isolation_env`` fixture) passes the gate.
+    """
+    runner = _make_fake_runner(stdout="ok", stderr="", returncode=0)
+    adapter.run_skill_preflight(
+        skill_root="/tmp/x",
+        run_subprocess=runner,
+        has_confirmation=True,
+    )
+    # The harness must have spawned the binary exactly once.
+    assert len(runner.calls) == 1  # type: ignore[attr-defined]
+
+
+def test_run_subagent_preflight_blocks_noninteractive_without_confirmation(
+    adapter: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    workspace_isolation: Any
+) -> None:
+    _unblock_all_no_isolation(monkeypatch)
+    agents_path = tmp_path / "agents.json"
+    agents_path.write_text(SUBAGENT_INLINE_JSON, encoding="utf-8")
+    runner = _make_fake_runner(stdout="", stderr="", returncode=0)
+    run = adapter.run_subagent_preflight(
+        agents_path=agents_path,
+        run_subprocess=runner,
+    )
+    assert runner.calls == []  # type: ignore[attr-defined]
+    evidence_ids = _blocker_ids(run.evidence)
+    assert (
+        workspace_isolation.NO_ISOLATION_CONFIRMATION_REQUIRED_BLOCKER
+        in evidence_ids
+    )
+    # ``agents_path`` must still be recorded verbatim for the evidence dump.
+    assert run.agents_path == str(agents_path)
+
+
+def test_run_omp_skill_preflight_blocks_noninteractive_without_confirmation(
+    adapter: Any, monkeypatch: pytest.MonkeyPatch, workspace_isolation: Any
+) -> None:
+    """Axis B: the omp Skill harness blocks on missing opt-in."""
+    _unblock_all_no_isolation(monkeypatch)
+    runner = _make_fake_runner(stdout="", stderr="", returncode=0)
+    run = adapter.run_omp_skill_preflight(
+        isolated_root="/tmp/isolated",
+        run_subprocess=runner,
+    )
+    assert runner.calls == []  # type: ignore[attr-defined]
+    assert run.runtime == "omp"
+    assert (
+        workspace_isolation.NO_ISOLATION_CONFIRMATION_REQUIRED_BLOCKER
+        in _blocker_ids(run.evidence)
+    )
+
+
+def test_run_omp_subagent_preflight_blocks_noninteractive_without_confirmation(
+    adapter: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    workspace_isolation: Any
+) -> None:
+    """Axis B: the omp subagent harness blocks on missing opt-in."""
+    _unblock_all_no_isolation(monkeypatch)
+    agents_path = tmp_path / "agents.json"
+    agents_path.write_text(SUBAGENT_INLINE_JSON, encoding="utf-8")
+    runner = _make_fake_runner(stdout="", stderr="", returncode=0)
+    run = adapter.run_omp_subagent_preflight(
+        isolated_root=tmp_path,
+        agents_path=agents_path,
+        run_subprocess=runner,
+    )
+    assert runner.calls == []  # type: ignore[attr-defined]
+    assert run.runtime == "omp"
+    assert (
+        workspace_isolation.NO_ISOLATION_CONFIRMATION_REQUIRED_BLOCKER
+        in _blocker_ids(run.evidence)
+    )
+
+
+def test_run_skill_preflight_local_real_env_auto_passes_gate(
+    adapter: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The local-real opt-in env var (``METACRUCIBLE_RUN_LOCAL_REAL=1``)
+    must auto-pass the no-isolation gate even when the env override
+    ``METACRUCIBLE_ALLOW_NO_ISOLATION`` is unset.
+
+    This is the "local-real opt-in IS the confirmation" policy:
+    developers who opt in to local-real smoke runs are treated as
+    having confirmed the no-isolation gate. Production callers
+    that want this convenience must set the env var explicitly.
+    """
+    monkeypatch.delenv("METACRUCIBLE_ALLOW_NO_ISOLATION", raising=False)
+    monkeypatch.setenv("METACRUCIBLE_RUN_LOCAL_REAL", "1")
+    runner = _make_fake_runner(stdout="ok", stderr="", returncode=0)
+    adapter.run_skill_preflight(
+        skill_root="/tmp/x",
+        run_subprocess=runner,
+    )
+    # The gate must have auto-passed and the binary must have been
+    # spawned exactly once.
+    assert len(runner.calls) == 1  # type: ignore[attr-defined]
+
+
+def test_run_skill_preflight_blocked_result_keeps_evidence_summary_consistent(
+    adapter: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A blocked pre-invocation gate must still produce a consistent
+    ``build_evidence_summary`` (the receipt writer branches on the
+    same fields regardless of whether the spawn happened).
+    """
+    _unblock_all_no_isolation(monkeypatch)
+    runner = _make_fake_runner(stdout="ignored", stderr="ignored", returncode=0)
+    run = adapter.run_skill_preflight(
+        skill_root="/tmp/x",
+        allowed_tools=("SendEmail",),  # forces a blocker
+        run_subprocess=runner,
+    )
+    summary = adapter.build_evidence_summary(run)
+    assert summary["ok"] is False
+    assert "execution-boundary-allowed-tool-unsupported" in [
+        b.get("id") for b in summary["blockers"]
+    ]
+    # The summary must surface the adapter version even though no
+    # subprocess was spawned (the receipt writer reads this field
+    # for the run header).
+    assert summary["adapter_version"] == EXPECTED_ADAPTER_VERSION
+
+
+# --------------------------------------------------------------------------- #
+# Realistic stream-json evidence shape (Issue #46 Task 4 axis C)               #
+# --------------------------------------------------------------------------- #
+
+
+def test_run_skill_preflight_realistic_stream_json_evidence_shape(
+    adapter: Any, stream_json: Any
+) -> None:
+    """Axis C: a realistic stream-json capture (system/init + result events
+    with the documented adapter + runtime versions) must collapse to a
+    clean evidence dict with no blockers and a non-empty runtime version.
+
+    The harness's ``run_subprocess`` test seam is fed a deterministic
+    stream-json blob that mirrors what ``claude --output-format
+    stream-json`` emits in production. The harness must reuse
+    :func:`metacrucible.claude_stream_json.parse_stream_json`; the
+    test asserts the evidence dict shape (init+result captured,
+    adapter version pinned, runtime version present, no blockers,
+    warnings list may be non-empty per ADR 0028).
+    """
+    sentinel = "METACRUCIBLE_SKILL_DISCOVERABLE=yes; NAME=metacrucible-smoke"
+    realistic_stdout = (
+        '{"type":"system","subtype":"init","claude_code_version":"2.1.0"}\n'
+        '{"type":"assistant","message":{"role":"assistant",'
+        '"content":[{"type":"text","text":"thinking..."}]}}\n'
+        f'{{"type":"result","subtype":"success","result":"{sentinel}"}}\n'
+    )
+    runner = _make_fake_runner(
+        stdout=realistic_stdout, stderr="", returncode=0
+    )
+    run = adapter.run_skill_preflight(
+        skill_root="/tmp/x",
+        run_subprocess=runner,
+    )
+    evidence = run.evidence
+    # Init + result both captured.
+    assert evidence["start_captured"] is True
+    assert evidence["completion_captured"] is True
+    # Adapter + runtime versions present and correct.
+    assert evidence["adapter_version"] == stream_json.ADAPTER_VERSION
+    assert evidence["adapter_version"] == "claude-code/0.4.1"
+    assert evidence["claude_code_version"] == "2.1.0"
+    # No blockers for a clean, well-formed run.
+    assert evidence["blockers"] == [], (
+        f"realistic stream-json must produce zero blockers; got "
+        f"{evidence['blockers']!r}"
+    )
+    # Warnings may be non-empty per ADR 0028 (the realistic run has no
+    # tool_use blocks so ``stream-json-tool-calls-missing`` may fire).
+    assert isinstance(evidence["warnings"], list)
+    # Preflight folds the final_output into the sentinel parser.
+    assert run.preflight.get("ok") is True
+    assert run.preflight.get("name") == "metacrucible-smoke"
+
+
+def test_run_skill_preflight_realistic_stream_json_warns_on_missing_tool_use(
+    adapter: Any, stream_json: Any
+) -> None:
+    """Axis C: a realistic run that emits only init+result (no tool_use)
+    must surface ``stream-json-tool-calls-missing`` as a warning, NOT
+    a blocker. Per ADR 0028, missing tool-call details are a warning.
+    """
+    stdout = (
+        '{"type":"system","subtype":"init","claude_code_version":"2.1.0"}\n'
+        '{"type":"result","subtype":"success","result":"hello"}\n'
+    )
+    runner = _make_fake_runner(stdout=stdout, stderr="", returncode=0)
+    run = adapter.run_skill_preflight(
+        skill_root="/tmp/x",
+        run_subprocess=runner,
+    )
+    evidence = run.evidence
+    # No blockers (warnings are not blockers).
+    assert evidence["blockers"] == []
+    # And the tool-calls warning must be present.
+    warning_ids = [
+        w.get("id") for w in evidence["warnings"] if isinstance(w, dict)
+    ]
+    assert "stream-json-tool-calls-missing" in warning_ids
 
 
 SMOKE_SUBAGENT_SOURCE_FOR_TEST: str = (

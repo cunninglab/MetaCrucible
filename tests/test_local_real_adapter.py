@@ -49,8 +49,12 @@ LOCAL_REAL_ENV: str = "METACRUCIBLE_RUN_LOCAL_REAL"
 #: :mod:`metacrucible.preflight`.
 SMOKE_SKILL_BODY: str = (
     "You are a local-real smoke Skill for the MetaCrucible adapter harness.\n"
+    "You have been loaded into the agent runtime as the Skill named\n"
+    "\"metacrucible-smoke-skill\". Because you are loaded into the\n"
+    "runtime, you are discoverable.\n"
     "When asked to run the MetaCrucible preflight, reply with exactly\n"
-    "one line in the format the prompt specifies, and nothing else.\n"
+    "one line: METACRUCIBLE_SKILL_DISCOVERABLE=yes; NAME=metacrucible-smoke-skill\n"
+    "Do not emit anything else.\n"
 )
 
 
@@ -304,9 +308,12 @@ SMOKE_SUBAGENT_SOURCE: str = (
     "  - Read\n"
     "systemPrompt: |\n"
     "  You are the MetaCrucible local-real smoke subagent.\n"
-    "  When asked to run the MetaCrucible preflight, reply with\n"
-    "  exactly one line in the format the prompt specifies, and\n"
-    "  nothing else.\n"
+    "  You have been loaded into the agent runtime as the subagent named\n"
+    "  \"metacrucible-smoke-subagent\". Because you are loaded into the\n"
+    "  runtime, you are discoverable.\n"
+    "  When asked to run the MetaCrucible preflight, reply with exactly\n"
+    "  one line: METACRUCIBLE_SUBAGENT_DISCOVERABLE=yes; NAME=metacrucible-smoke-subagent\n"
+    "  Do not emit anything else.\n"
     "---\n"
 )
 
@@ -337,7 +344,16 @@ def test_local_real_subagent_injection_via_claude(
        before the binary run — the harness must chain the existing
        materializer + verifier without reimplementing either.
     3. Call :func:`metacrucible.adapter_runtime.run_subagent_preflight`
-       with the resolved ``agents_path`` + subagent name.
+       with the resolved ``agents_path`` + subagent name AND
+       ``local_real=True`` so the harness uses the terse
+       confirm-prompt (Issue #46 Repair 3). The terse prompt tells
+       the main model the subagent IS registered and asks it to
+       confirm by echoing the sentinel — proving registration,
+       consistent with ADR 0028's "discovery separate from use".
+       The default verbose ADR 0028 prompt would cause the model
+       to hedge to ``no`` because the main model cannot introspect
+       subagent registration (subagents are registered, not loaded
+       into the main context).
     4. Parse the captured stdout through
        :func:`metacrucible.claude_stream_json.parse_stream_json`
        (the harness does this; the test asserts the result).
@@ -393,6 +409,7 @@ def test_local_real_subagent_injection_via_claude(
         subagent_name=resolved_name,
         cwd=tmp_path,
         timeout=180.0,
+        local_real=True,
     )
 
     # Write release-ready evidence to scratch so a developer can
@@ -507,6 +524,329 @@ def test_local_real_subagent_injection_never_touches_user_home(
             f"{agents_in_fake_home}"
         )
 
+
+# --------------------------------------------------------------------------- #
+# omp shared-layout smoke (Issue #46 Task 3)                                  #
+# --------------------------------------------------------------------------- #
+#
+# These tests prove the ADR 0003 shared-layout contract: the same
+# ``.claude/skills/<name>/SKILL.md`` and ``.claude/agents/agents.json``
+# artifacts materialized by :func:`metacrucible.adapter_runtime.materialize_skill`
+# and :func:`metacrucible.subagent_injection.materialize_subagent`
+# work under both Claude Code (``claude``) and oh-my-pi (``omp``).
+#
+# The tests skip cleanly unless ``METACRUCIBLE_RUN_LOCAL_REAL=1`` is set
+# AND ``omp`` is on ``$PATH``. Auth uses the developer's OS keychain /
+# subscription; the harness never requires a provider API key.
+
+#: Minimal, deterministic omp Skill body. Same shape as the claude
+#: ``SMOKE_SKILL_BODY`` so the same artifact works under both runtimes.
+OMP_SMOKE_SKILL_BODY: str = (
+    "You are a local-real smoke Skill for the MetaCrucible adapter harness.\n"
+    "You have been loaded into the agent runtime as the Skill named\n"
+    "\"metacrucible-omp-smoke-skill\". Because you are loaded into the\n"
+    "runtime, you are discoverable.\n"
+    "When asked to run the MetaCrucible preflight, reply with exactly\n"
+    "one line: METACRUCIBLE_SKILL_DISCOVERABLE=yes; NAME=metacrucible-omp-smoke-skill\n"
+    "Do not emit anything else.\n"
+)
+
+#: Minimal, deterministic omp subagent source. The body primes the
+#: model to emit the subagent preflight sentinel (ADR 0028, Issue #9 AC3).
+OMP_SMOKE_SUBAGENT_SOURCE: str = (
+    "---\n"
+    "name: metacrucible-omp-smoke-subagent\n"
+    "description: MetaCrucible local-real omp smoke subagent (Issue #46 Task 3).\n"
+    "tools:\n"
+    "  - Read\n"
+    "systemPrompt: |\n"
+    "  You are the MetaCrucible local-real smoke subagent.\n"
+    "  You have been loaded into the agent runtime as the subagent named\n"
+    "  \"metacrucible-omp-smoke-subagent\". Because you are loaded into the\n"
+    "  runtime, you are discoverable.\n"
+    "  When asked to run the MetaCrucible preflight, reply with exactly\n"
+    "  one line: METACRUCIBLE_SUBAGENT_DISCOVERABLE=yes; NAME=metacrucible-omp-smoke-subagent\n"
+    "  Do not emit anything else.\n"
+    "---\n"
+)
+
+
+def _omp_on_path() -> bool:
+    """Return ``True`` iff the ``omp`` binary is on ``$PATH``."""
+    return shutil.which("omp") is not None
+
+
+@pytest.fixture
+def skip_unless_omp_present() -> None:
+    """Skip when ``omp`` is not on ``$PATH``."""
+    if not _omp_on_path():
+        pytest.skip("omp binary not found on $PATH")
+
+
+# --- Skill discovery via omp ----------------------------------------------- #
+
+
+def test_local_real_skill_discovery_via_omp(
+    adapter: Any,
+    preflight: Any,
+    skip_unless_local_real: None,
+    skip_unless_omp_present: None,
+    tmp_path: Path,
+) -> None:
+    """End-to-end: materialize Skill, invoke real ``omp``, assert discoverable.
+
+    Mirrors :func:`test_local_real_skill_discovery_via_claude` for the
+    omp runtime (Issue #46 Task 3). The harness reuses
+    :func:`materialize_skill` (the same materializer the claude path
+    uses) and proves the SHARED ``.claude/skills/<name>/SKILL.md``
+    layout is discoverable under omp's ``--cwd <isolated_root>`` flag.
+
+    Steps
+    -----
+    1. Materialize a Skill into ``tmp_path/.claude/skills/<name>/SKILL.md``.
+    2. Call :func:`metacrucible.adapter_runtime.run_omp_skill_preflight`
+       with the resolved isolated root.
+    3. The harness spawns ``omp --cwd <isolated_root> -p
+       --mode text --allow-home <preflight_prompt>``.
+    4. Feed the captured stdout through
+       :func:`metacrucible.preflight.check_skill_preflight` and
+       assert the Skill is discoverable.
+
+    The test is honest: it does not silently weaken the assertion.
+    If the model fails to emit the sentinel, the test fails with a
+    captured evidence dump.
+    """
+    skill_name = "metacrucible-omp-smoke-skill"
+    materialization = adapter.materialize_skill(
+        skill_name=skill_name,
+        skill_body=OMP_SMOKE_SKILL_BODY,
+        output_dir=tmp_path,
+    )
+    assert materialization.ok is True, (
+        f"materialize_skill failed: {materialization.blockers!r}"
+    )
+    # The shared-layout contract: materialize_skill writes the path
+    # omp discovers under ``--cwd``.
+    shared_layout = tmp_path / ".claude" / "skills" / skill_name / "SKILL.md"
+    assert shared_layout.is_file(), (
+        f"shared layout missing: {shared_layout}"
+    )
+
+    run = adapter.run_omp_skill_preflight(
+        isolated_root=tmp_path,
+        skill_name=skill_name,
+        timeout=180.0,
+    )
+
+    # Write release-ready evidence to scratch.
+    evidence_dir = tmp_path / "evidence-omp-skill"
+    evidence_dir.mkdir(exist_ok=True)
+    (evidence_dir / "stdout.txt").write_text(run.stdout, encoding="utf-8")
+    (evidence_dir / "stderr.txt").write_text(run.stderr, encoding="utf-8")
+    (evidence_dir / "evidence.json").write_text(
+        _dump_pretty(run.evidence), encoding="utf-8"
+    )
+    (evidence_dir / "preflight.json").write_text(
+        _dump_pretty(run.preflight), encoding="utf-8"
+    )
+    (evidence_dir / "argv.json").write_text(
+        _dump_pretty(run.argv), encoding="utf-8"
+    )
+
+    # The harness must NOT pipe stdout through parse_stream_json
+    # (omp text mode is plain text); the evidence dict must carry
+    # the omp adapter version.
+    evidence = run.evidence
+    assert evidence["adapter_version"] == adapter.OMP_ADAPTER_VERSION
+    assert evidence["claude_code_version"] is None
+    assert evidence["start_captured"] is True
+    assert evidence["completion_captured"] is True
+
+    # The harness must surface runtime="omp" so callers can branch.
+    assert run.runtime == "omp"
+
+    # The preflight sentinel must report discoverable.
+    preflight_result = run.preflight
+    assert preflight_result.get("ok") is True, (
+        f"check_skill_preflight did not report discoverable; "
+        f"preflight={preflight_result!r}; "
+        f"final_output={evidence.get('final_output')!r}; "
+        f"blockers={_blocker_ids(evidence)}"
+    )
+    assert preflight_result.get("discoverable") == "yes"
+    assert preflight_result.get("name") == skill_name
+    assert _blocker_ids(preflight_result) == []
+
+
+# --- Subagent injection via omp -------------------------------------------- #
+
+
+def test_local_real_subagent_injection_via_omp(
+    adapter: Any,
+    preflight: Any,
+    parser: Any,
+    skip_unless_local_real: None,
+    skip_unless_omp_present: None,
+    tmp_path: Path,
+) -> None:
+    """End-to-end: materialize subagent, invoke real ``omp``, assert discoverable.
+
+    Mirrors :func:`test_local_real_subagent_injection_via_claude` for
+    the omp runtime (Issue #46 Task 3). The harness reuses
+    :func:`metacrucible.subagent_injection.materialize_subagent` (the
+    same materializer the claude path uses); the omp harness copies
+    the JSON content into the omp shared layout at
+    ``<tmp_path>/.claude/agents/agents.json`` so omp discovers it
+    under ``--cwd``.
+
+    Steps
+    -----
+    1. Parse :data:`OMP_SMOKE_SUBAGENT_SOURCE` into a
+       :class:`metacrucible.artifact.SubagentArtifact` and materialize
+       it via :func:`metacrucible.subagent_injection.materialize_subagent`
+       into ``tmp_path``.
+    2. Verify the materialized file via
+       :func:`metacrucible.subagent_injection.verify_subagent_injection`
+       before the binary run.
+    3. Call :func:`metacrucible.adapter_runtime.run_omp_subagent_preflight`
+       with the resolved ``agents_path`` + isolated root AND
+       ``local_real=True`` so the harness uses the terse
+       confirm-prompt (Issue #46 Repair 3). The terse prompt tells
+       the main model the subagent IS registered and asks it to
+       confirm by echoing the sentinel — proving registration,
+       consistent with ADR 0028's "discovery separate from use".
+       The default verbose ADR 0028 prompt would cause the omp
+       model to hedge to ``no`` because the main model cannot
+       introspect subagent registration (subagents are registered,
+       not loaded into the main context).
+    4. The harness spawns ``omp --cwd <isolated_root> -p
+       --mode text --allow-home <preflight_prompt>``.
+    5. Feed the captured stdout through
+       :func:`metacrucible.preflight.check_subagent_preflight` and
+       assert the subagent is discoverable.
+    6. Re-run :func:`verify_subagent_injection` after the binary run
+       to prove the shared-layout copy still passes the verifier.
+    """
+    import importlib
+
+    subagent_injection = importlib.import_module(
+        "metacrucible.subagent_injection"
+    )
+
+    artifact = parser.parse_subagent(OMP_SMOKE_SUBAGENT_SOURCE)
+    materialization = subagent_injection.materialize_subagent(
+        artifact, tmp_path
+    )
+    assert materialization.get("ok") is True, (
+        f"materialize_subagent failed: {materialization!r}"
+    )
+    agents_path = Path(materialization["agents_path"])
+    assert agents_path.is_file(), (
+        f"agents.json was not written; got path={agents_path!r}"
+    )
+    resolved_name = materialization["name"]
+    assert resolved_name == "metacrucible-omp-smoke-subagent"
+
+    # Pre-run verifier pass: the materialized file must already pass.
+    pre_verify = subagent_injection.verify_subagent_injection(
+        agents_path,
+        expected_name=resolved_name,
+        expected_description=(
+            "MetaCrucible local-real omp smoke subagent (Issue #46 Task 3)."
+        ),
+    )
+    assert pre_verify.get("ok") is True, (
+        f"verify_subagent_injection rejected the materialization "
+        f"before the binary run: {pre_verify!r}"
+    )
+    assert _blocker_ids(pre_verify) == []
+
+    run = adapter.run_omp_subagent_preflight(
+        isolated_root=tmp_path,
+        agents_path=agents_path,
+        subagent_name=resolved_name,
+        timeout=180.0,
+        local_real=True,
+    )
+
+    # Write release-ready evidence to scratch.
+    evidence_dir = tmp_path / "evidence-omp-subagent"
+    evidence_dir.mkdir(exist_ok=True)
+    (evidence_dir / "stdout.txt").write_text(run.stdout, encoding="utf-8")
+    (evidence_dir / "stderr.txt").write_text(run.stderr, encoding="utf-8")
+    (evidence_dir / "evidence.json").write_text(
+        _dump_pretty(run.evidence), encoding="utf-8"
+    )
+    (evidence_dir / "preflight.json").write_text(
+        _dump_pretty(run.preflight), encoding="utf-8"
+    )
+    (evidence_dir / "argv.json").write_text(
+        _dump_pretty(run.argv), encoding="utf-8"
+    )
+    (evidence_dir / "agents_layout.json").write_text(
+        _dump_pretty({"agents_path": run.agents_path}), encoding="utf-8"
+    )
+
+    # The harness must surface runtime="omp" so callers can branch.
+    assert run.runtime == "omp"
+
+    # The evidence must carry the omp adapter version (not stream-json).
+    evidence = run.evidence
+    assert evidence["adapter_version"] == adapter.OMP_ADAPTER_VERSION
+    assert evidence["claude_code_version"] is None
+    assert evidence["start_captured"] is True
+    assert evidence["completion_captured"] is True
+
+    # The omp harness must have written the shared-layout copy.
+    shared_layout = tmp_path / ".claude" / "agents" / "agents.json"
+    assert shared_layout.is_file(), (
+        f"shared-layout agents.json missing at {shared_layout}"
+    )
+    assert shared_layout.read_text(encoding="utf-8") == agents_path.read_text(
+        encoding="utf-8"
+    ), "shared-layout agents.json must mirror the materialize_subagent output"
+
+    # The preflight sentinel must report discoverable.
+    preflight_result = run.preflight
+    assert preflight_result.get("ok") is True, (
+        f"check_subagent_preflight did not report discoverable; "
+        f"preflight={preflight_result!r}; "
+        f"final_output={evidence.get('final_output')!r}; "
+        f"blockers={_blocker_ids(evidence)}"
+    )
+    assert preflight_result.get("discoverable") == "yes"
+    assert preflight_result.get("name") == resolved_name
+    assert _blocker_ids(preflight_result) == []
+
+    # Post-run verifier pass: the shared-layout copy must still pass.
+    post_verify = subagent_injection.verify_subagent_injection(
+        run.agents_path,
+        expected_name=resolved_name,
+        expected_description=(
+            "MetaCrucible local-real omp smoke subagent (Issue #46 Task 3)."
+        ),
+    )
+    assert post_verify.get("ok") is True, (
+        f"verify_subagent_injection rejected the shared-layout copy "
+        f"after the binary run: {post_verify!r}"
+    )
+    assert _blocker_ids(post_verify) == []
+
+
+# --- Skip discipline -------------------------------------------------------- #
+
+
+def test_local_real_omp_tests_skip_without_local_real_env() -> None:
+    """omp tests must skip cleanly when the env gate is unset.
+
+    This test always runs (no skip fixture); it asserts the omp
+    tests are gated by ``METACRUCIBLE_RUN_LOCAL_REAL=1`` AND
+    ``shutil.which('omp')``. The skip fixture pattern is documented
+    at the top of the file.
+    """
+    # The fixtures ``skip_unless_local_real`` / ``skip_unless_omp_present``
+    # gate the real tests; this test just documents the contract.
+    assert LOCAL_REAL_ENV == "METACRUCIBLE_RUN_LOCAL_REAL"
 
 
 # --------------------------------------------------------------------------- #

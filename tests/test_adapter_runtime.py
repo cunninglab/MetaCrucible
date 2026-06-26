@@ -1088,6 +1088,96 @@ def test_run_subagent_preflight_default_prompt_uses_subagent_name(
     assert full_argv[-1] == expected
 
 
+def test_local_real_subagent_confirm_prompt_renders_sentinel_and_name(
+    adapter: Any, preflight: Any
+) -> None:
+    """The terse confirm-prompt helper must render the sentinel prefix + subagent name."""
+    rendered = adapter.local_real_subagent_confirm_prompt(
+        subagent_name="metacrucible-smoke-subagent"
+    )
+    # The sentinel prefix (from preflight) must be present so the
+    # standard ``check_subagent_preflight`` parser classifies the
+    # model's reply.
+    assert preflight.SUBAGENT_SENTINEL_PREFIX in rendered
+    # The subagent name must be folded into the prompt.
+    assert "metacrucible-smoke-subagent" in rendered
+    # The template constant must round-trip through the helper.
+    assert (
+        adapter.SUBAGENT_LOCAL_REAL_CONFIRM_PROMPT_TEMPLATE.format(
+            prefix=preflight.SUBAGENT_SENTINEL_PREFIX,
+            subagent_name="metacrucible-smoke-subagent",
+        )
+        == rendered
+    )
+
+
+def test_local_real_subagent_confirm_prompt_handles_empty_name(
+    adapter: Any,
+) -> None:
+    """An empty subagent name must render ``<unknown>`` (defensive)."""
+    rendered = adapter.local_real_subagent_confirm_prompt(subagent_name="")
+    assert "<unknown>" in rendered
+
+
+def test_run_subagent_preflight_default_uses_verbose_preflight_prompt(
+    adapter: Any, preflight: Any, tmp_path: Path
+) -> None:
+    """The default path must keep the verbose ADR 0028 preflight prompt (no flag)."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    runner = _make_fake_runner(stdout="not-json\n", stderr="", returncode=0)
+    adapter.run_subagent_preflight(
+        agents_path=agents_path,
+        run_subprocess=runner,
+        subagent_name="my-agent",
+    )
+    full_argv = runner.calls[0]["argv"]  # type: ignore[attr-defined]
+    expected = preflight.subagent_preflight_prompt(subagent_name="my-agent")
+    # Default (no local_real) must equal the verbose ADR 0028 prompt.
+    assert full_argv[-1] == expected
+    # And it must NOT be the terse confirm-prompt.
+    terse = adapter.local_real_subagent_confirm_prompt(subagent_name="my-agent")
+    assert full_argv[-1] != terse
+
+
+def test_run_subagent_preflight_local_real_uses_confirm_prompt(
+    adapter: Any, tmp_path: Path
+) -> None:
+    """``local_real=True`` must switch the harness to the terse confirm-prompt."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    runner = _make_fake_runner(stdout="not-json\n", stderr="", returncode=0)
+    adapter.run_subagent_preflight(
+        agents_path=agents_path,
+        run_subprocess=runner,
+        subagent_name="my-agent",
+        local_real=True,
+    )
+    full_argv = runner.calls[0]["argv"]  # type: ignore[attr-defined]
+    expected = adapter.local_real_subagent_confirm_prompt(subagent_name="my-agent")
+    # local_real=True must equal the terse confirm-prompt.
+    assert full_argv[-1] == expected
+    # And it must NOT be the verbose ADR 0028 prompt.
+    from metacrucible.preflight import subagent_preflight_prompt
+    assert full_argv[-1] != subagent_preflight_prompt(subagent_name="my-agent")
+
+
+def test_run_subagent_preflight_local_real_does_not_break_explicit_prompt(
+    adapter: Any, tmp_path: Path
+) -> None:
+    """An explicit ``prompt=`` must win over the ``local_real`` flag."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    runner = _make_fake_runner(stdout="not-json\n", stderr="", returncode=0)
+    adapter.run_subagent_preflight(
+        agents_path=agents_path,
+        run_subprocess=runner,
+        prompt="EXPLICIT PROMPT",
+        local_real=True,
+    )
+    full_argv = runner.calls[0]["argv"]  # type: ignore[attr-defined]
+    assert full_argv[-1] == "EXPLICIT PROMPT"
+
 def test_run_subagent_preflight_disable_verbose(
     adapter: Any, tmp_path: Path
 ) -> None:
@@ -1151,3 +1241,553 @@ def test_run_subagent_preflight_argv_does_not_include_subprocess_seam(
     assert run.argv[0] == "claude"
     assert run.argv[-1].startswith("You are running the MetaCrucible")
 
+
+# --------------------------------------------------------------------------- #
+# omp shared-layout argv builders (Issue #46 Task 3)                          #
+# --------------------------------------------------------------------------- #
+#
+# The omp runtime reads Skills and subagents from the SHARED
+# ``.claude/skills/<name>/SKILL.md`` and ``.claude/agents/agents.json``
+# layout under ``--cwd``. The harness emits the pure token shape pinned
+# by the brief; tests below prove the shape without spawning the binary.
+
+OMP_PROMPT: str = "Run the MetaCrucible Skill preflight now."
+
+EXPECTED_OMP_ARGV_TOKENS_DEFAULT: list[str] = [
+    "omp",
+    "--cwd",
+    "/tmp/isolated",
+    "-p",
+    "--mode",
+    "text",
+    "--allow-home",
+    OMP_PROMPT,
+]
+
+
+def test_adapter_module_exposes_omp_runtime_constants(adapter: Any) -> None:
+    """The harness must expose the omp runtime discriminator constants."""
+    assert adapter.RUNTIME_CLAUDE == "claude"
+    assert adapter.RUNTIME_OMP == "omp"
+    assert adapter.OMP_ADAPTER_VERSION == "oh-my-pi/16.1.19"
+
+
+def test_adapter_module_exposes_omp_argv_builders(adapter: Any) -> None:
+    """The harness must expose the omp Skill and subagent argv builders."""
+    assert hasattr(adapter, "build_omp_skill_preflight_argv")
+    assert callable(adapter.build_omp_skill_preflight_argv)
+    assert hasattr(adapter, "build_omp_subagent_preflight_argv")
+    assert callable(adapter.build_omp_subagent_preflight_argv)
+
+
+def test_adapter_module_exposes_omp_subprocess_methods(adapter: Any) -> None:
+    """The harness must expose the omp Skill and subagent subprocess methods."""
+    assert hasattr(adapter, "run_omp_skill_preflight")
+    assert callable(adapter.run_omp_skill_preflight)
+    assert hasattr(adapter, "run_omp_subagent_preflight")
+    assert callable(adapter.run_omp_subagent_preflight)
+
+
+def test_skill_preflight_run_dataclass_has_runtime_field(adapter: Any) -> None:
+    """``SkillPreflightRun`` must surface the runtime discriminator."""
+    fields = set(adapter.SkillPreflightRun.__dataclass_fields__.keys())
+    assert "runtime" in fields
+
+
+def test_subagent_preflight_run_dataclass_has_runtime_field(adapter: Any) -> None:
+    """``SubagentPreflightRun`` must surface the runtime discriminator."""
+    fields = set(adapter.SubagentPreflightRun.__dataclass_fields__.keys())
+    assert "runtime" in fields
+
+
+# --- omp Skill argv builder -------------------------------------------------- #
+
+
+def test_build_omp_skill_argv_matches_brief_token_shape(adapter: Any) -> None:
+    """The omp Skill argv builder must emit the exact token shape pinned by the brief."""
+    argv = adapter.build_omp_skill_preflight_argv(
+        isolated_root="/tmp/isolated",
+        prompt=OMP_PROMPT,
+    )
+    assert argv == EXPECTED_OMP_ARGV_TOKENS_DEFAULT
+
+
+def test_build_omp_skill_argv_uses_cwd_flag(adapter: Any) -> None:
+    """``--cwd`` must carry the isolated root as the second token after the binary."""
+    argv = adapter.build_omp_skill_preflight_argv(
+        isolated_root="/scratch/.claude-root",
+        prompt=OMP_PROMPT,
+    )
+    assert argv[0] == "omp"
+    assert argv[1] == "--cwd"
+    assert argv[2] == "/scratch/.claude-root"
+
+
+def test_build_omp_skill_argv_omits_no_tools(adapter: Any) -> None:
+    """``--no-tools`` must NOT be present: it disables omp artifact injection.
+
+    omp treats Skills and subagents as a tool-side feature; passing
+    ``--no-tools`` stops the runtime from loading
+    ``.claude/skills/<name>/SKILL.md`` and
+    ``.claude/agents/agents.json``, which makes the preflight's
+    ``discoverable=yes`` check impossible. Side-effect safety for the
+    smoke run comes from ``-p`` (non-interactive single turn), not from
+    a tool-disabling flag.
+    """
+    argv = adapter.build_omp_skill_preflight_argv(
+        isolated_root="/tmp/isolated",
+        prompt=OMP_PROMPT,
+    )
+    assert "--no-tools" not in argv, (
+        f"omp argv must not include --no-tools (defeats artifact injection); got {argv!r}"
+    )
+
+
+def test_build_omp_skill_argv_uses_text_mode(adapter: Any) -> None:
+    """``--mode text`` must be present so stdout is plain text (not json)."""
+    argv = adapter.build_omp_skill_preflight_argv(
+        isolated_root="/tmp/isolated",
+        prompt=OMP_PROMPT,
+    )
+    idx = argv.index("--mode")
+    assert argv[idx + 1] == "text"
+
+
+def test_build_omp_skill_argv_uses_allow_home(adapter: Any) -> None:
+    """``--allow-home`` must be present so omp does not auto-switch to a tmp dir."""
+    argv = adapter.build_omp_skill_preflight_argv(
+        isolated_root="/tmp/isolated",
+        prompt=OMP_PROMPT,
+    )
+    assert "--allow-home" in argv
+
+
+def test_build_omp_skill_argv_prompt_is_positional(adapter: Any) -> None:
+    """The preflight prompt must be the final positional token (omp takes it as arg)."""
+    argv = adapter.build_omp_skill_preflight_argv(
+        isolated_root="/tmp/isolated",
+        prompt="CUSTOM PROMPT",
+    )
+    assert argv[-1] == "CUSTOM PROMPT"
+
+
+def test_build_omp_skill_argv_uses_print_flag(adapter: Any) -> None:
+    """``-p`` must be present for non-interactive mode."""
+    argv = adapter.build_omp_skill_preflight_argv(
+        isolated_root="/tmp/isolated",
+        prompt=OMP_PROMPT,
+    )
+    assert "-p" in argv
+
+
+def test_build_omp_skill_argv_does_not_include_claude_only_flags(adapter: Any) -> None:
+    """The omp argv must not include ``--bare`` / ``--add-dir`` / ``--output-format``."""
+    argv = adapter.build_omp_skill_preflight_argv(
+        isolated_root="/tmp/isolated",
+        prompt=OMP_PROMPT,
+    )
+    for forbidden in ("--bare", "--add-dir", "--output-format", "--allowed-tools", "--verbose"):
+        assert forbidden not in argv, (
+            f"omp argv must not include {forbidden!r}; got {argv!r}"
+        )
+
+
+def test_build_omp_skill_argv_rejects_empty_prompt(adapter: Any) -> None:
+    """An empty prompt must fail loudly."""
+    with pytest.raises(ValueError):
+        adapter.build_omp_skill_preflight_argv(
+            isolated_root="/tmp/isolated",
+            prompt="",
+        )
+
+
+# --- omp subagent argv builder ---------------------------------------------- #
+
+
+def test_build_omp_subagent_argv_matches_skill_shape(adapter: Any) -> None:
+    """omp discovers subagents from the same ``.claude/`` layout; argv shape matches Skill."""
+    skill_argv = adapter.build_omp_skill_preflight_argv(
+        isolated_root="/tmp/isolated",
+        prompt=OMP_PROMPT,
+    )
+    subagent_argv = adapter.build_omp_subagent_preflight_argv(
+        isolated_root="/tmp/isolated",
+        prompt=OMP_PROMPT,
+    )
+    assert subagent_argv == skill_argv
+
+
+def test_build_omp_subagent_argv_rejects_empty_prompt(adapter: Any) -> None:
+    """An empty prompt must fail loudly."""
+    with pytest.raises(ValueError):
+        adapter.build_omp_subagent_preflight_argv(
+            isolated_root="/tmp/isolated",
+            prompt="",
+        )
+
+
+# --- omp subprocess method (Skill) via test seam ---------------------------- #
+
+
+def test_run_omp_skill_preflight_passes_skill_preflight_prompt(
+    adapter: Any, preflight: Any
+) -> None:
+    """The omp Skill harness must feed the preflight prompt to the binary as positional."""
+    runner = _make_fake_runner(stdout="not-json\n", stderr="", returncode=0)
+    adapter.run_omp_skill_preflight(
+        isolated_root="/tmp/isolated",
+        run_subprocess=runner,
+    )
+    full_argv = runner.calls[0]["argv"]  # type: ignore[attr-defined]
+    expected_prompt = preflight.skill_preflight_prompt()
+    assert full_argv[-1] == expected_prompt
+
+
+def test_run_omp_skill_preflight_uses_capture_output(adapter: Any) -> None:
+    """The omp subprocess must request captured stdout/stderr from the runner."""
+    runner = _make_fake_runner(stdout="", stderr="", returncode=0)
+    adapter.run_omp_skill_preflight(
+        isolated_root="/tmp/isolated",
+        run_subprocess=runner,
+    )
+    kwargs = runner.calls[0]["kwargs"]  # type: ignore[attr-defined]
+    assert kwargs.get("capture_output") is True
+    assert kwargs.get("text") is True
+    assert kwargs.get("check") is False
+
+
+def test_run_omp_skill_preflight_passes_timeout(adapter: Any) -> None:
+    """The omp subprocess must forward a timeout to the runner."""
+    runner = _make_fake_runner(stdout="", stderr="", returncode=0)
+    adapter.run_omp_skill_preflight(
+        isolated_root="/tmp/isolated",
+        run_subprocess=runner,
+        timeout=7.5,
+    )
+    kwargs = runner.calls[0]["kwargs"]  # type: ignore[attr-defined]
+    assert kwargs.get("timeout") == 7.5
+
+
+def test_run_omp_skill_preflight_spawns_from_isolated_root(adapter: Any) -> None:
+    """The omp subprocess must default its cwd to the isolated root."""
+    runner = _make_fake_runner(stdout="", stderr="", returncode=0)
+    adapter.run_omp_skill_preflight(
+        isolated_root="/scratch/isolated",
+        run_subprocess=runner,
+    )
+    kwargs = runner.calls[0]["kwargs"]  # type: ignore[attr-defined]
+    assert kwargs.get("cwd") == "/scratch/isolated"
+
+def test_run_omp_skill_preflight_folds_text_through_check_skill_preflight(
+    adapter: Any, preflight: Any
+) -> None:
+    """The omp harness must reuse ``check_skill_preflight`` (no parallel validator)."""
+    sentinel = "METACRUCIBLE_SKILL_DISCOVERABLE=yes; NAME=metacrucible-smoke"
+    runner = _make_fake_runner(stdout=sentinel, stderr="", returncode=0)
+    run = adapter.run_omp_skill_preflight(
+        isolated_root="/tmp/isolated",
+        run_subprocess=runner,
+    )
+    expected = preflight.check_skill_preflight(sentinel)
+    assert run.preflight == expected
+    assert run.preflight.get("ok") is True
+    assert run.preflight.get("name") == "metacrucible-smoke"
+
+
+def test_run_omp_skill_preflight_does_not_parse_stream_json(
+    adapter: Any, stream_json: Any
+) -> None:
+    """The omp harness must NOT pipe stdout through ``parse_stream_json`` (text mode)."""
+    runner = _make_fake_runner(stdout="plain text sentinel\n", stderr="", returncode=0)
+    run = adapter.run_omp_skill_preflight(
+        isolated_root="/tmp/isolated",
+        run_subprocess=runner,
+    )
+    # final_output must be the raw stdout verbatim, not stream-json parsed.
+    assert run.evidence["final_output"] == "plain text sentinel\n"
+    # omp has its own adapter_version (no claude_code_version in the evidence).
+    assert run.evidence["adapter_version"] == "oh-my-pi/16.1.19"
+    assert run.evidence["claude_code_version"] is None
+
+
+def test_run_omp_skill_preflight_records_runtime_field(adapter: Any) -> None:
+    """The result must carry ``runtime="omp"`` so callers can branch uniformly."""
+    runner = _make_fake_runner(stdout="ok", stderr="", returncode=0)
+    run = adapter.run_omp_skill_preflight(
+        isolated_root="/tmp/isolated",
+        run_subprocess=runner,
+    )
+    assert run.runtime == "omp"
+
+
+def test_run_omp_skill_preflight_default_prompt_uses_skill_name(
+    adapter: Any, preflight: Any
+) -> None:
+    """The omp harness must fold the caller-supplied skill name into the preflight prompt."""
+    runner = _make_fake_runner(stdout="", stderr="", returncode=0)
+    adapter.run_omp_skill_preflight(
+        isolated_root="/tmp/isolated",
+        run_subprocess=runner,
+        skill_name="my-skill",
+    )
+    full_argv = runner.calls[0]["argv"]  # type: ignore[attr-defined]
+    expected = preflight.skill_preflight_prompt(skill_name="my-skill")
+    assert full_argv[-1] == expected
+
+
+def test_run_omp_skill_preflight_honors_explicit_prompt(adapter: Any) -> None:
+    """An explicit prompt override must be appended verbatim."""
+    runner = _make_fake_runner(stdout="", stderr="", returncode=0)
+    adapter.run_omp_skill_preflight(
+        isolated_root="/tmp/isolated",
+        run_subprocess=runner,
+        prompt="CUSTOM PROMPT",
+    )
+    full_argv = runner.calls[0]["argv"]  # type: ignore[attr-defined]
+    assert full_argv[-1] == "CUSTOM PROMPT"
+
+
+# --- omp subprocess method (subagent) via test seam ------------------------- #
+
+
+def test_run_omp_subagent_preflight_passes_subagent_preflight_prompt(
+    adapter: Any, preflight: Any, tmp_path: Path
+) -> None:
+    """The omp subagent harness must feed the preflight prompt as final positional."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    runner = _make_fake_runner(stdout="not-json\n", stderr="", returncode=0)
+    adapter.run_omp_subagent_preflight(
+        isolated_root=tmp_path,
+        agents_path=agents_path,
+        run_subprocess=runner,
+        subagent_name="smoke-agent",
+    )
+    full_argv = runner.calls[0]["argv"]  # type: ignore[attr-defined]
+    expected_prompt = preflight.subagent_preflight_prompt(subagent_name="smoke-agent")
+    assert full_argv[-1] == expected_prompt
+
+
+def test_run_omp_subagent_preflight_copies_agents_to_shared_layout(
+    adapter: Any, tmp_path: Path
+) -> None:
+    """The harness must write the subagent JSON into the SHARED omp layout."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    runner = _make_fake_runner(stdout="", stderr="", returncode=0)
+    adapter.run_omp_subagent_preflight(
+        isolated_root=tmp_path,
+        agents_path=agents_path,
+        run_subprocess=runner,
+    )
+    omp_layout = tmp_path / ".claude" / "agents" / "agents.json"
+    assert omp_layout.is_file(), (
+        f"shared-layout omp agents.json was not written at {omp_layout}"
+    )
+    assert omp_layout.read_text(encoding="utf-8") == SUBAGENT_INLINE_JSON
+
+
+def test_run_omp_subagent_preflight_uses_capture_output(
+    adapter: Any, tmp_path: Path
+) -> None:
+    """The omp subagent subprocess must request captured stdout/stderr."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    runner = _make_fake_runner(stdout="", stderr="", returncode=0)
+    adapter.run_omp_subagent_preflight(
+        isolated_root=tmp_path,
+        agents_path=agents_path,
+        run_subprocess=runner,
+    )
+    kwargs = runner.calls[0]["kwargs"]  # type: ignore[attr-defined]
+    assert kwargs.get("capture_output") is True
+    assert kwargs.get("text") is True
+    assert kwargs.get("check") is False
+
+
+def test_run_omp_subagent_preflight_spawns_from_isolated_root(
+    adapter: Any, tmp_path: Path
+) -> None:
+    """The omp subagent subprocess must default its cwd to the isolated root."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    runner = _make_fake_runner(stdout="", stderr="", returncode=0)
+    adapter.run_omp_subagent_preflight(
+        isolated_root=tmp_path,
+        agents_path=agents_path,
+        run_subprocess=runner,
+    )
+    kwargs = runner.calls[0]["kwargs"]  # type: ignore[attr-defined]
+    assert kwargs.get("cwd") == str(tmp_path)
+
+
+def test_run_omp_subagent_preflight_folds_text_through_check_subagent_preflight(
+    adapter: Any, preflight: Any, tmp_path: Path
+) -> None:
+    """The omp subagent harness must reuse ``check_subagent_preflight`` (no parallel validator)."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    sentinel = (
+        f"{preflight.SUBAGENT_SENTINEL_PREFIX}=yes; NAME=smoke-agent"
+    )
+    runner = _make_fake_runner(stdout=sentinel, stderr="", returncode=0)
+    run = adapter.run_omp_subagent_preflight(
+        isolated_root=tmp_path,
+        agents_path=agents_path,
+        run_subprocess=runner,
+    )
+    expected = preflight.check_subagent_preflight(sentinel)
+    assert run.preflight == expected
+    assert run.preflight.get("ok") is True
+
+
+def test_run_omp_subagent_preflight_records_runtime_field(
+    adapter: Any, tmp_path: Path
+) -> None:
+    """The omp subagent result must carry ``runtime="omp"``."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    runner = _make_fake_runner(stdout="", stderr="", returncode=0)
+    run = adapter.run_omp_subagent_preflight(
+        isolated_root=tmp_path,
+        agents_path=agents_path,
+        run_subprocess=runner,
+    )
+    assert run.runtime == "omp"
+
+
+def test_run_omp_subagent_preflight_blocks_on_missing_file(
+    adapter: Any, tmp_path: Path
+) -> None:
+    """A missing ``agents.json`` must surface a clear blocker, not crash."""
+    missing = tmp_path / "does-not-exist-agents.json"
+    runner = _make_fake_runner(stdout="not-json\n", stderr="", returncode=0)
+    run = adapter.run_omp_subagent_preflight(
+        isolated_root=tmp_path,
+        agents_path=missing,
+        run_subprocess=runner,
+    )
+    assert runner.calls == []  # type: ignore[attr-defined]
+    assert run.runtime == "omp"
+    assert "omp agents.json" in run.stderr
+
+def test_run_omp_subagent_preflight_default_uses_verbose_preflight_prompt(
+    adapter: Any, preflight: Any, tmp_path: Path
+) -> None:
+    """The omp default path must keep the verbose ADR 0028 preflight prompt (no flag)."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    runner = _make_fake_runner(stdout="not-json\n", stderr="", returncode=0)
+    adapter.run_omp_subagent_preflight(
+        isolated_root=tmp_path,
+        agents_path=agents_path,
+        run_subprocess=runner,
+        subagent_name="smoke-agent",
+    )
+    full_argv = runner.calls[0]["argv"]  # type: ignore[attr-defined]
+    expected = preflight.subagent_preflight_prompt(subagent_name="smoke-agent")
+    # Default (no local_real) must equal the verbose ADR 0028 prompt.
+    assert full_argv[-1] == expected
+    # And it must NOT be the terse confirm-prompt.
+    terse = adapter.local_real_subagent_confirm_prompt(subagent_name="smoke-agent")
+    assert full_argv[-1] != terse
+
+
+def test_run_omp_subagent_preflight_local_real_uses_confirm_prompt(
+    adapter: Any, tmp_path: Path
+) -> None:
+    """``local_real=True`` must switch the omp harness to the terse confirm-prompt."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    runner = _make_fake_runner(stdout="not-json\n", stderr="", returncode=0)
+    adapter.run_omp_subagent_preflight(
+        isolated_root=tmp_path,
+        agents_path=agents_path,
+        run_subprocess=runner,
+        subagent_name="smoke-agent",
+        local_real=True,
+    )
+    full_argv = runner.calls[0]["argv"]  # type: ignore[attr-defined]
+    expected = adapter.local_real_subagent_confirm_prompt(subagent_name="smoke-agent")
+    # local_real=True must equal the terse confirm-prompt.
+    assert full_argv[-1] == expected
+    # And it must NOT be the verbose ADR 0028 prompt.
+    from metacrucible.preflight import subagent_preflight_prompt
+    assert full_argv[-1] != subagent_preflight_prompt(subagent_name="smoke-agent")
+
+
+def test_run_omp_subagent_preflight_local_real_does_not_break_explicit_prompt(
+    adapter: Any, tmp_path: Path
+) -> None:
+    """An explicit ``prompt=`` must win over the omp ``local_real`` flag."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    runner = _make_fake_runner(stdout="not-json\n", stderr="", returncode=0)
+    adapter.run_omp_subagent_preflight(
+        isolated_root=tmp_path,
+        agents_path=agents_path,
+        run_subprocess=runner,
+        prompt="EXPLICIT PROMPT",
+        local_real=True,
+    )
+    full_argv = runner.calls[0]["argv"]  # type: ignore[attr-defined]
+    assert full_argv[-1] == "EXPLICIT PROMPT"
+
+
+# --- shared-layout artifact paths (the ADR 0003 contract) ------------------- #
+
+
+def test_materialize_skill_writes_into_omp_shared_layout(
+    adapter: Any, tmp_path: Path
+) -> None:
+    """``materialize_skill`` writes the SHARED layout omp reads from ``--cwd``."""
+    # The omp harness points ``--cwd`` at ``isolated_root`` and relies
+    # on ``<isolated_root>/.claude/skills/<name>/SKILL.md`` being
+    # discoverable. ``materialize_skill`` writes exactly that path —
+    # the brief's "shared layout" contract — so no parallel materializer
+    # is needed for the omp Skill path.
+    result = adapter.materialize_skill(
+        skill_name="shared-layout",
+        skill_body="body",
+        output_dir=tmp_path,
+    )
+    assert result.ok is True
+    shared_layout = tmp_path / ".claude" / "skills" / "shared-layout" / "SKILL.md"
+    assert shared_layout.is_file()
+    assert Path(result.skill_md_path) == shared_layout
+
+
+def test_subagent_injection_materializes_into_omp_compatible_json(
+    adapter: Any, tmp_path: Path
+) -> None:
+    """``materialize_subagent`` writes JSON whose shape omp consumes (ADR 0003)."""
+    import importlib
+
+    subagent_injection = importlib.import_module("metacrucible.subagent_injection")
+    parser = importlib.import_module("metacrucible.artifact")
+
+    artifact = parser.parse_subagent(SMOKE_SUBAGENT_SOURCE_FOR_TEST)
+    materialization = subagent_injection.materialize_subagent(artifact, tmp_path)
+    assert materialization.get("ok") is True
+    # The materializer writes the file the claude ``--agents`` flag
+    # loads; the omp harness copies it into the omp shared layout.
+    agents_path = Path(materialization["agents_path"])
+    assert agents_path.is_file()
+    assert json.loads(agents_path.read_text(encoding="utf-8")).get(
+        "metacrucible-omp-test"
+    ) is not None
+
+
+SMOKE_SUBAGENT_SOURCE_FOR_TEST: str = (
+    "---\n"
+    "name: metacrucible-omp-test\n"
+    "description: MetaCrucible omp shared-layout test subagent.\n"
+    "tools:\n"
+    "  - Read\n"
+    "systemPrompt: |\n"
+    "  echo subagent body.\n"
+    "---\n"
+)
+
+# Use stdlib json (already available via _dump_pretty pattern elsewhere).
+import json

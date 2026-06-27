@@ -75,23 +75,23 @@ def test_workflow_uses_mise_action() -> None:
 
 
 def test_workflow_pins_mise_action_major() -> None:
-    """The Mise action must be pinned to a major version like ``@v2``."""
+    """The Mise action must be pinned to a major version like ``@v4``."""
     text = _read_workflow()
     assert re.search(r"jdx/mise-action@v\d+", text), (
         "jdx/mise-action must be pinned to a concrete major version "
-        "(e.g. jdx/mise-action@v2)"
+        "(e.g. jdx/mise-action@v4)"
     )
 
 
 def test_workflow_pins_mise_version() -> None:
     """The Mise action must be pinned to a concrete Mise version, not ``latest``."""
     text = _read_workflow()
-    match = re.search(r"mise-version:\s*([^\n#]+)", text)
-    assert match, "workflow must set mise-version: <pinned version>"
+    match = re.search(r"^\s*version:\s*\"?([^\n#\"]+)\"?\s*$", text, re.MULTILINE)
+    assert match, "workflow must set version: <pinned version> under the mise-action step"
     version = match.group(1).strip().strip('"').strip("'")
-    assert version, "mise-version value must not be empty"
+    assert version, "version value must not be empty"
     assert version.lower() != "latest", (
-        f"mise-version must be pinned, got {version!r}"
+        f"version must be pinned, got {version!r}"
     )
 
 

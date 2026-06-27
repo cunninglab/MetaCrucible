@@ -47,6 +47,45 @@ recorded JSONL fixtures: `review`, `bootstrap`, `optimize`, and
 cover this surface so a change to the optimizer or the CLI command
 shape is reflected in CI.
 
+## Releasing
+
+MetaCrucible ships to PyPI through a Mise-routed, secret-free pipeline
+that is reproducible from a clean worktree. Publish credentials are
+minted at release time via [Trusted Publishing](https://docs.pypi.org/trusted-publishers/)
+(OIDC), exchanged for a short-lived PyPI token by GitHub Actions —
+no long-lived provider API key or repository secret is required.
+
+| Command | What it does |
+| --- | --- |
+| `mise run build` | Build wheel + sdist into `dist/` (`uv build --wheel --sdist`). |
+| `mise run release-gate` | Validate that `pyproject.toml` `[project].version` is a real release (not a placeholder) and that `CHANGELOG.md` has a matching `## [<version>]` section. With `--check-tag`, also require the `v<version>` git tag. |
+
+### Cutting a release
+
+1. Bump `version` in `pyproject.toml` to the release version
+   (for example `0.1.0`).
+2. Move the `[Unreleased]` entries in `CHANGELOG.md` into a new
+   `## [<version>]` section, following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+3. Run `mise run build` locally and confirm both
+   `metacrucible-<version>-py3-none-any.whl` and
+   `metacrucible-<version>.tar.gz` land in `dist/`.
+4. Run `mise run release-gate` locally to confirm the version matches
+   the new `CHANGELOG.md` section.
+5. Push a `v<version>` tag (for example
+   `git tag v0.1.0 && git push origin v0.1.0`). Pushing a `v*` tag
+   triggers `.github/workflows/release.yml`, which runs the full
+   suite, re-runs the build + gate, and publishes to PyPI via Trusted
+   Publishing (OIDC) using `pypa/gh-action-pypi-publish`.
+6. Alternatively, trigger the same workflow from the GitHub Actions UI
+   via `workflow_dispatch`.
+
+The release workflow declares `permissions: id-token: write` and does
+not reference any provider API key or repository secret. Trusted
+Publishing (OIDC) is the documented publish mechanism.
+
+See `docs/adr/0036-pin-project-metadata-policy.md` for the changelog
+and metadata policy that the gate enforces.
+
 ## Test layers
 
 MetaCrucible runs three test layers with different purposes and

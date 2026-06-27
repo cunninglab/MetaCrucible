@@ -1,0 +1,63 @@
+name: release
+
+# PyPI release workflow (issue #48). Publishes to PyPI via Trusted
+# Publishing (OIDC), gated on a `v*` tag push or manual dispatch.
+# MUST NOT trigger on push to `main` or on pull_request.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# Trusted Publishing requires id-token: write so the workflow can
+# mint a short-lived OIDC token exchanged for PyPI credentials.
+# OIDC is the only credential mechanism used here.
+permissions:
+  id-token: write
+  contents: read
+
+# Cancel in-progress runs on the same tag/ref to save CI minutes on
+# rapid tag re-pushes while a release is in flight.
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# Public-fork safe: no repository secrets, no provider API keys, no
+# live LLM SDK commands. The only credential mechanism is OIDC
+# Trusted Publishing.
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Install Mise
+        uses: jdx/mise-action@v4
+        with:
+          version: "2026.6.14"
+
+      - name: Provision Python and project venv via Mise
+        run: mise install
+
+      - name: Editable install of MetaCrucible and dev dependencies
+        run: mise run install
+
+      # Full test suite (not just test-replay): the release path must
+      # pass every recorded test before publishing to PyPI.
+      - name: Run the full test suite (mise run test)
+        run: mise run test
+
+      - name: Build wheel and sdist (mise run build)
+        run: mise run build
+
+      # Validate that pyproject.toml [project].version is a real
+      # release (not a placeholder) and that CHANGELOG.md has a
+      # matching `## [<version>]` section before publishing.
+      - name: Validate release gate (mise run release-gate)
+        run: mise run release-gate
+
+      # Trusted Publishing: OIDC only.
+      - name: Publish to PyPI via Trusted Publishing (OIDC)
+        uses: pypa/gh-action-pypi-publish@release/v1

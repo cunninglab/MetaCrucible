@@ -21,12 +21,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Mise
-        uses: jdx/mise-action@v2
+        uses: jdx/mise-action@v4
         with:
-          mise-version: 2026.6.14
+          version: "2026.6.14"
 
       - name: Provision Python and project venv via Mise
         run: mise install

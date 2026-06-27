@@ -305,13 +305,13 @@ Non-goals:
 - Expected: the full non-local-real suite passes; `mise run build` produces wheel+sdist; `mise run release-gate` exits with a deterministic code and a human-readable message; `tests/test_release_workflow.py` confirms `release.yml` has no provider keys and no API token.
 
 ### Status
-Status: pending
+Status: in-progress
 Task review: pending
 Spec verdict: pending
 Quality verdict: pending
 Task review rounds: 0/3
 Task review report: none
-Task base: none
+Task base: f340f513182898aa3dfa6845fa66330877c7701b
 Task head: none
 Work commits: none
 Accepted range: none

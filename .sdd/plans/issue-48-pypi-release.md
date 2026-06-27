@@ -11,7 +11,7 @@ Primary root: /Users/cunning/Workspace/repos/cunninglab/MetaCrucible
 Repo key: cunninglab/MetaCrucible
 
 ## Pipeline status
-Status: finish
+Status: complete
 Branch: sdd/issue-48-pypi-release-process
 Workspace: /Users/cunning/Workspace/worktrees/cunninglab/MetaCrucible/issue-48-pypi-release
 Workspace root: n/a
@@ -358,5 +358,5 @@ Integration fix:
   Work commits: none
   Affected tasks: none
 Run Record: pass
-Finish decision: pending
-PR URL: none
+Finish decision: open-pr
+PR URL: https://github.com/cunninglab/MetaCrucible/pull/63

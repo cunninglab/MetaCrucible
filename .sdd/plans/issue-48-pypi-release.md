@@ -127,13 +127,13 @@ Non-goals:
 - Expected: all tests PASS, covering the placeholder-version rejection, the missing-changelog-section rejection, the missing-tag rejection (`--check-tag`), and the all-green pass path.
 
 ### Status
-Status: pending
+Status: in-progress
 Task review: pending
 Spec verdict: pending
 Quality verdict: pending
 Task review rounds: 0/3
 Task review report: none
-Task base: none
+Task base: 5e0cd9672880d0b7026f9bc8e7c011d9db163f39
 Task head: none
 Work commits: none
 Accepted range: none

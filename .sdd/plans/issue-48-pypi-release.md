@@ -246,16 +246,16 @@ Non-goals:
 - Expected: all tests PASS, confirming the CHANGELOG release-tooling entry and the CONTRIBUTING "Releasing" section both exist and reference the Mise tasks and Trusted Publishing.
 
 ### Status
-Status: in-progress
-Task review: pending
-Spec verdict: pending
-Quality verdict: pending
+Status: pass
+Task review: pass
+Spec verdict: pass
+Quality verdict: pass
 Task review rounds: 1/3
-Task review report: none
+Task review report: .sdd/work/issue-48-pypi-release/task-004/task-review-report.json
 Task base: ddf97d01d3535e710485530ab17160e0e814ce15
 Task head: 18a0e3a340ae882c081e1e429c2a45c4ad90f802
 Work commits: b15b81b15a0cdc36005efcba56bc9e0db08cb944..18a0e3a340ae882c081e1e429c2a45c4ad90f802
-Accepted range: none
+Accepted range: ddf97d01d3535e710485530ab17160e0e814ce15..18a0e3a340ae882c081e1e429c2a45c4ad90f802
 
 ### Dispatch facts
 Implementer allowed edit scope:

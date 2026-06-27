@@ -69,16 +69,16 @@ Add a Mise-routed, secret-free PyPI build + release-gate toolchain to MetaCrucib
 - Expected: all tests in `tests/test_build_task.py` PASS, including a wheel+sdist artifact assertion and a wheel exclusion assertion.
 
 ### Status
-Status: in-progress
-Task review: pending
-Spec verdict: pending
-Quality verdict: pending
+Status: pass
+Task review: pass
+Spec verdict: pass
+Quality verdict: pass
 Task review rounds: 0/3
-Task review report: none
+Task review report: .sdd/work/issue-48-pypi-release/task-001/task-review-report.json
 Task base: b938ab4dcb9b576503527295ee1cd05b471b1f80
 Task head: 6762d2b95da31165a0b75b30808c0eb86d14d57d
 Work commits: 6762d2b95da31165a0b75b30808c0eb86d14d57d
-Accepted range: none
+Accepted range: b938ab4dcb9b576503527295ee1cd05b471b1f80..6762d2b95da31165a0b75b30808c0eb86d14d57d
 
 ### Dispatch facts
 Implementer allowed edit scope:

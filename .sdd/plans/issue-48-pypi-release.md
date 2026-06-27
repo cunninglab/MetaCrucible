@@ -11,7 +11,7 @@ Primary root: /Users/cunning/Workspace/repos/cunninglab/MetaCrucible
 Repo key: cunninglab/MetaCrucible
 
 ## Pipeline status
-Status: final-review
+Status: finish
 Branch: sdd/issue-48-pypi-release-process
 Workspace: /Users/cunning/Workspace/worktrees/cunninglab/MetaCrucible/issue-48-pypi-release
 Workspace root: n/a
@@ -348,15 +348,15 @@ Non-goals:
 
 ## Finalization
 
-Final code review: pending
-Final code review report: none
-Final verification: pending
+Final code review: pass
+Final code review report: .sdd/work/issue-48-pypi-release/final/code-review-report.json
+Final verification: pass
 Integration fix:
   Status: none
   Base: none
   Head: none
   Work commits: none
   Affected tasks: none
-Run Record: pending
+Run Record: pass
 Finish decision: pending
 PR URL: none

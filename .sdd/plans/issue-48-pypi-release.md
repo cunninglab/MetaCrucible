@@ -187,13 +187,13 @@ Non-goals:
 - Expected: all tests PASS, pinning the trigger shape, OIDC permission, absence of API tokens / live-LLM markers, and presence of `pypa/gh-action-pypi-publish`.
 
 ### Status
-Status: pending
+Status: in-progress
 Task review: pending
 Spec verdict: pending
 Quality verdict: pending
 Task review rounds: 0/3
 Task review report: none
-Task base: none
+Task base: 56670f04a2378ec91cdb688484ec28f284420440
 Task head: none
 Work commits: none
 Accepted range: none

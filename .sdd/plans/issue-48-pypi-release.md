@@ -246,13 +246,13 @@ Non-goals:
 - Expected: all tests PASS, confirming the CHANGELOG release-tooling entry and the CONTRIBUTING "Releasing" section both exist and reference the Mise tasks and Trusted Publishing.
 
 ### Status
-Status: pending
+Status: in-progress
 Task review: pending
 Spec verdict: pending
 Quality verdict: pending
 Task review rounds: 0/3
 Task review report: none
-Task base: none
+Task base: d4e13f68043cb96a919bc2626f1a320a5233e5c1
 Task head: none
 Work commits: none
 Accepted range: none

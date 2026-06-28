@@ -77,7 +77,12 @@ from .exit_codes import (
     EXIT_USER_ERROR,
 )
 from .promote import _atomic_write_jsonl, promote_case
-from .storage import REPO_DIR_NAME, RepositoryStorage, UserGlobalStorage
+from .storage import (
+    DEFAULT_RAW_RETENTION_DAYS,
+    REPO_DIR_NAME,
+    RepositoryStorage,
+    UserGlobalStorage,
+)
 from .synthesize import run_synthesize_command
 from . import rule_checks as _rule_checks
 from .replay import build_judge_call_fns, build_optimizer_call_fn, load_replay
@@ -792,6 +797,48 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     inspect_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="emit a parseable JSON object on stdout",
+    )
+    cleanup_parser = subparsers.add_parser(
+        "cleanup",
+        help=(
+            "prune raw evidence or cache from the user-global store "
+            "(Issue #49; ADR 0030 / 0035). Receipts, summaries, and "
+            "trajectory digests are preserved."
+        ),
+    )
+    cleanup_parser.add_argument(
+        "target",
+        choices=["raw", "cache"],
+        help=(
+            "which user-global artifact to prune: 'raw' removes raw "
+            "evidence older than --retention-days; 'cache' removes "
+            "every cache entry"
+        ),
+    )
+    cleanup_parser.add_argument(
+        "--retention-days",
+        type=int,
+        default=DEFAULT_RAW_RETENTION_DAYS,
+        metavar="N",
+        help=(
+            "retention window in days for the 'raw' target "
+            f"(default: {DEFAULT_RAW_RETENTION_DAYS}). Ignored when "
+            "target is 'cache'."
+        ),
+    )
+    cleanup_parser.add_argument(
+        "--home",
+        default=None,
+        metavar="PATH",
+        help=(
+            "user-global home directory (default: $HOME). When set, "
+            "cleanup operates on <PATH>/.metacrucible/."
+        ),
+    )
+    cleanup_parser.add_argument(
         "--json",
         action="store_true",
         help="emit a parseable JSON object on stdout",
@@ -3537,6 +3584,48 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_cleanup(args: argparse.Namespace) -> int:
+    """Run the ``cleanup`` subcommand; return the process exit code.
+
+    Issue #49 / ADR 0030: prune raw evidence or cache from the
+    user-global store without deleting receipts, summaries, or
+    trajectory digests. Cleanup is a support command (ADR 0035)
+    and never emits a BLOCKED evidence bundle.
+
+    Exit codes:
+
+      - ``EXIT_OK`` — successful prune, including empty prunes
+        (the storage layer returns ``removed_count=0`` rather
+        than raising).
+      - ``EXIT_USER_ERROR`` — negative ``--retention-days``,
+        unset ``$HOME`` with no ``--home`` override, or any
+        other precondition surfaced as ``ValueError`` by
+        :class:`metacrucible.storage.UserGlobalStorage`.
+    """
+    if args.retention_days < 0:
+        print(
+            "metacrucible: --retention-days must be >= 0",
+            file=sys.stderr,
+        )
+        return EXIT_USER_ERROR
+    try:
+        store = (
+            UserGlobalStorage(home=args.home)
+            if args.home is not None
+            else UserGlobalStorage()
+        )
+    except ValueError as exc:
+        print(f"metacrucible: {exc}", file=sys.stderr)
+        return EXIT_USER_ERROR
+    if args.target == "raw":
+        report = store.prune_raw_evidence(retention_days=args.retention_days)
+    else:
+        report = store.prune_cache()
+    payload = {"target": args.target, **report}
+    _emit(payload, as_json=args.json)
+    return EXIT_OK
+
+
 def _baseline_git_dirty_check(
     workspace: Path, baseline_inputs: list[Path]
 ) -> tuple[bool, list[str], bool]:
@@ -4261,6 +4350,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_evaluate(args)
         if getattr(args, "command", None) == "inspect":
             return cmd_inspect(args)
+        if getattr(args, "command", None) == "cleanup":
+            return cmd_cleanup(args)
         return EXIT_OK
     except Exception as exc:  # noqa: BLE001 - exit-code firewall
         # Catch-all so an uncaught command-handler bug still
